@@ -8,7 +8,15 @@
 
 BOOL isolateAppGroup = NO;
 BOOL strictTestMode = NO;
+static NSString *extensionParentContainerPath;
 void* webKitHeader = 0;
+void NSFMGuestExtensionHooksInit(NSString *parentContainerPath) {
+    extensionParentContainerPath = parentContainerPath;
+    strictTestMode = [NSUserDefaults.guestContainerInfo[@"strictTestMode"] boolValue];
+    isolateAppGroup = strictTestMode || [NSUserDefaults.guestContainerInfo[@"isolateAppGroup"] boolValue];
+    swizzle(NSFileManager.class, @selector(containerURLForSecurityApplicationGroupIdentifier:), @selector(hook_containerURLForSecurityApplicationGroupIdentifier:));
+}
+
 void NSFMGuestHooksInit(void) {
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
     strictTestMode = [infoDict[@"strictTestMode"] boolValue];
@@ -42,7 +50,8 @@ void NSFMGuestHooksInit(void) {
     }
     NSURL *result;
     if(isolateAppGroup) {
-        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/LCAppGroup/%@", getenv("HOME"), groupIdentifier]];
+        NSString *homePath = extensionParentContainerPath ?: @(getenv("HOME"));
+        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LCAppGroup/%@", homePath, groupIdentifier]];
     } else if (NSUserDefaults.lcAppGroupPath){
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LiveContainer/Data/AppGroup/%@", NSUserDefaults.lcAppGroupPath, groupIdentifier]];
     } else {
