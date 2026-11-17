@@ -14,4 +14,4 @@ extern void* __mmap(void *addr, size_t len, int prot, int flags, int fd, off_t o
 extern int __fcntl(int fildes, int cmd, void* param);
 
 void searchDyldFunctions(void);
-char *searchDyldFunction(char *base, char *signature, int length);
+char *searchDyldFunction(char *base, const char *signature, int length);

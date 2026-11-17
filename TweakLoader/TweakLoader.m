@@ -1,9 +1,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <stdlib.h>
 #include <objc/runtime.h>
 #import "../LiveContainer/utils.h"
+#import "../LiveContainer/LCSharedUtils.h"
 
 static NSString *const kDisabledTweaksKey = @"disabledItems";
 static NSString *const kContainerInfoFileName = @"LCContainerInfo.plist";
@@ -15,15 +17,6 @@ static NSString *strictContainerHomePath = nil;
 static id strictWillTerminateObserver = nil;
 
 static void LCStrictAutoWipeOnExit(void);
-
-static void LCStrictEnsureContainerDirectories(NSString *homePath) {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSArray<NSString *> *directories = @[@"Library/Caches", @"Library/Cookies", @"Documents", @"SystemData", @"tmp"];
-    for(NSString *directory in directories) {
-        NSString *path = [homePath stringByAppendingPathComponent:directory];
-        [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-}
 
 static NSString *LCStrictSessionMarkerPath(NSString *homePath) {
     if(homePath.length == 0) {
@@ -61,35 +54,7 @@ static void LCStrictWipeContainerContentsIfNeeded(void) {
         return;
     }
     NSString *homePath = strictContainerHomePath;
-    if(homePath.length == 0 || [homePath isEqualToString:@"/"]) {
-        return;
-    }
-
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *containerInfoPath = [homePath stringByAppendingPathComponent:kContainerInfoFileName];
-    if(![fm fileExistsAtPath:containerInfoPath]) {
-        return;
-    }
-
-    NSError *listError = nil;
-    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:homePath error:&listError];
-    if(!entries) {
-        NSLog(@"[LC][StrictMode] Failed to enumerate container for auto-wipe: %@", listError.localizedDescription);
-        return;
-    }
-
-    for(NSString *entry in entries) {
-        if([entry isEqualToString:kContainerInfoFileName]) {
-            continue;
-        }
-        NSString *entryPath = [homePath stringByAppendingPathComponent:entry];
-        NSError *removeError = nil;
-        if(![fm removeItemAtPath:entryPath error:&removeError] && removeError) {
-            NSLog(@"[LC][StrictMode] Failed to remove %@ during auto-wipe: %@", entry, removeError.localizedDescription);
-        }
-    }
-
-    LCStrictEnsureContainerDirectories(homePath);
+    [NSClassFromString(@"LCSharedUtils") wipeStrictContainerIfNeededAtPath:homePath force:NO];
 }
 
 static void LCStrictRecoverStaleSessionIfNeeded(void) {
@@ -155,12 +120,47 @@ static BOOL isTweakURLDisabled(NSURL *url, NSURL *rootFolderURL) {
     return NO;
 }
 
+static BOOL isSubstrateCompatibleTweakName(NSString *name) {
+    NSString *lower = name.lowercaseString;
+    return [lower containsString:@"cydiasubstrate"] ||
+           [lower containsString:@"ellekit"] ||
+           [lower containsString:@"libhooker"] ||
+           [lower containsString:@"substitute"];
+}
+
+static BOOL isTweakConflictingWithLoadedImage(NSURL *url, NSString *executableName) {
+    NSString *bundleFrameworksPath = NSBundle.mainBundle.privateFrameworksPath;
+    if (bundleFrameworksPath.length > 0) {
+        NSString *candidate = [bundleFrameworksPath stringByAppendingPathComponent:url.lastPathComponent];
+        if ([NSFileManager.defaultManager fileExistsAtPath:candidate]) {
+            return YES;
+        }
+    }
+
+    if (executableName.length == 0) {
+        return NO;
+    }
+    NSString *frameworkSuffix = [NSString stringWithFormat:@"/%@.framework/%@", executableName, executableName];
+    NSString *dylibSuffix = [NSString stringWithFormat:@"/%@", executableName];
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imageCount; ++i) {
+        const char *imgC = _dyld_get_image_name(i);
+        if (!imgC) continue;
+        NSString *imgPath = [NSString stringWithUTF8String:imgC];
+        if ([imgPath hasSuffix:frameworkSuffix] || [imgPath hasSuffix:dylibSuffix]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static NSString *loadTweakAtURL(NSURL *url) {
     NSString *tweakPath = url.path;
     NSString *tweak = tweakPath.lastPathComponent;
     if (![tweakPath hasSuffix:@".dylib"] && ![tweakPath hasSuffix:@".framework"]) {
         return nil;
     }
+    NSString *binaryName = tweak;
     if ([tweakPath hasSuffix:@".framework"]) {
         NSURL* infoPlistURL = [url URLByAppendingPathComponent:@"Info.plist"];
         NSDictionary* infoDict = [NSDictionary dictionaryWithContentsOfURL:infoPlistURL];
@@ -168,13 +168,22 @@ static NSString *loadTweakAtURL(NSURL *url) {
         if(!binary || ![binary isKindOfClass:NSString.class]) {
             return [NSString stringWithFormat:@"Unable to load %@: Unable to read Info.Plist", tweak];
         }
+        binaryName = binary;
         tweakPath = [[url URLByAppendingPathComponent:binary] path];
     }
-    
-    void *handle = dlopen(tweakPath.UTF8String, RTLD_LAZY | RTLD_GLOBAL);
+
+    if (isTweakConflictingWithLoadedImage(url, binaryName)) {
+        NSLog(@"[TweakLoader] Skipping duplicate/conflicting tweak %@", tweak);
+        return nil;
+    }
+
+    BOOL exportGlobally = [NSUserDefaults.guestAppInfo[@"exportTweakSymbolsGlobally"] boolValue] ||
+        isSubstrateCompatibleTweakName(tweak);
+    int dlopenMode = RTLD_LAZY | (exportGlobally ? RTLD_GLOBAL : RTLD_LOCAL);
+    void *handle = dlopen(tweakPath.UTF8String, dlopenMode);
     const char *error = dlerror();
     if (handle) {
-        NSLog(@"Loaded tweak %@", tweak);
+        NSLog(@"Loaded tweak %@ (%@)", tweak, exportGlobally ? @"GLOBAL" : @"LOCAL");
         return nil;
     } else if (error) {
         NSLog(@"Error: %s", error);
@@ -185,11 +194,11 @@ static NSString *loadTweakAtURL(NSURL *url) {
     }
 }
 
-static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
+static void loadTweaksRecursively(NSURL *folderURL, NSURL *rootFolderURL, NSMutableArray *errors) {
     NSArray<NSURL *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:0 error:nil];
     for (NSURL *fileURL in items) {
         NSString *name = fileURL.lastPathComponent;
-        if ([name hasSuffix:@".disabled"]) {
+        if ([name hasSuffix:@".disabled"] || isTweakURLDisabled(fileURL, rootFolderURL)) {
             NSLog(@"Skipping disabled tweak %@", name);
             continue;
         }
@@ -197,7 +206,7 @@ static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
         [fileURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
         // a .framework is a directory but loads as a single tweak
         if (isDirectory.boolValue && ![name hasSuffix:@".framework"]) {
-            loadTweaksRecursively(fileURL, errors);
+            loadTweaksRecursively(fileURL, rootFolderURL, errors);
         } else {
             NSString *error = loadTweakAtURL(fileURL);
             if (error) {
@@ -208,7 +217,9 @@ static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
 }
 
 static void showDlerrAlert(NSString *error) {
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindowScene *scene = (UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject;
+    if (!scene) return;
+    UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Failed to load tweaks" message:error preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         window.windowScene = nil;
@@ -221,14 +232,15 @@ static void showDlerrAlert(NSString *error) {
     [alert addAction:cancelAction];
     window.rootViewController = [UIViewController new];
     window.windowLevel = 1000;
-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
     [window makeKeyAndVisible];
     [window.rootViewController presentViewController:alert animated:YES completion:nil];
     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+extern void LCDebugAgentInitIfNeeded(void);
+
  __attribute__((constructor))
-static void TweakLoaderConstructor() {
+static void TweakLoaderConstructor(void) {
     NSDictionary *guestContainerInfo = [NSUserDefaults guestContainerInfo];
     strictTestModeEnabled = [guestContainerInfo[@"strictTestMode"] boolValue];
     strictAutoWipeOnExitEnabled = strictTestModeEnabled && [guestContainerInfo[@"strictAutoWipeOnExit"] boolValue];
@@ -243,19 +255,25 @@ static void TweakLoaderConstructor() {
         }
     }
 
-    const char *tweakFolderC = getenv("LC_GLOBAL_TWEAKS_FOLDER");
-    NSString *globalTweakFolder = @(tweakFolderC);
+    NSString *globalTweakFolder = [NSClassFromString(@"LCSharedUtils") cachedGlobalTweaksFolderPath];
     unsetenv("LC_GLOBAL_TWEAKS_FOLDER");
+
+    LCDebugAgentInitIfNeeded();
 
     if([NSUserDefaults.guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
         // don't load any tweak since tweakloader is loaded after all initializers
         NSLog(@"Skip loading tweaks");
         return;
     }
+
+    if (globalTweakFolder.length == 0) {
+        return;
+    }
+    NSURL *globalTweakFolderURL = [NSURL fileURLWithPath:globalTweakFolder];
     
     NSMutableArray *errors = [NSMutableArray new];
     
-    NSArray<NSURL *> *globalTweaks = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:globalTweakFolder]
+    NSArray<NSURL *> *globalTweaks = [NSFileManager.defaultManager contentsOfDirectoryAtURL:globalTweakFolderURL
     includingPropertiesForKeys:@[] options:0 error:nil];
     NSString *tweakFolderName = NSUserDefaults.guestAppInfo[@"LCTweakFolder"];
     
@@ -288,7 +306,7 @@ static void TweakLoaderConstructor() {
             // skip loading myself
             continue;
         }
-        if ([name hasSuffix:@".disabled"]) {
+        if ([name hasSuffix:@".disabled"] || isTweakURLDisabled(fileURL, globalTweakFolderURL)) {
             NSLog(@"Skipping disabled global tweak %@", name);
             continue;
         }
@@ -301,8 +319,8 @@ static void TweakLoaderConstructor() {
     // Load selected tweak folder, recursively
     if (tweakFolderName.length > 0) {
         NSLog(@"Loading tweaks from the selected folder");
-        NSString *tweakFolder = [globalTweakFolder stringByAppendingPathComponent:tweakFolderName];
-        loadTweaksRecursively([NSURL fileURLWithPath:tweakFolder], errors);
+        NSURL *tweakFolderURL = [globalTweakFolderURL URLByAppendingPathComponent:tweakFolderName];
+        loadTweaksRecursively(tweakFolderURL, globalTweakFolderURL, errors);
     }
 
     if (errors.count > 0) {

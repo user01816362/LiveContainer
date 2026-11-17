@@ -49,17 +49,19 @@ int LiveProcessMain(int argc, char *argv[]) {
     NSString *customPayloadDylib = appInfo[@"customPayloadDylib"];
     if(customPayloadDylib) {
         void *handle = dlopen(customPayloadDylib.fileSystemRepresentation, RTLD_LAZY);
-        NSCAssert(appInfo, @"Failed to load custom payload dylib at path: %@", customPayloadDylib);
+        NSCAssert(handle != NULL, @"Failed to load custom payload dylib at path: %@ (%s)", customPayloadDylib, dlerror() ?: "unknown error");
         
         NSString *customPayloadEntry = appInfo[@"customPayloadEntry"];
         NSCAssert(customPayloadEntry, @"Missing customPayloadEntry");
         int (*payloadEntry)(int, char **, char **, char **) = dlsym(handle, customPayloadEntry.UTF8String);
+        NSCAssert(payloadEntry != NULL, @"Missing custom payload entry %@: %s", customPayloadEntry, dlerror() ?: "unknown error");
         return payloadEntry(argc, argv, _envp, _apple);
     }
     
     NSLog(@"Retrieved app info: %@", appInfo);
     // Set LiveContainer's home path
-    setenv("LP_HOME_PATH", getenv("HOME"), 1);
+    const char *lpHome = getenv("HOME");
+    if(lpHome) setenv("LP_HOME_PATH", lpHome, 1);
     const char *overrideHomePath = [appInfo[@"lcHomePath"] fileSystemRepresentation];
     if(overrideHomePath) setenv("LC_HOME_PATH", overrideHomePath, 1);
     // Pass selected app info to user defaults
@@ -75,8 +77,13 @@ int LiveProcessMain(int argc, char *argv[]) {
     for(int i = 0; i < bookmarks.count; i++) {
         bool isStale = false;
         NSError* error = nil;
-        bookmarkedUrls[i] = [NSURL URLByResolvingBookmarkData:bookmarks[i] options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&error];
-        access = [bookmarkedUrls[i] startAccessingSecurityScopedResource];
+        NSURL *resolved = [NSURL URLByResolvingBookmarkData:bookmarks[i] options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&error];
+        if (resolved) {
+            [bookmarkedUrls addObject:resolved];
+            if ([resolved startAccessingSecurityScopedResource]) {
+                access = true;
+            }
+        }
     }
     
     if ([appInfo[@"selected"] isEqualToString:@"builtinSideStore"]) {

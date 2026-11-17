@@ -28,12 +28,12 @@ private let knownLiveContainers = [
 
 struct InstallAnotherLCButton : View {
     @State var lcName : String
-    @State var detected = false
+    @State var detected : Bool
     let delegate : InstallAnotherLCButtonDelegate
     
     init(lcName: String, delegate: InstallAnotherLCButtonDelegate) {
         self._lcName = State(initialValue: lcName)
-        self._detected = State(initialValue: UIApplication.shared.canOpenURL(URL(string: "\(lcName.lowercased())://")!))
+        self._detected = State(initialValue: LCUtils.isAppSchemeInstalled(lcName.lowercased()))
         self.delegate = delegate
     }
     
@@ -60,7 +60,7 @@ struct InstallAnotherLCButton : View {
     }
     
     func updateInstallStatus() {
-        detected = UIApplication.shared.canOpenURL(URL(string: "\(lcName.lowercased())://")!)
+        detected = LCUtils.isAppSchemeInstalled(lcName.lowercased())
     }
 }
 
@@ -150,10 +150,7 @@ struct LCMultiLCManagementView : View, InstallAnotherLCButtonDelegate {
         if scheme == "livecontainer" {
             return true
         }
-        guard let url = URL(string: "\(scheme)://") else {
-            return false
-        }
-        return UIApplication.shared.canOpenURL(url)
+        return LCUtils.isAppSchemeInstalled(scheme)
     }
 
     private func reloadLaunchPriorityItems() {

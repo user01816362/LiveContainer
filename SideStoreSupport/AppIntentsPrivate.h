@@ -7,6 +7,8 @@
 @import Foundation;
 @import AppIntents;
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface LNAction
 - (instancetype)initWithIdentifier:(NSString *)identifier
                     mangledTypeName:(NSString *)mangledTypeName
@@ -27,6 +29,8 @@
                options:(id)options
      reportingProgress:(NSProgress *)progress
               delegate:(nullable id)delegate
-            auditToken:(audit_token_t *)auditToken
+            auditToken:(nullable audit_token_t *)auditToken
      completionHandler:(PrivateIntentCompletion)completion;
 @end
+
+NS_ASSUME_NONNULL_END

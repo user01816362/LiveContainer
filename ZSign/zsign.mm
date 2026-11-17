@@ -55,7 +55,7 @@ int checkCert(NSData *key,
     }
     
     X509* cert = (X509*)zSignAsset.m_x509Cert;
-    BIO *brother1;
+    BIO *brother1 = NULL;
     unsigned long issuerHash = X509_issuer_name_hash((X509*)cert);
     if (0x817d2f7a == issuerHash) {
         brother1 = BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACert, (int)strlen(ZSignAsset::s_szAppleDevCACert));
@@ -75,6 +75,8 @@ int checkCert(NSData *key,
     X509 *issuer = PEM_read_bio_X509(brother1, NULL, 0, NULL);
     
     if (!cert || !issuer) {
+        if (issuer) X509_free(issuer);
+        BIO_free(brother1);
         completionHandler(2, nil, nil, @"Error loading cert or issuer");
         return -4;
     }
@@ -83,6 +85,8 @@ int checkCert(NSData *key,
     // Extract OCSP URL from cert
     STACK_OF(ACCESS_DESCRIPTION)* aia = (STACK_OF(ACCESS_DESCRIPTION)*)X509_get_ext_d2i((X509*)cert, NID_info_access, 0, 0);
     if (!aia) {
+        X509_free(issuer);
+        BIO_free(brother1);
         completionHandler(2, nil, nil, @"No AIA (OCSP) extension found in certificate");
         return -5;
     }
@@ -100,16 +104,38 @@ int checkCert(NSData *key,
 
     
     if (!uri) {
+        sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
+        X509_free(issuer);
+        BIO_free(brother1);
         completionHandler(2, nil, nil, @"No OCSP URI found in certificate.");
         return -6;
     }
 
     OCSP_REQUEST* req = OCSP_REQUEST_new();
+    OCSP_CERTID* req_cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
+    if (!req || !req_cert_id) {
+        if (req_cert_id) OCSP_CERTID_free(req_cert_id);
+        if (req) OCSP_REQUEST_free(req);
+        sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
+        X509_free(issuer);
+        BIO_free(brother1);
+        completionHandler(2, nil, nil, @"Failed to construct OCSP request.");
+        return -7;
+    }
+    OCSP_request_add0_id(req, req_cert_id); // Ownership transferred to request
     OCSP_CERTID* cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
-    OCSP_request_add0_id(req, cert_id);  // Ownership transferred to request
-    cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
     unsigned char* der = 0;
     int len = i2d_OCSP_REQUEST(req, &der);
+    if (!cert_id || len <= 0 || !der) {
+        if (der) OPENSSL_free(der);
+        if (cert_id) OCSP_CERTID_free(cert_id);
+        OCSP_REQUEST_free(req);
+        sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
+        X509_free(issuer);
+        BIO_free(brother1);
+        completionHandler(2, nil, nil, @"Failed to serialize OCSP request.");
+        return -8;
+    }
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithUTF8String:(const char *)uri->data]]];
     [request setHTTPMethod:@"POST"];
@@ -118,12 +144,13 @@ int checkCert(NSData *key,
     [request setValue:@"application/ocsp-response" forHTTPHeaderField:@"Accept"];
     
     OPENSSL_free(der);
-    if (aia) {
-        sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
-    }
+    sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
     OCSP_REQUEST_free(req);
     X509_free(issuer);
     BIO_free(brother1);
+
+    // Retain X509 across asynchronous URLSession callback so ZSignAsset destruction doesn't leave cert dangling.
+    X509_up_ref(cert);
 
     NSURLSession *session = [NSURLSession sharedSession];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:request
@@ -131,6 +158,8 @@ int checkCert(NSData *key,
                                                                 NSURLResponse * _Nullable response,
                                                                 NSError * _Nullable error) {
         if (error) {
+            OCSP_CERTID_free(cert_id);
+            X509_free(cert);
             completionHandler(2, nil, nil, error.localizedDescription);
             return;
         }
@@ -142,6 +171,8 @@ int checkCert(NSData *key,
             OCSP_RESPONSE *resp = 0;
             d2i_OCSP_RESPONSE(&resp, (const unsigned char**)&respBytes, data.length);
             if(!resp) {
+                OCSP_CERTID_free(cert_id);
+                X509_free(cert);
                 completionHandler(2, nil, nil, @"Failed to decode OCSP response.");
                 return;
             }
@@ -164,19 +195,22 @@ int checkCert(NSData *key,
             formatter.locale = NSLocale.currentLocale;
             NSDate *expirationDate = [formatter dateFromString:fullDateString];
 
-            int status, reason;
-            if (OCSP_resp_find_status(basic, cert_id, &status, &reason, NULL, NULL, NULL)) {
+            int status = 2, reason = 0;
+            if (basic && OCSP_resp_find_status(basic, cert_id, &status, &reason, NULL, NULL, NULL)) {
                 completionHandler(status, expirationDate, organizationalUnitName, nil);
             } else {
                 completionHandler(2, expirationDate, organizationalUnitName, nil);
             }
             
             OCSP_CERTID_free(cert_id);
-            OCSP_BASICRESP_free(basic);
+            if (basic) OCSP_BASICRESP_free(basic);
             OCSP_RESPONSE_free(resp);
+            X509_free(cert);
             
             
         } else {
+            OCSP_CERTID_free(cert_id);
+            X509_free(cert);
             completionHandler(2, nil, nil, @"Invalid response or no data");
             return;
         }
@@ -294,6 +328,7 @@ int checkCert(NSData *key,
     ZMachO* macho = new ZMachO();
     if (!macho->Init(path.UTF8String)) {
         ZLog::ErrorV(">>> Invalid mach-o file! %s\n", path.UTF8String);
+        delete macho;
         return false;
     }
 
@@ -302,6 +337,7 @@ int checkCert(NSData *key,
     string strCodeResourcesData;
     string strBundleId(bundleId.UTF8String);
     bool bRet = macho->Sign(&zSignAsset, true, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResourcesData);
+    delete macho;
     return bRet;
 }
 

@@ -23,7 +23,6 @@ enum SideStoreIntentError: LocalizedError {
     }
 }
 
-@available(iOS 17.0, *)
 private func resolveType(_ mangledTypeName: String) throws -> any Any.Type {
     let bytes = Array(mangledTypeName.utf8)
     let resolvedType: Any.Type? = bytes.withUnsafeBufferPointer { buffer in
@@ -49,7 +48,6 @@ private func resolveType(_ mangledTypeName: String) throws -> any Any.Type {
     return resolvedType
 }
 
-@available(iOS 17.0, *)
 struct SideStoreIntentCaller {
     static let shared = SideStoreIntentCaller()
 
@@ -86,7 +84,6 @@ struct SideStoreIntentCaller {
     }
 }
 
-@available(iOS 17.0, *)
 @objc extension SideStoreClient {
     @objc(performRefreshForRealWithIdentifier:mangledTypeName:server:)
     func performRefreshForReal(identifier: String, mangledTypeName: String, server: any RefreshServer) {

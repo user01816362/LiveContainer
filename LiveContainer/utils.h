@@ -1,3 +1,6 @@
+#ifndef LC_UTILS_H
+#define LC_UTILS_H
+
 #import <Foundation/Foundation.h>
 #include <mach-o/loader.h>
 #include <objc/runtime.h>
@@ -54,3 +57,5 @@ static inline void swizzleClassMethod(Class class, SEL originalAction, SEL swizz
 @interface NSDictionary(lc)
 - (BOOL)writeBinToFile:(NSString *)path atomically:(BOOL)useAuxiliaryFile;
 @end
+
+#endif /* LC_UTILS_H */

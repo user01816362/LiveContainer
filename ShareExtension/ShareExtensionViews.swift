@@ -131,7 +131,7 @@ private struct ShareHiddenUnlockGridEntry: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 26, weight: .semibold))
                     .frame(width: 52, height: 52)
-                    .background(Color(.secondarySystemBackground))
+                    .background { Color(.secondarySystemBackground) }
                     .clipShape(RoundedRectangle(cornerRadius: 52 * 0.2667, style: .continuous))
                 Text(" ")
                     .font(.caption)
@@ -200,7 +200,7 @@ private struct ShareInstallGridEntry: View {
                     .font(.system(size: 25, weight: .semibold))
                     .frame(width: 52, height: 52)
                     .foregroundStyle(.primary)
-                    .background(Color(.secondarySystemBackground))
+                    .background { Color(.secondarySystemBackground) }
                     .clipShape(RoundedRectangle(cornerRadius: 52 * 0.2667, style: .continuous))
                 Text("lc.common.install".loc)
                     .font(.caption)
@@ -230,7 +230,7 @@ private struct ShareAppIconView: View {
                     .font(.system(size: geometry.size.width * 0.56))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .foregroundStyle(.secondary)
-                    .background(Color(.secondarySystemBackground))
+                    .background { Color(.secondarySystemBackground) }
                     .clipShape(RoundedRectangle(cornerRadius: geometry.size.width * 0.2667, style: .continuous))
             }
         }

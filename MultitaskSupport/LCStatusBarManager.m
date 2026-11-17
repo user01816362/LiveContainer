@@ -23,10 +23,6 @@
 
 @implementation UIApplication(LiveContainer)
 + (Class)_statusBarManagerClass {
-    if (@available(iOS 16.0, *)) {
-        return LCStatusBarManager.class;
-    } else {
-        return UIStatusBarManager.class;
-    }
+    return LCStatusBarManager.class;
 }
 @end

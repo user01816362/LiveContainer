@@ -5,6 +5,7 @@
 #import "PlugInKitPrivate.h"
 #import "LivePlugInServer.h"
 #import "../utils.h"
+#import "../LCSharedUtils.h"
 #import "Tweaks.h"
 
 static NSURL *guestExtensionsAppURL;
@@ -35,7 +36,8 @@ NSDictionary* prepareGuestPlugInConfig(NSBundle* guestBundle, NSError** errorOut
     } else if (NSUserDefaults.lcAppGroupPath.length) {
         appGroupPath = [NSUserDefaults.lcAppGroupPath stringByAppendingPathComponent:@"LiveContainer/Data/AppGroup"];
     } else {
-        appGroupPath = [@(getenv("LC_HOME_PATH")) stringByAppendingPathComponent:@"Documents/Data/AppGroup"];
+        NSString *lcHome = [LCSharedUtils cachedLcHomePath] ?: NSHomeDirectory();
+        appGroupPath = [lcHome stringByAppendingPathComponent:@"Documents/Data/AppGroup"];
     }
     if (!error) [fm createDirectoryAtPath:appGroupPath withIntermediateDirectories:YES attributes:nil error:&error];
     if (!error) {
@@ -60,7 +62,7 @@ NSDictionary* prepareGuestPlugInConfig(NSBundle* guestBundle, NSError** errorOut
             @"guestContainerInfo": NSUserDefaults.guestContainerInfo ?: @{},
             @"appGroupPath": NSUserDefaults.lcAppGroupPath ?: @"",
             @"parentContainerPath": guestExtensionsContainerURL.path,
-            @"lcHomePath": @(getenv("LC_HOME_PATH")),
+            @"lcHomePath": [LCSharedUtils cachedLcHomePath] ?: @"",
     };
 
     return envelope;

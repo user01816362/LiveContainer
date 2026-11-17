@@ -6,7 +6,9 @@
 - (NSString *)lc_realpath {
     // stringByResolvingSymlinksInPath does not fully resolve symlink, and some apps will crash without /private prefix
     char result[PATH_MAX];
-    realpath(self.fileSystemRepresentation, result);
+    if (!self.fileSystemRepresentation || !realpath(self.fileSystemRepresentation, result)) {
+        return self;
+    }
     return [NSString stringWithUTF8String:result];
 }
 @end

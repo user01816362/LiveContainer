@@ -21,7 +21,6 @@ static NSError *PrivateIntentError(NSInteger code, NSString *description) {
 + (NSProgress *)runWithIdentifier:(NSString *)identifier
                   mangledTypeName:(NSString *)mangledTypeName
                        completion:(PrivateIntentCompletion)completion {
-    NSError *error = nil;
     audit_token_t auditToken = {};
 
     Class actionClass = NSClassFromString(@"LNAction");

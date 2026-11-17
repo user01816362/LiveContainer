@@ -92,7 +92,7 @@ static int hooked___fcntl(int fildes, int cmd, void *param) {
     return orig_fcntl(fildes, cmd, param);
 }
 
-char *searchDyldFunction(char *base, char *signature, int length) {
+char *searchDyldFunction(char *base, const char *signature, int length) {
     char *patchAddr = NULL;
     for(int i=0; i < 0x80000; i+=4) {
         if (base[i] == signature[0] && memcmp(base+i, signature, length) == 0) {
@@ -107,8 +107,10 @@ void init_bypassDyldLibValidation(void) {
     static BOOL bypassed;
     if (bypassed) return;
     bypassed = YES;
-    // supporting this on 26 requires other apps to use universal JIT script, sadly not the case now
-    if (@available(iOS 19.0, *)) return;
+#if !TARGET_OS_SIMULATOR
+    // Library validation bypass via dyld patch is unsupported on iOS 26+; JITLess handles code signing.
+    if (bypassed) return;
+#endif
 
     NSLog(@"[DyldLVBypass] init");
     

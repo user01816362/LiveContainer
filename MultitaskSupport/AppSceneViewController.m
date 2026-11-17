@@ -29,99 +29,21 @@
 @property(nonatomic) bool isAppTerminationCleanUpCalled;
 @end
 
-static UIInterfaceOrientation LCInterfaceOrientationForView(UIView *view) {
-    UIWindowScene *windowScene = view.window.windowScene;
-    if (!windowScene) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (![scene isKindOfClass:UIWindowScene.class]) {
-                continue;
-            }
-            UIWindowScene *candidateScene = (UIWindowScene *)scene;
-            if (candidateScene.activationState == UISceneActivationStateForegroundActive) {
-                windowScene = candidateScene;
-                break;
-            }
-            if (!windowScene) {
-                windowScene = candidateScene;
-            }
-        }
-    }
-    return windowScene ? windowScene.interfaceOrientation : UIInterfaceOrientationPortrait;
-}
-
-static NSString *const kLCStrictContainerInfoFileName = @"LCContainerInfo.plist";
-
-static NSString *LCContainerPathForDataUUID(NSString *dataUUID) {
-    if(dataUUID.length == 0) {
-        return nil;
-    }
-
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSURL *docURL = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
-    NSMutableArray<NSURL *> *candidateURLs = [NSMutableArray array];
-    if(docURL) {
-        [candidateURLs addObject:[docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]]];
-    }
-    NSURL *appGroupPath = [LCSharedUtils appGroupPath];
-    if(appGroupPath) {
-        [candidateURLs addObject:[appGroupPath URLByAppendingPathComponent:[NSString stringWithFormat:@"LiveContainer/Data/Application/%@", dataUUID]]];
-    }
-
-    for(NSURL *candidateURL in candidateURLs) {
-        NSString *containerInfoPath = [[candidateURL path] stringByAppendingPathComponent:kLCStrictContainerInfoFileName];
-        if([fm fileExistsAtPath:containerInfoPath]) {
-            return candidateURL.path;
-        }
-    }
-    return nil;
-}
-
-static BOOL LCStrictShouldAutoWipeContainerAtPath(NSString *containerPath) {
-    if(containerPath.length == 0) {
-        return NO;
-    }
-    NSString *containerInfoPath = [containerPath stringByAppendingPathComponent:kLCStrictContainerInfoFileName];
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
-    if(![info isKindOfClass:NSDictionary.class]) {
-        return NO;
-    }
-    return [info[@"strictTestMode"] boolValue] && [info[@"strictAutoWipeOnExit"] boolValue];
-}
-
-static void LCStrictEnsureContainerDirectoriesAtPath(NSString *containerPath) {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSArray<NSString *> *directories = @[@"Library/Caches", @"Library/Cookies", @"Documents", @"SystemData", @"tmp"];
-    for(NSString *directory in directories) {
-        NSString *path = [containerPath stringByAppendingPathComponent:directory];
-        [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-}
-
-static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
-    NSString *containerPath = LCContainerPathForDataUUID(dataUUID);
-    if(containerPath.length == 0 || !LCStrictShouldAutoWipeContainerAtPath(containerPath)) {
-        return;
-    }
-
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSError *listError = nil;
-    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:containerPath error:&listError];
-    if(!entries) {
-        NSLog(@"[LC][StrictMode] Failed to enumerate container %@ for auto-wipe: %@", dataUUID, listError.localizedDescription);
-        return;
-    }
-
-    for(NSString *entry in entries) {
-        if([entry isEqualToString:kLCStrictContainerInfoFileName]) {
+static UIScreen *LCFallbackActiveScreen(void) {
+    UIScreen *fallbackScreen = nil;
+    for (UISceneSession *session in UIApplication.sharedApplication.openSessions) {
+        if (![session.scene isKindOfClass:UIWindowScene.class]) {
             continue;
         }
-        NSError *removeError = nil;
-        NSString *entryPath = [containerPath stringByAppendingPathComponent:entry];
-        if(![fm removeItemAtPath:entryPath error:&removeError] && removeError) {
-            NSLog(@"[LC][StrictMode] Failed to remove %@ in container %@: %@", entry, dataUUID, removeError.localizedDescription);
+        UIWindowScene *windowScene = (UIWindowScene *)session.scene;
+        if (windowScene.activationState == UISceneActivationStateForegroundActive) {
+            return windowScene.screen;
+        }
+        if (!fallbackScreen) {
+            fallbackScreen = windowScene.screen;
         }
     }
-    LCStrictEnsureContainerDirectoriesAtPath(containerPath);
+    return fallbackScreen;
 }
 
 @implementation AppSceneViewController
@@ -169,7 +91,9 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
     NSURL *docURL = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"LCSharePrivateDataWithLiveProcess"]) {
         NSData* bookmarkData = [docURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
-        [bookmarks addObject:bookmarkData];
+        if(bookmarkData) {
+            [bookmarks addObject:bookmarkData];
+        }
     } else {
         bool isSharedApp = false;
         NSBundle* bundle = [LCSharedUtils findBundleWithBundleId:bundleId isSharedAppOut:&isSharedApp];
@@ -177,12 +101,18 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
         if (!isSharedApp) {
             NSURL *dataURL = [docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]];
             NSURL *tweaksURL = [docURL URLByAppendingPathComponent:@"Tweaks"];
-            [bookmarks addObject:[bundle.bundleURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
+            NSData* bundleBookmark = [bundle.bundleURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
+            if(bundleBookmark) {
+                [bookmarks addObject:bundleBookmark];
+            }
             NSData* containerBookmark = [dataURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
             if(containerBookmark) {
                 [bookmarks addObject:containerBookmark];
             }
-            [bookmarks addObject:[tweaksURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
+            NSData* tweaksBookmark = [tweaksURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
+            if(tweaksBookmark) {
+                [bookmarks addObject:tweaksBookmark];
+            }
         }
     }
     item.userInfo = userInfo;
@@ -224,7 +154,10 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
     void (^updateSceneSettings)(id) = ^void(UIMutableApplicationSceneSettings *settings) {
         settings.canShowAlerts = YES;
         settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:self.view.layer.cornerRadius bottomLeft:self.view.layer.cornerRadius bottomRight:self.view.layer.cornerRadius topRight:self.view.layer.cornerRadius];
-        settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
+        UIScreen *targetScreen = self.view.window.windowScene.screen ?: self.hostScene.screen ?: LCFallbackActiveScreen();
+        if (targetScreen) {
+            settings.displayConfiguration = targetScreen.displayConfiguration;
+        }
         settings.foreground = YES;
         //settings.interruptionPolicy = 2; // reconnect
         settings.level = 1;
@@ -232,88 +165,54 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
         settings.statusBarDisabled = !self.isNativeWindow;
         //settings.previewMaximumSize =
         //settings.deviceOrientationEventsEnabled = YES;
-        if(!self.usesHostingControllerAPI) {
-            settings.safeAreaInsetsPortrait = self.view.safeAreaInsets;
-        }
     };
     void (^updateSceneClientSettings)(id) = ^void(UIMutableApplicationSceneClientSettings *clientSettings) {
         clientSettings.interfaceOrientation = UIInterfaceOrientationPortrait;
         clientSettings.statusBarStyle = 0;
     };
 
-    if (@available(iOS 18.0, *)) {
-        // Use new API for iOS 18+. While some of these APIs are available since 17.0, we're only interested in fixing event deferring issue
-        _UISceneHostingControllerAdvancedConfiguration *config = [[_UISceneHostingControllerAdvancedConfiguration alloc] initWithProcessIdentity:processHandle.identity];
-        config.sceneSpecification = specification;
-        if (@available(iOS 27.0, *)) {} else {
-            // on 27 manually adding this is not need, also setAdditionalExtensions: doesn't exist for some reason
-            config.additionalExtensions = [NSOrderedSet orderedSetWithArray:@[
-                PrivClass(_UISceneHostingEventDeferringExtension),
-            ]];
-        }
-        self.hostingController = [[_UISceneHostingController alloc] initWithAdvancedConfiguration:config];
-        /// !! do NOT use self.hostingController.sceneView here as it breaks keyboard focus on iOS 26 below. I have no idea why this happens even though both return the same object. Maybe sceneView didn't initialize its ViewController properly?
-        self.contentView = self.hostingController.sceneViewController.view;
-        self.contentView.clipsToBounds = NO;
-        // _scenePresenter was a property in 26, but made only ivar in 27
+    // Use _UISceneHostingController (iOS 27+)
+    _UISceneHostingControllerAdvancedConfiguration *config = [[_UISceneHostingControllerAdvancedConfiguration alloc] initWithProcessIdentity:processHandle.identity];
+    config.sceneSpecification = specification;
+    self.hostingController = [[_UISceneHostingController alloc] initWithAdvancedConfiguration:config];
+    /// !! do NOT use self.hostingController.sceneView here as it breaks keyboard focus on iOS 26 below. Maybe sceneView didn't initialize its ViewController properly?
+    self.contentView = self.hostingController.sceneViewController.view;
+    self.contentView.clipsToBounds = NO;
+    @try {
         self.presenter = [self.contentView valueForKey:@"_scenePresenter"];
-        self.sceneID = self.presenter.identifier;
-        FBScene *scene = self.presenter.scene;
-        [scene configureParameters:^(FBSMutableSceneParameters *parameters) {
-            [parameters updateSettingsWithBlock:updateSceneSettings];
-            [parameters updateClientSettingsWithBlock:updateSceneClientSettings];
-        }];
-        
-        /// Fix keyboard focus by setting up event deferring extension. Previously we worked around it by changing identifier, but that broke other things
-        _UISceneEventDeferringHostComponent *deferringComponent = self.hostingController._eventDeferringComponent;
-        NSAssert(deferringComponent, @"Unexpectedly nil _UISceneEventDeferringHostComponent");
-        if (@available(iOS 27.0, *)) { // _UIKeyboardArbiterUsesDeferringGraph()
-            /// UIKitCore`__85-[_UIRemoteViewControllerSceneHostingImpl _viewServiceHostSessionDidConnectToClient:]_block_invoke
-            /// iOS 27 requires setting up _UISceneEventDeferringHostComponent for keyboard focus to work
-            
-            /// Replicate these methods since they are made private
-            /// -[_UISceneEventDeferringHostComponent setFirstResponderTrackingSelectionPath:]:
-            [deferringComponent setValue:self forKey:@"_firstResponderTrackingSelectionPath"];
-            // if (!deferringComponent->_flags.clientIsInChain) return;
-            /// -[_UISceneEventDeferringHostComponent becomeFirstResponderIfNecessary]:
-            // if (deferringComponent->_flags.maintainHostFirstResponderWhenClientWantsKeyboard)
-            
-            deferringComponent.grantBehavior = 2;
-            deferringComponent.selectionRequestBehavior = 2;
-        }
-        /// UIKitCore`-[_UISceneHostingController createSceneWithConfiguration:]
-        /// Lower iOS uses _UISceneHostingEventDeferringExtension, no further setup needed
-        
-        // Now it's time to get the initial settings from decorated VC
-        [self.delegate appSceneVCWillActivateScene:self];
-        [self addChildViewController:self.hostingController.sceneViewController];
-        
-        // For new API, let FBSSceneObserver send host scene events instead of NSExtensionContext
-        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
-        [center removeObserver:self.extension name:UIApplicationDidBecomeActiveNotification object:UIApp];
-        [center removeObserver:self.extension name:UIApplicationWillResignActiveNotification object:UIApp];
-        [center removeObserver:self.extension name:UIApplicationDidEnterBackgroundNotification object:UIApp];
-        [center removeObserver:self.extension name:UIApplicationWillEnterForegroundNotification object:UIApp];
-    } else {
-        self.sceneID = [NSString stringWithFormat:@"sceneID:%@-%@", @"LiveProcess", self.dataUUID];
-        FBSMutableSceneDefinition *definition = [PrivClass(FBSMutableSceneDefinition) definition];
-        definition.identity = [PrivClass(FBSSceneIdentity) identityForIdentifier:self.sceneID];
-        definition.clientIdentity = [PrivClass(FBSSceneClientIdentity) identityForProcessIdentity:processHandle.identity];
-        definition.specification = specification;
-        
-        FBSMutableSceneParameters *parameters = [PrivClass(FBSMutableSceneParameters) parametersForSpecification:specification];
+    } @catch (NSException *exception) {
+        NSLog(@"[LC] Unable to read _scenePresenter via KVC: %@", exception);
+    }
+    self.sceneID = self.presenter.identifier;
+    FBScene *scene = self.presenter.scene;
+    [scene configureParameters:^(FBSMutableSceneParameters *parameters) {
         [parameters updateSettingsWithBlock:updateSceneSettings];
         [parameters updateClientSettingsWithBlock:updateSceneClientSettings];
-        FBScene *scene = [[PrivClass(FBSceneManager) sharedInstance] createSceneWithDefinition:definition initialParameters:parameters];
-        self.presenter = [scene.uiPresentationManager createPresenterWithIdentifier:self.sceneID];
-        [self.presenter modifyPresentationContext:^(UIMutableScenePresentationContext *context) {
-            context.appearanceStyle = 2;
-        }];
-        [self.presenter activate];
-        
-        self.contentView = [[UIView alloc] init];
-        [self.contentView addSubview:self.presenter.presentationView];
+    }];
+    
+    /// Fix keyboard focus by setting up event deferring extension.
+    _UISceneEventDeferringHostComponent *deferringComponent = self.hostingController._eventDeferringComponent;
+    if (deferringComponent) {
+        @try {
+            /// Replicate -[_UISceneEventDeferringHostComponent setFirstResponderTrackingSelectionPath:]
+            [deferringComponent setValue:self forKey:@"_firstResponderTrackingSelectionPath"];
+        } @catch (NSException *exception) {
+            NSLog(@"[LC] Unable to set _firstResponderTrackingSelectionPath: %@", exception);
+        }
+        deferringComponent.grantBehavior = 2;
+        deferringComponent.selectionRequestBehavior = 2;
     }
+    
+    // Now it's time to get the initial settings from decorated VC
+    [self.delegate appSceneVCWillActivateScene:self];
+    [self addChildViewController:self.hostingController.sceneViewController];
+    
+    // For new API, let FBSSceneObserver send host scene events instead of NSExtensionContext
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center removeObserver:self.extension name:UIApplicationDidBecomeActiveNotification object:UIApp];
+    [center removeObserver:self.extension name:UIApplicationWillResignActiveNotification object:UIApp];
+    [center removeObserver:self.extension name:UIApplicationDidEnterBackgroundNotification object:UIApp];
+    [center removeObserver:self.extension name:UIApplicationWillEnterForegroundNotification object:UIApp];
     [self.view addSubview:_contentView];
     
     // If we have a staging URL scheme, pass it now
@@ -330,7 +229,10 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
     self.contentView.layer.anchorPoint = CGPointMake(0, 0);
     self.contentView.layer.position = CGPointMake(0, 0);
     
-    [self.view.window.windowScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
+    self.hostScene = self.view.window.windowScene;
+    if (self.hostScene && self.sceneID) {
+        [self.hostScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
+    }
 }
 
 - (void)terminate {
@@ -368,7 +270,7 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
         }
         [self updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
-            settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
+            settings.interfaceOrientation = self.view.window.windowScene.effectiveGeometry.interfaceOrientation;
             CGRect frame = self.view.frame;
             if(!self.usesHostingControllerAPI) {
                 frame.size.width /= self.scaleRatio;
@@ -418,8 +320,6 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
     }
     
     if (self.contentView) {
-        BOOL isiOS26 = NO;
-        if(@available(iOS 19.0, *)) { if(@available(iOS 27.0, *)) {} else isiOS26 = YES; }
         // Discard position
         frame.origin = CGPointZero;
         self.contentView.frame = frame;
@@ -443,18 +343,18 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
             [[PrivClass(FBSceneManager) sharedInstance] destroyScene:self.sceneID withTransitionContext:nil];
         }
         if(self.usesHostingControllerAPI) {
-            if(@available(iOS 17.0, *)) {
-                [self.hostingController invalidate];
-                [self.hostingController.sceneViewController removeFromParentViewController];
-                self.hostingController = nil;
-            }
+            [self.hostingController invalidate];
+            [self.hostingController.sceneViewController willMoveToParentViewController:nil];
+            [self.hostingController.sceneViewController.view removeFromSuperview];
+            [self.hostingController.sceneViewController removeFromParentViewController];
+            self.hostingController = nil;
         } else if(self.presenter){
             [self.presenter deactivate];
             [self.presenter invalidate];
             self.presenter = nil;
         }
 
-        LCStrictAutoWipeContainerForDataUUIDIfNeeded(self.dataUUID);
+        [LCSharedUtils wipeStrictContainerForDataUUIDIfNeeded:self.dataUUID];
         
         [self.delegate appSceneVCAppDidExit:self];
         [MultitaskManager unregisterMultitaskContainerWithContainer:self.dataUUID];
@@ -487,9 +387,13 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
     [super viewDidMoveToWindow:newWindow shouldAppearOrDisappear:appear];
     if(!newWindow) {
         if(self.sceneID) {
-            [self.view.window.windowScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
+            UIWindowScene *sceneToUnregister = self.hostScene ?: self.view.window.windowScene;
+            [sceneToUnregister _unregisterSettingsDiffActionArrayForKey:self.sceneID];
+            self.hostScene = nil;
         }
         self.delegate = nil;
+    } else {
+        self.hostScene = newWindow.windowScene;
     }
 }
 
@@ -498,7 +402,10 @@ static void LCStrictAutoWipeContainerForDataUUIDIfNeeded(NSString *dataUUID) {
         // pull from UserDefaults.standard.setValue(launchURLStr, forKey: "launchAppUrlScheme")
         UIApplicationSceneTransitionContext *context = [UIApplicationSceneTransitionContext new];
         NSURL *url = [NSURL URLWithString:urlString];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         context.payload = @{UIApplicationLaunchOptionsURLKey: urlString};
+#pragma clang diagnostic pop
         context.actions = [NSSet setWithObject:[[UIOpenURLAction alloc] initWithURL:url]];
         return context;
     }];

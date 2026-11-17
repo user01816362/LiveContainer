@@ -31,7 +31,7 @@ struct LCAppBinaryExportView: View {
     }
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 if items.isEmpty {
                     Text("No .dylib or .framework was found in this app bundle.")

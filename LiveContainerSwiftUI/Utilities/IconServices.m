@@ -29,8 +29,8 @@
 
 @interface ISImageDescriptor : NSObject
 @property (nonatomic, assign, readwrite) NSInteger appearance;
-@property (nonatomic, assign, readwrite) NSInteger appearanceVariant NS_AVAILABLE_IOS(18_0);
-@property (nonatomic, assign, readwrite) NSUInteger specialIconOptions NS_AVAILABLE_IOS(18_0);
+@property (nonatomic, assign, readwrite) NSInteger appearanceVariant;
+@property (nonatomic, assign, readwrite) NSUInteger specialIconOptions;
 @property (nonatomic, assign, readwrite) BOOL drawBorder;
 @property (nonatomic, assign, readwrite) BOOL shouldApplyMask;
 @property (atomic, assign, readwrite) BOOL ignoreCache;
@@ -196,16 +196,9 @@ NSMutableSet<ISBundleIcon*>* iconsNeedToGenerateOriginalIcon;
     LSApplicationRecordFake* record = [[LSApplicationRecordFake alloc] initWithBundle:bundle];
     ISRecordResourceProvider* provider = [[PrivClass(ISRecordResourceProvider) alloc] initWithRecord:record options:0];
     
-    if(@available(iOS 17.0, *)) {
-        // set suggestedRecipe so -[ISRecipeFactory _recipe] skips all checks and directly use ISiOSAppRecipe
-        [provider setSuggestedRecipe:[[PrivClass(ISiOSAppRecipe) alloc] init]];
-        [provider setResourceType:1];
-    } else {
-        // force IconShape to 7 so a ISiOSAppRecipe will eventually generate in -[ISGenerationRequest generateImageReturningRecordIdentifiers:]
-        // 0x1a04c116c(x26, &sel_setShape:, 0x1a04c116c(x0_37, &sel_iconShape))
-        // shape - 1 > 5 -> ISiOSAppRecipe
-        [provider setIconShape:7];
-    }
+    // set suggestedRecipe so -[ISRecipeFactory _recipe] skips all checks and directly use ISiOSAppRecipe
+    [provider setSuggestedRecipe:[[PrivClass(ISiOSAppRecipe) alloc] init]];
+    [provider setResourceType:1];
     return provider;
 }
 
@@ -278,6 +271,24 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
     return image;
 }
 
+static CGFloat LCActiveDisplayScale(void) {
+    CGFloat screenScale = UITraitCollection.currentTraitCollection.displayScale;
+    if (screenScale > 0) {
+        return screenScale;
+    }
+    if (NSThread.isMainThread) {
+        for (UISceneSession *session in UIApplication.sharedApplication.openSessions) {
+            if ([session.scene isKindOfClass:UIWindowScene.class]) {
+                CGFloat candidateScale = ((UIWindowScene *)session.scene).screen.scale;
+                if (candidateScale > 0) {
+                    return candidateScale;
+                }
+            }
+        }
+    }
+    return 3.0;
+}
+
 @implementation UIImage(LiveContainer)
 + (instancetype)generateIconForBundleURL:(NSURL*)url style:(GeneratedIconStyle)style hasBorder:(BOOL)hasBorder {
     static dispatch_once_t onceToken;
@@ -298,12 +309,6 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
         method_exchangeImplementations(class_getInstanceMethod(PrivClass(LSApplicationRecord), @selector(initWithURL:allowPlaceholder:error:)), class_getInstanceMethod(LSApplicationRecordFake.class, @selector(initWithURL:allowPlaceholder:error:)));
     });
     
-    if(@available(iOS 18.0, *)) {
-        
-    } else {
-        style = 0;
-    }
-    
     ISBundleIcon* icon = [[PrivClass(ISBundleIcon) alloc] initWithBundleURL:url];
     ISImageDescriptor *descriptor = [PrivClass(ISImageDescriptor) imageDescriptorNamed:@"com.apple.IconServices.ImageDescriptor.HomeScreen"];
     
@@ -313,24 +318,14 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
     
 
     descriptor.ignoreCache = YES;
-    descriptor.scale = UIScreen.mainScreen.scale;
+    descriptor.scale = LCActiveDisplayScale();
     descriptor.variantOptions = 0;
 
-    if (@available(iOS 16.0, *)) {
-        // 0 = light mode, 1 = dark mode
-        if(style == 1) {
-            descriptor.appearance = 1;
-        } else {
-            descriptor.appearance = 0;
-        }
-    }
-    if (@available(iOS 18.0, *)) {
-        if(@available(iOS 18.2, *)) {
-            // 0 = normal, 2 = tinted mode, 3 = liquid glass (gray scale)
-            descriptor.appearanceVariant = 0;
-        }
-        descriptor.specialIconOptions = 2;
-    }
+    // 0 = light mode, 1 = dark mode
+    descriptor.appearance = (style == 1) ? 1 : 0;
+    // 0 = normal, 2 = tinted mode, 3 = liquid glass (gray scale)
+    descriptor.appearanceVariant = 0;
+    descriptor.specialIconOptions = 2;
     
     descriptor.drawBorder = hasBorder;
     descriptor.shouldApplyMask = hasBorder;

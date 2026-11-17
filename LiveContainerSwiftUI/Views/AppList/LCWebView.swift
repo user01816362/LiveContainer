@@ -22,10 +22,10 @@ struct LCWebView: View {
     @State private var isLoading = false
     @State private var showShareSheet = false
     
-    @State private var runAppAlert = YesNoHelper()
+    @StateObject private var runAppAlert = YesNoHelper()
     @State private var runAppAlertMsg = ""
     
-    @State private var installAppAlert = YesNoHelper()
+    @StateObject private var installAppAlert = YesNoHelper()
     @State private var installAppAlertMsg = ""
     
     @State private var errorShow = false
@@ -67,7 +67,7 @@ struct LCWebView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
-        .background(Color(.systemBackground))
+        .background { Color(.systemBackground) }
         .onAppear {
             if !didAppear {
                 onViewAppear()
@@ -113,66 +113,68 @@ struct LCWebView: View {
     }
 
     private var navigationBar: some View {
-        HStack(spacing: 8) {
-            Button {
-                isPresent = false
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 17, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .modifier(LCWebViewGlassBackground(shape: Circle(), isInteractive: true))
-            }
-
-            VStack(spacing: 3) {
-                Text(pageTitle.isEmpty ? (currentURL.host ?? currentURL.absoluteString) : pageTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .accessibilityAddTraits(.isHeader)
-                HStack(spacing: 4) {
-                    if currentURL.scheme == "https" {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 9))
-                    }
-                    Text(currentURL.host ?? currentURL.absoluteString)
-                        .font(.caption)
-                }
-                .foregroundStyle(.secondary)
-            }
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .frame(maxWidth: .infinity)
-            .frame(height: 44)
-            .padding(.horizontal, 12)
-            .modifier(LCWebViewGlassBackground(shape: Capsule()))
-            Button {
-                if isLoading {
-                    webView.webView.stopLoading()
-                } else {
-                    webView.reload()
-                }
-            } label: {
-                if isLoading {
+        GlassEffectContainer {
+            HStack(spacing: 8) {
+                Button {
+                    isPresent = false
+                } label: {
                     Image(systemName: "xmark")
-                } else {
-                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 44, height: 44)
+                        .modifier(LCWebViewGlassBackground(shape: Circle(), isInteractive: true))
                 }
+
+                VStack(spacing: 3) {
+                    Text(pageTitle.isEmpty ? (currentURL.host ?? currentURL.absoluteString) : pageTitle)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .accessibilityAddTraits(.isHeader)
+                    HStack(spacing: 4) {
+                        if currentURL.scheme == "https" {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: 9))
+                        }
+                        Text(currentURL.host ?? currentURL.absoluteString)
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity)
+                .frame(height: 44)
+                .padding(.horizontal, 12)
+                .modifier(LCWebViewGlassBackground(shape: Capsule()))
+                Button {
+                    if isLoading {
+                        webView.webView.stopLoading()
+                    } else {
+                        webView.reload()
+                    }
+                } label: {
+                    if isLoading {
+                        Image(systemName: "xmark")
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .font(.system(size: 20, weight: .medium))
+                .frame(width: 44, height: 44)
+                .modifier(LCWebViewGlassBackground(shape: Circle(), isInteractive: true))
+                
             }
-            .font(.system(size: 20, weight: .medium))
-            .frame(width: 44, height: 44)
-            .modifier(LCWebViewGlassBackground(shape: Circle(), isInteractive: true))
-            
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .buttonStyle(.plain)
+            .overlay(alignment: .bottom) {
+                ProgressView(value: uiLoadStatus)
+                    .progressViewStyle(.linear)
+                    .opacity(isLoading ? 1 : 0)
+                    .scaleEffect(y: 0.5, anchor: .bottom)
+                    .allowsHitTesting(false)
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .buttonStyle(.plain)
-        .overlay(alignment: .bottom) {
-            ProgressView(value: uiLoadStatus)
-                .progressViewStyle(.linear)
-                .opacity(isLoading ? 1 : 0)
-                .scaleEffect(y: 0.5, anchor: .bottom)
-                .allowsHitTesting(false)
-        }
-        .onChange(of: loadStatus) { newValue in
+        .onChange(of: loadStatus) { _, newValue in
             if newValue > uiLoadStatus {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     uiLoadStatus = newValue
@@ -184,46 +186,48 @@ struct LCWebView: View {
     }
 
     private var bottomBar: some View {
-        HStack {
-            Button(action: webView.goBack) {
-                Image(systemName: "chevron.backward")
-                    .frame(width: 44, height: 44)
-            }
-            .disabled(!canGoBack)
+        GlassEffectContainer {
+            HStack {
+                Button(action: webView.goBack) {
+                    Image(systemName: "chevron.backward")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(!canGoBack)
 
-            Spacer(minLength: 0)
-            Button(action: webView.goForward) {
-                Image(systemName: "chevron.forward")
-                    .frame(width: 44, height: 44)
-            }
-            .disabled(!canGoForward)
+                Spacer(minLength: 0)
+                Button(action: webView.goForward) {
+                    Image(systemName: "chevron.forward")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(!canGoForward)
 
-            Spacer(minLength: 0)
-            Button {
-                showShareSheet = true
-            } label: {
-                Image(systemName: "square.and.arrow.up")
-                    .frame(width: 44, height: 44)
-            }
+                Spacer(minLength: 0)
+                Button {
+                    showShareSheet = true
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .frame(width: 44, height: 44)
+                }
 
-            Spacer(minLength: 0)
-            Button {
-                UIApplication.shared.open(currentURL)
-            } label: {
-                Image(systemName: "safari")
-                    .frame(width: 44, height: 44)
+                Spacer(minLength: 0)
+                Button {
+                    UIApplication.shared.open(currentURL)
+                } label: {
+                    Image(systemName: "safari")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(!["http", "https"].contains(currentURL.scheme ?? ""))
             }
-            .disabled(!["http", "https"].contains(currentURL.scheme ?? ""))
+            .font(.system(size: 20))
+            .frame(maxWidth: 420)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 2)
+            .modifier(LCWebViewGlassBackground(shape: Capsule(), isInteractive: true))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .buttonStyle(.plain)
         }
-        .font(.system(size: 20))
-        .frame(maxWidth: 420)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 2)
-        .modifier(LCWebViewGlassBackground(shape: Capsule(), isInteractive: true))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
-        .buttonStyle(.plain)
     }
 
     func onViewAppear() {
@@ -237,9 +241,9 @@ struct LCWebView: View {
         let bundleId = app.appInfo.relativeBundlePath!
         if let runningLC = LCSharedUtils.getContainerUsingLCScheme(withFolderName: app.uiDefaultDataFolder){
             let encodedUrl = Data(url.absoluteString.utf8).base64EncodedString()
-            if let urlToOpen = URL(string: "\(runningLC)://livecontainer-launch?bundle-name=\(bundleId)&open-url=\(encodedUrl)"), UIApplication.shared.canOpenURL(urlToOpen) {
+            if let urlToOpen = URL(string: "\(runningLC)://livecontainer-launch?bundle-name=\(bundleId)&open-url=\(encodedUrl)"),
+               await UIApplication.shared.open(urlToOpen) {
                 NSLog("[LC] urlToOpen = \(urlToOpen.absoluteString)")
-                await UIApplication.shared.open(urlToOpen)
                 isPresent = false
                 return
             }
@@ -362,13 +366,8 @@ private struct LCWebViewGlassBackground<S: Shape>: ViewModifier {
     let shape: S
     var isInteractive = false
 
-    @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content.glassEffect(.regular.interactive(isInteractive), in: shape)
-        } else {
-            content.background(.regularMaterial, in: shape)
-        }
+        content.glassEffect(.regular.interactive(isInteractive), in: shape)
     }
 }
 
@@ -442,48 +441,43 @@ class WebViewDelegate : NSObject,WKNavigationDelegate {
         if url.scheme != "https" || url.host == nil {
             return
         }
-        if self.domainBundleIdDict[url.host!] != nil {
+        guard let host = url.host else {
             return
         }
-        guard let host = url.host else {
+        if self.domainBundleIdDict[host] != nil {
             return
         }
         
         // download and read apple-app-site-association
         let appleAppSiteAssociationURLs = [
-            URL(string: "https://\(host)/apple-app-site-association")!,
-            URL(string: "https://\(host)/.well-known/apple-app-site-association")!
-            ]
+            URL(string: "https://\(host)/apple-app-site-association"),
+            URL(string: "https://\(host)/.well-known/apple-app-site-association")
+        ].compactMap { $0 }
 
-        await withTaskGroup(of: Void.self) { group in
+        var collectedBundleIds: [String] = []
+        await withTaskGroup(of: [String].self) { group in
             for siteAssociationURL in appleAppSiteAssociationURLs {
                 group.addTask {
-                    await withUnsafeContinuation { c in
-                        let task = URLSession.shared.dataTask(with: siteAssociationURL) { data, response, error in
-                            do {
-                                guard let data = data else {
-                                    c.resume()
-                                    return
-                                }
-                                let siteAssociationObj = try JSONDecoder().decode(SiteAssociation.self, from: data)
-                                guard let detailItems = siteAssociationObj.applinks?.details else {
-                                    c.resume()
-                                    return
-                                }
-                                self.domainBundleIdDict[host] = []
-                                for item in detailItems {
-                                    self.domainBundleIdDict[host]!.append(contentsOf: item.getBundleIds())
-                                }
-                            } catch {
-                                
-                            }
-                            c.resume()
+                    do {
+                        let (data, _) = try await URLSession.shared.data(from: siteAssociationURL)
+                        let siteAssociationObj = try JSONDecoder().decode(SiteAssociation.self, from: data)
+                        guard let detailItems = siteAssociationObj.applinks?.details else {
+                            return []
                         }
-                        
-                        task.resume()
+                        return detailItems.flatMap { $0.getBundleIds() }
+                    } catch {
+                        return []
                     }
                 }
             }
+            for await ids in group {
+                for id in ids where !collectedBundleIds.contains(id) {
+                    collectedBundleIds.append(id)
+                }
+            }
+        }
+        if !collectedBundleIds.isEmpty {
+            self.domainBundleIdDict[host] = collectedBundleIds
         }
 
     }

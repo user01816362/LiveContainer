@@ -11,7 +11,6 @@
 - (void)handleTapAction:(UIAction *)action;
 @end
 
-API_AVAILABLE(ios(16.0))
 @interface LCStatusBarManager : UIStatusBarManager
 @property(nonatomic) AppSceneViewController *nativeWindowViewController;
 @end

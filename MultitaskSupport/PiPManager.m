@@ -9,17 +9,16 @@
 #include "DecoratedAppSceneViewController.h"
 #include "../LiveContainer/utils.h"
 
-API_AVAILABLE(ios(16.0))
 @interface PiPManager()
 @property(nonatomic, strong) UIView *pipVideoCallContentView;
 @property(nonatomic, strong) AVPictureInPictureVideoCallViewController *pipVideoCallViewController;
 @property(nonatomic, strong) AVPictureInPictureController *pipController;
 @property(nonatomic) AppSceneViewController* displayingVC;
+@property(nonatomic, weak) CALayer *observedBoundsLayer;
 @end
 
 
 @implementation PiPManager
-API_AVAILABLE(ios(16.0))
 static PiPManager* sharedInstance = nil;
 
 + (instancetype)shared {
@@ -45,10 +44,24 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (instancetype)init {
-    NSError* error = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
-    [[AVAudioSession sharedInstance] setActive:YES withOptions:1 error:&error];
+    self = [super init];
+    if (self) {
+        NSError* error = nil;
+        [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
+        [[AVAudioSession sharedInstance] setActive:YES withOptions:1 error:&error];
+    }
     return self;
+}
+
+- (void)removeBoundsObserver {
+    if (self.observedBoundsLayer) {
+        [self.observedBoundsLayer removeObserver:self forKeyPath:@"bounds"];
+        self.observedBoundsLayer = nil;
+    }
+}
+
+- (void)dealloc {
+    [self removeBoundsObserver];
 }
 
 - (void)startPiPWithVC:(AppSceneViewController*)vc {
@@ -97,7 +110,9 @@ static PiPManager* sharedInstance = nil;
         self.displayingVC.contentView.frame = CGRectMake(0, 0, self.displayingVC.view.bounds.size.width, self.displayingVC.view.bounds.size.height);
     }
     [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];
-    [self.pipVideoCallViewController.view.layer addObserver:self
+    [self removeBoundsObserver];
+    self.observedBoundsLayer = self.pipVideoCallViewController.view.layer;
+    [self.observedBoundsLayer addObserver:self
                                 forKeyPath:@"bounds"
                                    options:NSKeyValueObservingOptionNew
                                    context:NULL];
@@ -118,6 +133,7 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    [self removeBoundsObserver];
     [self.displayingVC.view insertSubview:self.displayingVC.contentView atIndex:0];
     [self.displayingVC setBackgroundNotificationEnabled:true];
     // resize if needed (eg orientation differs)
@@ -132,13 +148,18 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController failedToStartPictureInPictureWithError:(NSError *)error {
+    [self removeBoundsObserver];
     NSLog(@"%@", error.description);
 }
 
 - (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(NSObject*)object change:(NSDictionary<NSString *,id> *) change context:(void *) context {
     CGRect rect = [change[@"new"] CGRectValue];
     CGFloat scale = self.displayingVC.usesHostingControllerAPI ? self.displayingVC.scaleRatio : 1;
-    CGAffineTransform transform1 = CGAffineTransformScale(CGAffineTransformIdentity, rect.size.width / self.displayingVC.contentView.bounds.size.width/scale,rect.size.height /self.displayingVC.contentView.bounds.size.height/scale);
+    CGSize contentSize = self.displayingVC.contentView.bounds.size;
+    if (contentSize.width <= 0 || contentSize.height <= 0 || scale <= 0) {
+        return;
+    }
+    CGAffineTransform transform1 = CGAffineTransformScale(CGAffineTransformIdentity, rect.size.width / contentSize.width / scale, rect.size.height / contentSize.height / scale);
     self.pipVideoCallContentView.transform = transform1;
 }
 

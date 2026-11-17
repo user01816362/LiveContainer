@@ -117,7 +117,8 @@ OSStatus new_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey
 
 void SecItemGuestHooksInit(void)  {
 
-    containerId = [NSString stringWithUTF8String:getenv("HOME")].lastPathComponent;
+    const char *homeEnv = getenv("HOME");
+    containerId = (homeEnv ? [NSString stringWithUTF8String:homeEnv] : NSHomeDirectory()).lastPathComponent;
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
     int keychainGroupId = [infoDict[@"keychainGroupId"] intValue];
     NSString* groupId = [LCSharedUtils teamIdentifier];
@@ -148,5 +149,8 @@ void SecItemGuestHooksInit(void)  {
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecItemDelete, new_SecItemDelete, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyCreateRandomKey, new_SecKeyCreateRandomKey, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyCreateWithData, new_SecKeyCreateWithData, nil);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyGeneratePair, new_SecKeyGeneratePair, nil);
+#pragma clang diagnostic pop
 }

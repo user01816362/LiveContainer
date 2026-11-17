@@ -38,7 +38,7 @@ struct LCSettingsView: View {
     @State var successShow = false
     @State var successInfo = ""
 
-    @State private var certificateDataFound = false
+    @State private var certificateDataFound: Bool
 
     @StateObject private var certificateImportAlert = YesNoHelper()
     @StateObject private var certificateImportFromBuiltInSideStoreAlert = YesNoHelper()
@@ -58,7 +58,7 @@ struct LCSettingsView: View {
     @AppStorage("LCDeviceUDID", store: LCUtils.appGroupUserDefault) var deviceUDID: String = ""
     @AppStorage("LCJITEnablerType", store: LCUtils.appGroupUserDefault) var JITEnabler: JITEnablerType = .SideJITServer
 
-    @State var store : Store = .Unknown
+    @State var store : Store
 
     @AppStorage("LCLoadTweaksToSelf") var injectToLCItelf = false
     @AppStorage("LCIgnoreJITOnLaunch") var ignoreJITOnLaunch = false
@@ -69,10 +69,40 @@ struct LCSettingsView: View {
     @AppStorage("BKNoWatchdogs") var disableLiveProcessWatchdog = false
 
     @EnvironmentObject private var sharedModel : SharedModel
+    @ObservedObject private var presetStore = LCProfilePresetStore.shared
 
     @State private var isViewAppeared = false
 
     let storeName = LCUtils.getStoreName()
+
+    private var defaultProfileBadgeText: String {
+        switch presetStore.globalDefaultMode {
+        case .off: return "Off"
+        case .randomCoherentPhone: return "Auto-Random"
+        case .preset: return presetStore.selectedDefaultPreset?.name ?? "Preset"
+        }
+    }
+
+    @ViewBuilder
+    private var defaultProfileSection: some View {
+        Section {
+            NavigationLink {
+                LCDefaultProfileSettingsView()
+            } label: {
+                HStack {
+                    Text("Default Container Profile")
+                    Spacer()
+                    Text(defaultProfileBadgeText)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        } header: {
+            Text("Privacy & Device Presets")
+        } footer: {
+            Text("Automatically apply a 2026–2027 hardware preset or coherent randomized identity whenever new app containers are created.")
+        }
+    }
 
     init() {
         _certificateDataFound = State(initialValue: LCSharedUtils.certificatePassword() != nil)
@@ -80,7 +110,7 @@ struct LCSettingsView: View {
     }
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
                 if sharedModel.multiLCStatus != 2 {
                     Section{
@@ -147,17 +177,17 @@ struct LCSettingsView: View {
                     }
                 }
 
-                if #available(iOS 16.1, *) {
-                    Section {
-                        NavigationLink {
-                            LCMultitaskSettingView()
-                        } label: {
-                            Text("lc.appBanner.multitask".loc)
-                        }
-                    } footer: {
-                        Text("lc.settings.multitaskDesc".loc)
+                Section {
+                    NavigationLink {
+                        LCMultitaskSettingView()
+                    } label: {
+                        Text("lc.appBanner.multitask".loc)
                     }
+                } footer: {
+                    Text("lc.settings.multitaskDesc".loc)
                 }
+
+                defaultProfileSection
 
                 Section {
                     if JITEnabler == .SideJITServer || JITEnabler == .JITStreamerEBLegacy {
@@ -192,9 +222,9 @@ struct LCSettingsView: View {
 
                 Section {
                     Picker(selection: $selected32BitEmulator) {
+                        Text("lc.common.none".loc).tag("")
                         ForEach(sharedModel.arm32EmuApps, id: \.self) { app in
-                            Text("lc.common.none".loc).tag("")
-                            Text(app.appInfo.displayName()).tag(app.appInfo.relativeBundlePath!)
+                            Text(app.appInfo.displayName()).tag(app.appInfo.relativeBundlePath ?? "")
                         }
                     } label: {
                         Text("lc.settings.selected32BitEmulator".loc)
@@ -205,10 +235,8 @@ struct LCSettingsView: View {
                     Toggle(isOn: $dynamicColors) {
                         Text("lc.settings.dynamicColors".loc)
                     }
-                    if #available(iOS 18.0, *) {
-                        Toggle(isOn: $darkModeIcon) {
-                            Text("lc.settings.darkModeIcon".loc)
-                        }
+                    Toggle(isOn: $darkModeIcon) {
+                        Text("lc.settings.darkModeIcon".loc)
                     }
 
                 } header: {
@@ -443,7 +471,6 @@ struct LCSettingsView: View {
                 }
             )
         }
-        .navigationViewStyle(StackNavigationViewStyle())
         .onAppear() {
             if !isViewAppeared {
                 guard sharedModel.selectedTab == .settings, let link = sharedModel.deepLink else { return }
@@ -452,7 +479,7 @@ struct LCSettingsView: View {
                 isViewAppeared = true
             }
         }
-        .onChange(of: sharedModel.deepLink) { link in
+        .onChange(of: sharedModel.deepLink) { _, link in
             guard sharedModel.selectedTab == .settings, let link else { return }
             sharedModel.deepLink = nil
             handleURL(url: link)
@@ -475,11 +502,7 @@ struct LCSettingsView: View {
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
         notificationCenter.removeAllPendingNotificationRequests()
-        if #available(iOS 16.0, *) {
-            notificationCenter.setBadgeCount(0)
-        } else {
-            UIApplication.shared.applicationIconBadgeNumber = 0
-        }
+        notificationCenter.setBadgeCount(0)
     }
 
     func export() {

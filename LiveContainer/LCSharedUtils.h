@@ -17,4 +17,11 @@
 + (NSString*)findDefaultContainerWithBundleId:(NSString*)bundleId;
 + (NSArray<NSString*>*)lcUnorderedUrlSchemes;
 + (NSArray<NSString*>*)lcUrlSchemes;
++ (void)cacheProcessEnvironmentPaths;
++ (NSString *)cachedLcHomePath;
++ (NSString *)cachedLpHomePath;
++ (NSString *)cachedGlobalTweaksFolderPath;
++ (void)ensureContainerDirectoriesAtPath:(NSString *)containerPath;
++ (void)wipeStrictContainerIfNeededAtPath:(NSString *)containerPath force:(BOOL)force;
++ (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID;
 @end

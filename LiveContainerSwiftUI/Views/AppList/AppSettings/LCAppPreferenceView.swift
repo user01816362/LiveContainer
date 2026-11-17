@@ -129,8 +129,8 @@ struct PSMultiValue: View {
                 Text(delegate.localize(titles[i])).tag(values[i])
             }
         }
-        .onChange(of: realValue) { newValue in
-            delegate.set(key: key, val: realValue)
+        .onChange(of: realValue) { _, newValue in
+            delegate.set(key: key, val: newValue)
         }
     }
 }
@@ -142,24 +142,24 @@ struct PSToggleSwitch: View {
     let trueValue : AnyHashable
     let falseValue : AnyHashable
     let delegate : LCAppPreferencesDelegate
-    @State var realValue : Bool = false
+    @State var realValue : Bool
     
     init(title: String, key: String, defaultValue: AnyHashable, trueValue: AnyHashable?, falseValue: AnyHashable?, delegate: LCAppPreferencesDelegate) {
         self.title = title
         self.key = key
         self.defaultValue = defaultValue
         self.delegate = delegate
-        self.trueValue = trueValue ?? true as AnyHashable
-        self.falseValue = falseValue ?? false as AnyHashable
+        let trueVal = trueValue ?? true as AnyHashable
+        let falseVal = falseValue ?? false as AnyHashable
+        self.trueValue = trueVal
+        self.falseValue = falseVal
         let currentValue = delegate.get(key: key) ?? defaultValue
-        if currentValue == self.trueValue {
-            _realValue = State(initialValue: true)
-        }
+        self._realValue = State(initialValue: currentValue == trueVal)
     }
     
     var body: some View {
         Toggle(delegate.localize(title), isOn: $realValue)
-            .onChange(of: realValue) { newValue in
+            .onChange(of: realValue) { _, newValue in
                 delegate.set(key: key, val: newValue ? trueValue : falseValue)
             }
     }
@@ -236,25 +236,31 @@ struct PSGroup: View {
 struct AppPreferencePageView : View {
     let preferencePlistURL : URL
     
-    @State var children : [AnyView] = []
+    @State var children : [AnyView]
     @State var errorInfo : String?
 
     init(preferencePlistURL : URL, bundleId : String, containerURL : URL, settingsBundle: Bundle) {
         var children : [AnyView] = []
         self.preferencePlistURL = preferencePlistURL
         guard let dict = NSMutableDictionary(contentsOf: preferencePlistURL) else {
-            errorInfo = "Failed to load preference."
+            self._children = State(initialValue: [])
+            self._errorInfo = State(initialValue: "Failed to load preference.")
             return
         }
         guard let items = dict["PreferenceSpecifiers"] as? [[String:Any]] else {
-            errorInfo = "Failed to load preference."
+            self._children = State(initialValue: [])
+            self._errorInfo = State(initialValue: "Failed to load preference.")
             return
         }
         let suiteName = dict["ApplicationGroupContainerIdentifier"] as? String ?? bundleId
         let stringTable = dict["StringsTable"] as? String ?? nil
         
-        let userDefaults = UserDefaults()._init(withSuiteName: suiteName, container: containerURL)!
-        let delegate = AppPreferenceModel(settingsBundle: settingsBundle, userDefaults:userDefaults, table: stringTable)
+        guard let userDefaults = UserDefaults()._init(withSuiteName: suiteName, container: containerURL) else {
+            self._children = State(initialValue: [])
+            self._errorInfo = State(initialValue: "Failed to initialize app preferences store.")
+            return
+        }
+        let delegate = AppPreferenceModel(settingsBundle: settingsBundle, userDefaults: userDefaults, table: stringTable)
         
         var currGroup : [String:Any]? = nil
         var currGroupChildren : [AnyView] = []
@@ -317,10 +323,15 @@ struct AppPreferencePageView : View {
             children.append(AnyView(currView))
         }
         self._children = State(initialValue: children)
+        self._errorInfo = State(initialValue: nil)
     }
     
     var body: some View {
             Form {
+                if let errorInfo {
+                    Text(errorInfo)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(children.indices, id: \.self) { i in
                     children[i]
                 }

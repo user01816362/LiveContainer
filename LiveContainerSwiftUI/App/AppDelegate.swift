@@ -30,8 +30,18 @@ import Intents
             LCUtils.appGroupUserDefault.removeObject(forKey: "symbolOffsetCache")
             LCUtils.appGroupUserDefault.setValue(UIDevice.current.buildVersion, forKey: "LCLastIOSBuildVersion")
         }
+
+        // Reconnect persistent background URLSession downloads on launch.
+        Task { @MainActor in
+            _ = LCDownloadManager.shared
+            AltStoreSourcesViewModel.shared.loadSourcesIfNeeded()
+        }
         
         return true
+    }
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
+        LCDownloadManager.shared.handleEventsForBackgroundSession(identifier: identifier, completionHandler: completionHandler)
     }
     
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
@@ -92,7 +102,8 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make
             newOptions = UIScene.ActivationRequestOptions()
         }
         if let keyWindow = lcActiveKeyWindow {
-            newOptions?._setRequestFullscreen(UIScreen.main.bounds == keyWindow.bounds)
+            let screenBounds = keyWindow.windowScene?.screen.bounds ?? keyWindow.bounds
+            newOptions?._setRequestFullscreen(screenBounds == keyWindow.bounds)
         }
         self.hook_requestSceneSessionActivation(sceneSession, userActivity: userActivity, options: newOptions, errorHandler: errorHandler)
     }

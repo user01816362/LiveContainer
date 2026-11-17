@@ -7,9 +7,12 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <os/lock.h>
 #import "../../litehook/src/litehook.h"
 #import "LCMachOUtils.h"
+#import "LCSharedUtils.h"
 #include "mach_excServer.h"
+#import "Tweaks.h"
 #import "../utils.h"
 #import "../dyld_bypass_validation.h"
 @import Darwin;
@@ -30,9 +33,11 @@ bool hookedDlopen = false;
 bool tweakLoaderLoaded = false;
 bool appExecutableFileTypeOverwritten = false;
 const char* lcMainBundlePath = NULL;
+const char* lcGuestExecutablePath = NULL;
 
 void* (*orig_dlopen)(const char *path, int mode) = dlopen;
 void* (*orig_dlsym)(void * __handle, const char * __symbol) = dlsym;
+int (*orig_dladdr)(const void *addr, Dl_info *info) = dladdr;
 uint32_t (*orig_dyld_image_count)(void) = _dyld_image_count;
 const struct mach_header* (*orig_dyld_get_image_header)(uint32_t image_index) = _dyld_get_image_header;
 intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = _dyld_get_image_vmaddr_slide;
@@ -58,27 +63,107 @@ static void ensureBreakpointExceptionHandler(void) {
 
 static void overwriteAppExecutableFileType(void) {
     struct mach_header_64* appImageMachOHeader = (struct mach_header_64*) orig_dyld_get_image_header(appMainImageIndex);
-    kern_return_t kret = builtin_vm_protect(mach_task_self(), (vm_address_t)appImageMachOHeader, sizeof(appImageMachOHeader), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    if (!appImageMachOHeader) return;
+    kern_return_t kret = builtin_vm_protect(mach_task_self(), (vm_address_t)appImageMachOHeader, sizeof(struct mach_header_64), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
     if(kret != KERN_SUCCESS) {
         NSLog(@"[LC] failed to change appImageMachOHeader to rw");
     } else {
         NSLog(@"[LC] changed appImageMachOHeader to rw");
         appImageMachOHeader->filetype = MH_EXECUTE;
-        builtin_vm_protect(mach_task_self(), (vm_address_t)appImageMachOHeader, sizeof(appImageMachOHeader), false,  PROT_READ);
+        builtin_vm_protect(mach_task_self(), (vm_address_t)appImageMachOHeader, sizeof(struct mach_header_64), false,  PROT_READ);
     }
 }
 
-static inline int translateImageIndex(int origin) {
-    if(origin == lcImageIndex) {
-        if(!appExecutableFileTypeOverwritten) {
-            overwriteAppExecutableFileType();
-            appExecutableFileTypeOverwritten = true;
-        }
-        
-        return appMainImageIndex;
+static os_unfair_lock sVisibleImagesLock = OS_UNFAIR_LOCK_INIT;
+static uint32_t *sVisibleImageIndices = NULL;
+static uint32_t sVisibleImageCount = 0;
+static uint32_t sVisibleImageCapacity = 0;
+static uint32_t sCachedRawImageCount = 0;
+static uint32_t sCachedAppMainIndex = 0;
+
+static void rebuildVisibleImageTableLocked(void) {
+    uint32_t rawCount = orig_dyld_image_count();
+    uint32_t mainIdx = appMainImageIndex;
+    if (sVisibleImageIndices && sCachedRawImageCount == rawCount && sCachedAppMainIndex == mainIdx) {
+        return;
     }
-    
-    return origin;
+    if (rawCount + 1 > sVisibleImageCapacity) {
+        uint32_t newCap = rawCount + 16;
+        uint32_t *newBuf = (uint32_t *)realloc(sVisibleImageIndices, sizeof(uint32_t) * newCap);
+        if (!newBuf) {
+            return;
+        }
+        sVisibleImageIndices = newBuf;
+        sVisibleImageCapacity = newCap;
+    }
+
+    uint32_t visibleCount = 0;
+    bool guestLoaded = (mainIdx > lcImageIndex && mainIdx < rawCount);
+    if (guestLoaded) {
+        sVisibleImageIndices[visibleCount++] = mainIdx;
+    }
+    for (uint32_t i = 0; i < rawCount; ++i) {
+        if (guestLoaded && (i == lcImageIndex || i == mainIdx)) {
+            continue;
+        }
+        const char *imgName = orig_dyld_get_image_name(i);
+        if (LCStealthIsHiddenPath(imgName)) {
+            continue;
+        }
+        sVisibleImageIndices[visibleCount++] = i;
+    }
+    sVisibleImageCount = visibleCount;
+    sCachedRawImageCount = rawCount;
+    sCachedAppMainIndex = mainIdx;
+}
+
+static bool translateImageIndex(uint32_t origin, uint32_t *mappedOut) {
+    bool shouldOverwrite = false;
+    os_unfair_lock_lock(&sVisibleImagesLock);
+    rebuildVisibleImageTableLocked();
+    if (origin >= sVisibleImageCount) {
+        os_unfair_lock_unlock(&sVisibleImagesLock);
+        return false;
+    }
+    uint32_t mapped = sVisibleImageIndices[origin];
+    if (origin == 0 && mapped == appMainImageIndex && appMainImageIndex > lcImageIndex && !appExecutableFileTypeOverwritten) {
+        appExecutableFileTypeOverwritten = true;
+        shouldOverwrite = true;
+    }
+    os_unfair_lock_unlock(&sVisibleImagesLock);
+    if (shouldOverwrite) {
+        overwriteAppExecutableFileType();
+    }
+    if (mappedOut) {
+        *mappedOut = mapped;
+    }
+    return true;
+}
+
+int hook_dladdr(const void *addr, Dl_info *info) {
+    if (LCStealthIsInternalAddress(__builtin_return_address(0))) {
+        return orig_dladdr(addr, info);
+    }
+    const void *queryAddr = addr;
+    for (int i = 0; i < gRebindCount; i++) {
+        global_rebind rebind = gRebinds[i];
+        if (rebind.replacement == queryAddr) {
+            queryAddr = rebind.replacee;
+            break;
+        }
+    }
+    if (queryAddr == addr && LCStealthIsInternalAddress(queryAddr)) {
+        if (info) {
+            memset(info, 0, sizeof(*info));
+        }
+        return 0;
+    }
+    int ret = orig_dladdr(queryAddr, info);
+    if (ret != 0 && info && info->dli_fname && LCStealthIsHiddenPath(info->dli_fname)) {
+        memset(info, 0, sizeof(*info));
+        return 0;
+    }
+    return ret;
 }
 
 void* hook_dlsym(void * __handle, const char * __symbol) {
@@ -109,36 +194,53 @@ void* hook_dlsym(void * __handle, const char * __symbol) {
 }
 
 uint32_t hook_dyld_image_count(void) {
-    return orig_dyld_image_count() - 1 - (uint32_t)tweakLoaderLoaded;
+    if (LCStealthIsInternalAddress(__builtin_return_address(0))) {
+        return orig_dyld_image_count();
+    }
+    os_unfair_lock_lock(&sVisibleImagesLock);
+    rebuildVisibleImageTableLocked();
+    uint32_t count = sVisibleImageCount;
+    os_unfair_lock_unlock(&sVisibleImagesLock);
+    return count;
 }
 
 const struct mach_header* hook_dyld_get_image_header(uint32_t image_index) {
-    __attribute__((musttail)) return orig_dyld_get_image_header(translateImageIndex(image_index));
+    if (LCStealthIsInternalAddress(__builtin_return_address(0))) {
+        return orig_dyld_get_image_header(image_index);
+    }
+    uint32_t mapped = 0;
+    if (!translateImageIndex(image_index, &mapped)) {
+        return NULL;
+    }
+    return orig_dyld_get_image_header(mapped);
 }
 
 intptr_t hook_dyld_get_image_vmaddr_slide(uint32_t image_index) {
-    __attribute__((musttail)) return orig_dyld_get_image_vmaddr_slide(translateImageIndex(image_index));
+    if (LCStealthIsInternalAddress(__builtin_return_address(0))) {
+        return orig_dyld_get_image_vmaddr_slide(image_index);
+    }
+    uint32_t mapped = 0;
+    if (!translateImageIndex(image_index, &mapped)) {
+        return 0;
+    }
+    return orig_dyld_get_image_vmaddr_slide(mapped);
 }
 
 const char* hook_dyld_get_image_name(uint32_t image_index) {
-    __attribute__((musttail)) return orig_dyld_get_image_name(translateImageIndex(image_index));
+    if (LCStealthIsInternalAddress(__builtin_return_address(0))) {
+        return orig_dyld_get_image_name(image_index);
+    }
+    uint32_t mapped = 0;
+    if (!translateImageIndex(image_index, &mapped)) {
+        return NULL;
+    }
+    return orig_dyld_get_image_name(mapped);
 }
 
 void hideLiveContainerImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
-    Dl_info info;
-    dladdr(header, &info);
-    if(!strncmp(info.dli_fname, lcMainBundlePath, strlen(lcMainBundlePath)) || strstr(info.dli_fname, "/procursus/") != 0) {
-        char fakePath[PATH_MAX];
-        snprintf(fakePath, sizeof(fakePath), "/usr/lib/%p.dylib", header);
-        kern_return_t ret = vm_protect(mach_task_self(), (vm_address_t)info.dli_fname, PATH_MAX, false, PROT_READ | PROT_WRITE);
-        if(ret != KERN_SUCCESS) {
-            os_thread_self_restrict_tpro_to_rw();
-        }
-        strcpy((char *)info.dli_fname, fakePath);
-        if(ret != KERN_SUCCESS) {
-            os_thread_self_restrict_tpro_to_ro();
-        }
-    }
+    os_unfair_lock_lock(&sVisibleImagesLock);
+    sCachedRawImageCount = 0;
+    os_unfair_lock_unlock(&sVisibleImagesLock);
 }
 
 void* getDSCAddr(void) {
@@ -150,7 +252,7 @@ void* getDSCAddr(void) {
     return (void*)infos->sharedCacheBaseAddress;
 }
 
-void* getCachedSymbol(NSString* symbolName, mach_header_u* header) {
+void* getCachedSymbol(NSString* symbolName, struct mach_header_64* header) {
     NSDictionary* symbolOffsetDict = [NSUserDefaults.lcSharedDefaults objectForKey:@"symbolOffsetCache"][symbolName];
     if(!symbolOffsetDict) {
         return NULL;
@@ -167,7 +269,7 @@ void* getCachedSymbol(NSString* symbolName, mach_header_u* header) {
     return (void*)header + [symbolOffsetDict[@"offset"] unsignedLongLongValue];
 }
 
-void saveCachedSymbol(NSString* symbolName, mach_header_u* header, uint64_t offset) {
+void saveCachedSymbol(NSString* symbolName, struct mach_header_64* header, uint64_t offset) {
     NSMutableDictionary* allSymbolOffsetDict = [[NSUserDefaults.lcSharedDefaults objectForKey:@"symbolOffsetCache"] mutableCopy];
     if(!allSymbolOffsetDict) {
         allSymbolOffsetDict = [[NSMutableDictionary alloc] init];
@@ -282,12 +384,7 @@ bool initGuestSDKVersionInfo(void) {
 #else
         const char* dyldPath = "/usr/lib/dyld_sim";
 #endif
-        uint64_t offset = 0;
-        if(@available(iOS 27.0, *)) {
-            offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld311sVersionMapE");
-        } else {
-            offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld3L11sVersionMapE");
-        }
+        uint64_t offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld311sVersionMapE");
         assert(offset);
         versionMapPtr = dyldBase + offset;
         saveCachedSymbol(@"__ZN5dyld3L11sVersionMapE", dyldBase, offset);
@@ -362,19 +459,25 @@ void DyldHooksInit(bool hideLiveContainer, bool hookDlopen, uint32_t spoofSDKVer
     }
     
     if(NSUserDefaults.isLiveProcess) {
-        lcMainBundlePath = NSUserDefaults.lcMainBundle.bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.fileSystemRepresentation;
+        lcMainBundlePath = strdup(NSUserDefaults.lcMainBundle.bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.fileSystemRepresentation ?: "");
     } else {
-        lcMainBundlePath = NSUserDefaults.lcMainBundle.bundlePath.fileSystemRepresentation;
+        lcMainBundlePath = strdup(NSUserDefaults.lcMainBundle.bundlePath.fileSystemRepresentation ?: "");
+    }
+    NSString *guestExec = NSBundle.mainBundle.executablePath;
+    if (guestExec.length > 0 && guestExec.fileSystemRepresentation) {
+        lcGuestExecutablePath = strdup(guestExec.fileSystemRepresentation);
     }
     orig_dyld_get_image_header = _dyld_get_image_header;
     
     // hook dlsym to solve RTLD_MAIN_ONLY, hook other functions to hide LiveContainer itself
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, hook_dlsym, nil);
     if(hideLiveContainer) {
+        LCStealthHideInit();
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_image_count, hook_dyld_image_count, nil);
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_get_image_header, hook_dyld_get_image_header, nil);
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_get_image_vmaddr_slide, hook_dyld_get_image_vmaddr_slide, nil);
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_get_image_name, hook_dyld_get_image_name, nil);
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dladdr, hook_dladdr, nil);
         _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))hideLiveContainerImageCallback);
     }
     
@@ -459,7 +562,7 @@ int searchVtable(void** vtable, void *func) {
 void *dlopen_nolock(const char *path, int mode) {
     tidToIgnore = mach_thread_self();
     const char *libdyldPath = "/usr/lib/system/libdyld.dylib";
-    mach_header_u *libdyldHeader = LCGetLoadedImageHeader(0, libdyldPath);
+    struct mach_header_64 *libdyldHeader = LCGetLoadedImageHeader(0, libdyldPath);
     assert(libdyldHeader != NULL);
 #if !TARGET_OS_SIMULATOR
     NSString *lockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_lock_with_options";
@@ -467,12 +570,8 @@ void *dlopen_nolock(const char *path, int mode) {
     NSString *tryLockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_trylock";
     void **lockPtr = getCachedSymbol(lockPtrName, libdyldHeader);
     void **unlockPtr = getCachedSymbol(unlockPtrName, libdyldHeader);
-    void **trylockPtr = 0;
-    bool shouldPatchTrylock = false;
-    if(@available(iOS 26.5, *)) {
-        shouldPatchTrylock = true;
-        trylockPtr = getCachedSymbol(tryLockPtrName, libdyldHeader);
-    }
+    void **trylockPtr = getCachedSymbol(tryLockPtrName, libdyldHeader);
+    bool shouldPatchTrylock = true;
     
     if(!unlockPtr || !lockPtr || (shouldPatchTrylock && !trylockPtr)) {
         void **vtableLibSystemHelpers = litehook_find_dsc_symbol(libdyldPath, "__ZTVN5dyld416LibSystemHelpersE");
@@ -528,7 +627,7 @@ void *dlopen_nolock(const char *path, int mode) {
     ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ);
     if(ret != KERN_SUCCESS) {
         assert(os_tpro_is_supported());
-        os_thread_self_restrict_tpro_to_rw();
+        os_thread_self_restrict_tpro_to_ro();
     }
     
     void *result;
@@ -552,7 +651,7 @@ void *dlopen_nolock(const char *path, int mode) {
     ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ);
     if(ret != KERN_SUCCESS) {
         assert(os_tpro_is_supported());
-        os_thread_self_restrict_tpro_to_rw();
+        os_thread_self_restrict_tpro_to_ro();
     }
 #else
     litehook_rebind_symbol(libdyldHeader, os_unfair_recursive_lock_lock_with_options, hook_libdyld_os_unfair_recursive_lock_lock_with_options, nil);
@@ -622,8 +721,10 @@ void* jitless_hook_mmap(void *addr, size_t len, int prot, int flags, int fd, off
     // to get around `file system sandbox blocked mmap()` we temporarily move it to permitted path
     char filePath[PATH_MAX];
     if (fcntl(fd, F_GETPATH, filePath) != 0) return map;
+    NSString *lpHome = [LCSharedUtils cachedLpHomePath];
+    if (lpHome.length == 0) return map;
     char newTmpPath[PATH_MAX];
-    sprintf(newTmpPath, "%s/Documents/.fd%d.dylib", getenv("LP_HOME_PATH"), fd);
+    snprintf(newTmpPath, sizeof(newTmpPath), "%s/Documents/.fd%d.dylib", lpHome.fileSystemRepresentation, fd);
     rename(filePath, newTmpPath);
     map = __mmap(addr, len, prot, flags, fd, offset);
     rename(newTmpPath, filePath);
@@ -667,7 +768,7 @@ void bypass_seg_count_check(void (^block)(void)) {
 void bypass_os_variant_has_internal_content(void (^block)(void)) {
 #if !TARGET_OS_SIMULATOR
     const char *libsystem_darwinPath = "/usr/lib/system/libsystem_darwin.dylib";
-    mach_header_u *libsystem_darwinHeader = LCGetLoadedImageHeader(0, libsystem_darwinPath);
+    struct mach_header_64 *libsystem_darwinHeader = LCGetLoadedImageHeader(0, libsystem_darwinPath);
     NSString *internalRelTypeName = @"_internal_release_type";
     uint32_t *internalRelTypePtr = getCachedSymbol(internalRelTypeName, libsystem_darwinHeader);
     if (!internalRelTypePtr) {

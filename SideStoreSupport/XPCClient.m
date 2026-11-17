@@ -39,7 +39,7 @@ void installSideStoreHooks(void);
 
     if(!NSUserDefaults.isLiveProcess) return;
 
-    handler = [PrivClass(LiveProcessSideStoreHandler) shared];
+    handler = (id)[PrivClass(LiveProcessSideStoreHandler) shared];
     installSideStoreNotificationHooks();
     handler.connection.exportedInterface = [NSXPCInterface interfaceWithProtocol:@protocol(RefreshClient)];
     handler.connection.exportedObject = SideStoreClient.shared;
@@ -52,7 +52,6 @@ void installSideStoreHooks(void);
 
 // Implement the callback method
 + (void)appDidFinishLaunching:(NSNotification *)notification {
-    NSDictionary *launchOptions = notification.userInfo;
     [handler.server finishedLaunching];
 }
 

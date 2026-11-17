@@ -4,9 +4,11 @@
 #import "../LiveContainer/utils.h"
 #import "../LiveContainer/FoundationPrivate.h"
 
+#pragma clang diagnostic ignored "-Wundeclared-selector"
+
 BOOL fixFilePicker;
 __attribute__((constructor))
-static void NSFMGuestHooksInit() {
+static void NSFMGuestHooksInit(void) {
     if(!NSUserDefaults.lcGuestAppId) return;
     fixFilePicker = [NSUserDefaults.guestAppInfo[@"doSymlinkInbox"] boolValue];
     
@@ -15,7 +17,7 @@ static void NSFMGuestHooksInit() {
     if ([UIDocumentPickerViewController instancesRespondToSelector:legacyInitSelector]) {
         swizzle(UIDocumentPickerViewController.class, legacyInitSelector, @selector(hook_initWithDocumentTypes:inMode:));
     }
-    swizzle(UIDocumentBrowserViewController.class, @selector(initForOpeningContentTypes:), @selector(hook_initForOpeningContentTypes));
+    swizzle(UIDocumentBrowserViewController.class, @selector(initForOpeningContentTypes:), @selector(hook_initForOpeningContentTypes:));
     swizzleClassMethod(UTType.class, @selector(typeWithIdentifier:), @selector(hook_typeWithIdentifier:));
     if (fixFilePicker) {
         swizzle(NSURL.class, @selector(startAccessingSecurityScopedResource), @selector(hook_startAccessingSecurityScopedResource));

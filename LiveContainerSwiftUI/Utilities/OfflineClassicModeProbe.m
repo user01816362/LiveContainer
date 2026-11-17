@@ -228,6 +228,7 @@ void LCLoadSpringBoardFramework(void) {
         dlerror();
         void *springBoard = dlopen("/System/Library/PrivateFrameworks/SpringBoard.framework/SpringBoard",
                                    RTLD_LAZY | RTLD_GLOBAL);
+        (void)springBoard;
         
         NSCAssert(springBoard, @"Cannot load SpringBoard.framework: %s",
                   dlerror() ?: "unknown dlopen error");

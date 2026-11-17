@@ -6,7 +6,6 @@
 //
 import SwiftUI
 
-@available(iOS 16.1, *)
 struct MultitaskAppInfo {
     var displayName: String
     var dataUUID: String
@@ -19,7 +18,6 @@ struct MultitaskAppInfo {
     }
 }
 
-@available(iOS 16.1, *)
 @objc class MultitaskWindowManager: NSObject {
     @Environment(\.openWindow) static var openWindow
     static var appDict: [String: MultitaskAppInfo] = [:]
@@ -42,7 +40,6 @@ struct MultitaskAppInfo {
     }
 }
 
-@available(iOS 16.1, *)
 struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
     @Binding var show: Bool
     let bundleId: String
@@ -76,7 +73,7 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
                 settings.peripheryInsets = defaultInsets
                 settings.safeAreaInsetsPortrait = defaultInsets
                 settings.deviceOrientation = UIDevice.current.orientation
-                let orientation = vc.view.window?.windowScene?.interfaceOrientation ?? .portrait
+                let orientation = vc.view.window?.windowScene?.effectiveGeometry.interfaceOrientation ?? .portrait
                 settings.setInterfaceOrientation(orientation)
                 if(settings.interfaceOrientation().isLandscape) {
                     settings.setFrame(CGRect(x: 0, y: 0, width: vc.view.frame.size.height, height: vc.view.frame.size.width))
@@ -119,11 +116,10 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
     }
 }
 
-@available(iOS 16.1, *)
 struct MultitaskAppWindow: View {
     @State var show = true
     @State var pid = 0
-    @State var appInfo: MultitaskAppInfo? = nil
+    @State var appInfo: MultitaskAppInfo?
     @State var errorMessage: String? = nil
     @State private var hasScheduledAutoClose = false
     @State private var didRequestManualClose = false
@@ -133,10 +129,7 @@ struct MultitaskAppWindow: View {
     @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = false
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
     init(id: String) {
-        guard let appInfo = MultitaskWindowManager.appDict[id] else {
-            return
-        }
-        _appInfo = State(initialValue: appInfo)
+        _appInfo = State(initialValue: MultitaskWindowManager.appDict[id])
     }
     
     var body: some View {
@@ -155,7 +148,7 @@ struct MultitaskAppWindow: View {
                         DataManager.shared.model.pidCallback = nil
                     }
                 })
-                .background(.black)
+                .background { Color.black }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .ignoresSafeArea(.all, edges: .all)

@@ -12,7 +12,6 @@
 
 @class AppSceneViewController;
 
-API_AVAILABLE(ios(16.0))
 @protocol AppSceneViewControllerDelegate <NSObject>
 - (void)appSceneVCAppDidExit:(AppSceneViewController*)vc;
 - (void)appSceneVC:(AppSceneViewController*)vc didInitializeWithError:(NSError*)error;
@@ -21,7 +20,6 @@ API_AVAILABLE(ios(16.0))
 - (void)appSceneVCWillActivateScene:(AppSceneViewController *)vc;
 @end
 
-API_AVAILABLE(ios(16.0))
 @interface AppSceneViewController : UIViewController<_UISceneSettingsDiffAction>
 @property(nonatomic) NSString* bundleId;
 @property(nonatomic) NSString* dataUUID;
@@ -32,7 +30,7 @@ API_AVAILABLE(ios(16.0))
 @property(nonatomic) CGFloat scaleRatio;
 @property(nonatomic) UIView* contentView;
 @property(nonatomic) _UIScenePresenter *presenter;
-@property(nonatomic) _UISceneHostingController *hostingController API_AVAILABLE(ios(17.0));
+@property(nonatomic) _UISceneHostingController *hostingController;
 - (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID delegate:(id<AppSceneViewControllerDelegate>)delegate;
 - (void)setBackgroundNotificationEnabled:(bool)enabled;
 - (void)updateFrameWithSettingsBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block;

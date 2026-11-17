@@ -188,8 +188,7 @@ extension LCUtils {
             }
             
             // Check if the app is installed
-            guard let url = URL(string: "\(scheme)://"),
-                  UIApplication.shared.canOpenURL(url) else {
+            guard LCUtils.isAppSchemeInstalled(scheme) else {
                 continue
             }
             
@@ -519,8 +518,12 @@ extension LCUtils {
     static func openSideStore(delegate: LCAppModelDelegate? = nil, urlStr: String? = nil) {
         let sideStoreApp = LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared, delegate: delegate)
         
-        Task {
-            try await sideStoreApp.runApp(bundleIdOverride: "builtinSideStore", urlStr: urlStr)
+        Task { @MainActor in
+            do {
+                try await sideStoreApp.runApp(bundleIdOverride: "builtinSideStore", urlStr: urlStr)
+            } catch {
+                NSLog("[LC] Failed to run SideStore: \(error)")
+            }
         }
     }
 }

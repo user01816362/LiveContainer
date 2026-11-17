@@ -82,7 +82,7 @@ bool sideStoreExist = false;
 }
 @end
 
-static BOOL checkJITEnabled() {
+static BOOL checkJITEnabled(void) {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return YES;
 #else
@@ -101,45 +101,36 @@ static BOOL checkJITEnabled() {
 #endif
 }
 
-static uint64_t rnd64(uint64_t v, uint64_t r) {
-    r--;
-    return (v + r) & ~r;
-}
-
 void overwriteMainCFBundle(void) {
     // Overwrite CFBundleGetMainBundle
     uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
     void **mainBundleAddr = 0;
     
 #if !TARGET_OS_SIMULATOR
-    if(@available(iOS 27.0, *)) {
-        // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
-        while (true) {
-            bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
-            if (isTbz) {
-                // adrp <- pc-1
-                // tbz <- pc
-                // ldr  <- addr
-                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)(pc+1), (uint64_t)(pc-1));
-                break;
-            }
-            ++pc;
+    // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
+    while (true) {
+        bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
+        if (isTbz) {
+            // adrp <- pc-1
+            // tbz <- pc
+            // ldr  <- addr
+            mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)(pc+1), (uint64_t)(pc-1));
+            break;
         }
-    } else {
-#endif
-        while (true) {
-            uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
-            if (addr) {
-                // adrp <- pc-1
-                // tbnz <- pc
-                // ...
-                // ldr  <- addr
-                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
-                break;
-            }
-            ++pc;
+        ++pc;
+    }
+#else
+    while (true) {
+        uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
+        if (addr) {
+            // adrp <- pc-1
+            // tbnz <- pc
+            // ...
+            // ldr  <- addr
+            mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
+            break;
         }
-#if !TARGET_OS_SIMULATOR
+        ++pc;
     }
 #endif
     assert(mainBundleAddr != NULL);
@@ -201,17 +192,15 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
         assert(mainExecutablePathPtr != 0);
     }
 
-    kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)dyldConfig, sizeof(dyldConfig), false, PROT_READ | PROT_WRITE);
+    kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)dyldConfig, sizeof(DyldConfig), false, PROT_READ | PROT_WRITE);
     if(ret != KERN_SUCCESS) {
         assert(os_tpro_is_supported());
         os_thread_self_restrict_tpro_to_rw();
     }
     *mainExecutablePathPtr = newPath;
     
-    // in iOS 27, the length is also cached, it's at +0x28
-    if(@available(iOS 27.0, *)) {
-        dyldConfig->mainExecutablePathLen_27_0 = strlen(newPath);
-    }
+    // Cache mainExecutablePathLen (+0x28 on iOS 27)
+    dyldConfig->mainExecutablePathLen_27_0 = strlen(newPath);
     
     if(ret != KERN_SUCCESS) {
         os_thread_self_restrict_tpro_to_ro();
@@ -231,7 +220,7 @@ void overwriteExecPath(const char *newExecPath) {
 }
 
 static void *getAppEntryPoint(void *handle) {
-    uint32_t entryoff = 0;
+    uint64_t entryoff = 0;
     const struct mach_header_64 *header = (struct mach_header_64 *)getGuestAppHeader();
     uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     struct load_command *command = (struct load_command *)imageHeaderPtr;
@@ -283,6 +272,7 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
     setenv("HOME", homePath.fileSystemRepresentation, 1);
     setenv("CFFIXED_USER_HOME", homePath.fileSystemRepresentation, 1);
     setenv("TMPDIR", [[homePath stringByAppendingPathComponent:@"tmp"] stringByAppendingString:@"/"].fileSystemRepresentation, 1);
+    [LCSharedUtils cacheProcessEnvironmentPaths];
     overwriteMainNSBundle(bundle);
     overwriteMainCFBundle();
     const char *executablePath = strdup(bundle.executablePath.fileSystemRepresentation);
@@ -295,11 +285,10 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
 
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
-        if(@available(iOS 26.0 ,*))  {
-            return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
-        }
-#endif
+        return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
+#else
         if (checkJITEnabled()) init_bypassDyldLibValidation();
+#endif
     }
     DyldHooksInit(false, true, 0);
     appMainImageIndex = _dyld_image_count();
@@ -308,12 +297,8 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
         handle = dlopen_nolock(bundle.executablePath.fileSystemRepresentation, RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST);
     };
     NSDictionary *patchInfo = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"LCAppExtension.plist"]];
-    if (@available(iOS 27.0, *)) {
-        if ([patchInfo[@"segCountMismatch"] boolValue]) bypass_seg_count_check(load);
-        else load();
-    } else {
-        load();
-    }
+    if ([patchInfo[@"segCountMismatch"] boolValue]) bypass_seg_count_check(load);
+    else load();
     if (!handle) {
         const char *error = dlerror();
         return error ? @(error) : @"Unable to load the guest extension";
@@ -336,10 +321,8 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
-        if(@available(iOS 26.0 ,*))  {
-            return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
-        }
-#endif
+        return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
+#else
         // First of all, let's check if we have JIT
         for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
             usleep(1000*100);
@@ -348,10 +331,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
             return appError;
         }
+#endif
     }
 
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+    NSString *docPath = [NSString stringWithFormat:@"%@/Documents", [LCSharedUtils cachedLcHomePath] ?: NSHomeDirectory()];
     
     NSURL *appGroupFolder = nil;
     
@@ -431,6 +415,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakFolder = [docPath stringByAppendingPathComponent:@"Tweaks"];
     }
     setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
+    [LCSharedUtils cacheProcessEnvironmentPaths];
 
     // Update TweakLoader symlink
     NSString *tweakLoaderPath = [tweakFolder stringByAppendingPathComponent:@"TweakLoader.dylib"];
@@ -489,7 +474,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                     bookmarkURL = [NSURL URLByResolvingBookmarkData:bookmarkData options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&err];
                     bool access = [bookmarkURL startAccessingSecurityScopedResource];
                     if(!bookmarkURL || !access) {
-                        return [@"Bookmark resolution failed or unable to access the container. You might need to readd the data storage. %@" stringByAppendingString:err.localizedDescription];
+                        return [NSString stringWithFormat:@"Bookmark resolution failed or unable to access the container. You might need to readd the data storage. %@", err.localizedDescription ?: @"unknown error"];
                     }
                     [lcUserDefaults removeObjectForKey:@"error"];
                 }
@@ -556,11 +541,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // which if symlinked, the new tmp cannot be recreated (#1040, #1125) or the app may camplain about the tmp folder being a symlimk (#884)
 
     // Setup directories
-    NSArray *dirList = @[@"Library/Caches", @"Library/Cookies", @"Documents", @"SystemData"];
-    for (NSString *dir in dirList) {
-        NSString *dirPath = [newHomePath stringByAppendingPathComponent:dir];
-        [fm createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:nil];
-    }
+    [LCSharedUtils ensureContainerDirectoriesAtPath:newHomePath];
     
     NSString* containerInfoPath = [newHomePath stringByAppendingPathComponent:@"LCContainerInfo.plist"];
     guestContainerInfo = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
@@ -580,7 +561,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     NSMutableArray<NSString *> *objcArgv = NSProcessInfo.processInfo.arguments.mutableCopy;
     objcArgv[0] = appBundle.executablePath;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundeclared-selector"
     [NSProcessInfo.processInfo performSelector:@selector(setArguments:) withObject:objcArgv];
+#pragma clang diagnostic pop
     NSProcessInfo.processInfo.processName = appBundle.infoDictionary[@"CFBundleExecutable"];
     *_CFGetProgname() = NSProcessInfo.processInfo.processName.UTF8String;
     Class swiftNSProcessInfo = NSClassFromString(@"_NSSwiftProcessInfo");
@@ -652,9 +636,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
     };
     
-    BOOL is27up = false;
-    if(@available(iOS 27, *)) { is27up = true; }
-    if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
+    if([guestAppInfo[@"segCountMismatch"] boolValue]) {
         bypass_seg_count_check(dlopenBlock);
     } else {
         dlopenBlock();
@@ -674,7 +656,13 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return appError;
     }
     
-    if([guestAppInfo[@"dontInjectTweakLoader"] boolValue] && ![guestAppInfo[@"dontLoadTweakLoader"] boolValue]) {
+    NSString *pendingDebugBundleId = [lcSharedDefaults stringForKey:@"LCDebugPendingBundleID"];
+    NSString *pendingDebugRelPath = [lcSharedDefaults stringForKey:@"LCDebugPendingRelativePath"];
+    BOOL debugModeActive = [guestAppInfo[@"LCDebugModeEnabled"] boolValue] ||
+        (pendingDebugBundleId.length > 0 && ([pendingDebugBundleId isEqualToString:appBundle.bundleIdentifier] || [pendingDebugBundleId isEqualToString:lcGuestAppId])) ||
+        (pendingDebugRelPath.length > 0 && [pendingDebugRelPath isEqualToString:selectedApp]);
+    if(([guestAppInfo[@"dontInjectTweakLoader"] boolValue] && ![guestAppInfo[@"dontLoadTweakLoader"] boolValue]) ||
+       (debugModeActive && !tweakLoaderLoaded)) {
         tweakLoaderLoaded = true;
         if([guestAppInfo[@"hideLiveContainer"] boolValue]) {
             dlopen([lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/TweakLoader.dylib"].UTF8String, RTLD_LAZY|RTLD_GLOBAL);
@@ -717,6 +705,14 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return appError;
     }
 
+    if ([guestAppInfo[@"hideLiveContainer"] boolValue]) {
+        [LCSharedUtils cacheProcessEnvironmentPaths];
+        unsetenv("LC_HOME_PATH");
+        unsetenv("LP_HOME_PATH");
+        unsetenv("LC_GLOBAL_TWEAKS_FOLDER");
+        unsetenv("DYLD_INSERT_LIBRARIES");
+    }
+
     // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);
     int ret;
@@ -748,7 +744,11 @@ int LiveContainerMain(int argc, char *argv[]) {
     lcAppUrlScheme = NSBundle.mainBundle.infoDictionary[@"CFBundleURLTypes"][0][@"CFBundleURLSchemes"][0];
     lcAppGroupPath = [[NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[NSClassFromString(@"LCSharedUtils") appGroupID]] path];
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
-    setenv("LC_HOME_PATH", getenv("HOME"), 0);
+    const char *homeEnv = getenv("HOME");
+    if (homeEnv) {
+        setenv("LC_HOME_PATH", homeEnv, 0);
+    }
+    [LCSharedUtils cacheProcessEnvironmentPaths];
 
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
@@ -792,7 +792,7 @@ int LiveContainerMain(int argc, char *argv[]) {
         if([lastLaunchType isEqualToString:@"Shared"]) {
             preferencesTo = [LCSharedUtils.appGroupPath.path stringByAppendingPathComponent:[NSString stringWithFormat:@"LiveContainer/Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
         } else {
-            NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+            NSString *docPath = [NSString stringWithFormat:@"%@/Documents", [LCSharedUtils cachedLcHomePath] ?: NSHomeDirectory()];
             preferencesTo = [docPath stringByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
         }
         // recover preferences
@@ -804,7 +804,10 @@ int LiveContainerMain(int argc, char *argv[]) {
         }
     }
     // in case some weird apps remove the tmp folder
-    [NSFileManager.defaultManager createDirectoryAtPath:@(getenv("TMPDIR")) withIntermediateDirectories:YES attributes:nil error:nil];
+    const char *tmpDirEnv = getenv("TMPDIR");
+    if (tmpDirEnv) {
+        [NSFileManager.defaultManager createDirectoryAtPath:@(tmpDirEnv) withIntermediateDirectories:YES attributes:nil error:nil];
+    }
     
     if([selectedApp isEqualToString:@"ui"]) {
         selectedApp = nil;
@@ -853,7 +856,11 @@ int LiveContainerMain(int argc, char *argv[]) {
             }
             
             NSURL* url = [NSURL URLWithString:urlStr];
-            if([[NSClassFromString(@"UIApplication") sharedApplication] canOpenURL:url]){
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            BOOL canOpen = [[NSClassFromString(@"UIApplication") sharedApplication] canOpenURL:url];
+#pragma clang diagnostic pop
+            if(canOpen){
                 [[NSClassFromString(@"UIApplication") sharedApplication] openURL:url options:@{} completionHandler:nil];
                 
                 NSString *launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
@@ -929,7 +936,7 @@ int LiveContainerMain(int argc, char *argv[]) {
     NSCAssert(LiveContainerSwiftUIHandle, @"%s", dlerror());
     
     if(sideStoreExist) {
-        void* sideStoreHandle = dlopen("@executable_path/Frameworks/SideStoreSupport.framework/SideStoreSupport", RTLD_LAZY);
+        (void)dlopen("@executable_path/Frameworks/SideStoreSupport.framework/SideStoreSupport", RTLD_LAZY);
     }
 
     if ([lcUserDefaults boolForKey:@"LCLoadTweaksToSelf"]) {
@@ -942,6 +949,7 @@ int LiveContainerMain(int argc, char *argv[]) {
             tweakFolder = [docPath stringByAppendingPathComponent:@"Tweaks"];
         }
         setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
+    [LCSharedUtils cacheProcessEnvironmentPaths];
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
         extern void DyldHookLoadableIntoProcess(void);
         DyldHookLoadableIntoProcess();

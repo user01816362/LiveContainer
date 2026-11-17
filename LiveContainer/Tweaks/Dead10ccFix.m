@@ -22,6 +22,9 @@
 @property(nonatomic) BOOL methodInited;
 @property(nonatomic) int deboundeToken;
 - (void)handleAppDidEnterBackground:(NSNotification *)notification;
+@end
+
+@interface Dead10ccFix (RuntimeStolen)
 - (void)_handleTaskCompletionAndTerminate:(id)arg1;
 @end
 @interface UIApplication : NSObject
@@ -32,15 +35,22 @@
 
 Dead10ccFix* fix = nil;
 
-void initDead10ccFix(void) {
+/**
+ Initializes RunningBoard lock-file background tagging (`0xdead10cc` prevention).
 
-    if(NSUserDefaults.isLiveProcess) {
+ Registers both `NSExtensionHostDidEnterBackgroundNotification` and
+ `UIApplicationDidEnterBackgroundNotification` because iOS 27 scene hosting
+ (`_UISceneHostingController`) inside `LiveProcess` can deliver either lifecycle
+ notification when backgrounding.
+ */
+void initDead10ccFix(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
         fix = [[Dead10ccFix alloc] init];
+        // Note on LiveProcess: depending on Scene API, it could invoke either of these, so register both.
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:NSExtensionHostDidEnterBackgroundNotification object:nil];
-    } else if (NSUserDefaults.isSharedApp){
-        fix = [[Dead10ccFix alloc] init];
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:@"UIApplicationDidEnterBackgroundNotification" object:nil];
-    }
+    });
 }
 
 
@@ -154,8 +164,12 @@ void initDead10ccFix(void) {
                 continue;
             }
         }
-        int (*_sqlite3_lockstate)(char*, int) = dlsym(RTLD_DEFAULT, "_sqlite3_lockstate");
-        int sqlite_lock = _sqlite3_lockstate(path_c, pid);
+        static int (*sqlite3LockStateFn)(char*, int) = NULL;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            sqlite3LockStateFn = dlsym(RTLD_DEFAULT, "_sqlite3_lockstate");
+        });
+        int sqlite_lock = sqlite3LockStateFn ? sqlite3LockStateFn(path_c, pid) : -1;
         if (sqlite_lock == 0) {
             // _rbs_process_log with %{public}@ Ignoring unlocked SQLite database: %{public}@
 //            NSLog(@"Ignoring unlocked SQLite database: %@", path);
@@ -202,10 +216,16 @@ void initDead10ccFix(void) {
         Class class = NSClassFromString(@"UIApplication");
         SEL sel = @selector(_handleTaskCompletionAndTerminate:);
         Method method = class_getInstanceMethod(class, sel);
-        class_addMethod(Dead10ccFix.class, sel, method_getImplementation(method), method_getTypeEncoding(method));
+        if(method) {
+            class_addMethod(Dead10ccFix.class, sel, method_getImplementation(method), method_getTypeEncoding(method));
+        }
     }
     // this will call _UIApplicationCallWhenBackgroundTaskCountReachesZero which calls _terminateWithStatus: when no background tasks are left
-    [self _handleTaskCompletionAndTerminate:self];
+    if ([self respondsToSelector:@selector(_handleTaskCompletionAndTerminate:)]) {
+        [self _handleTaskCompletionAndTerminate:self];
+    } else {
+        [self handleAppDidEnterBackgroundReal];
+    }
 }
 
 - (void)_terminateWithStatus:(int)status {
@@ -220,7 +240,11 @@ void initDead10ccFix(void) {
             if(self.deboundeToken != curToken) {
                 return;
             }
-            [self _handleTaskCompletionAndTerminate:self];
+            if ([self respondsToSelector:@selector(_handleTaskCompletionAndTerminate:)]) {
+                [self _handleTaskCompletionAndTerminate:self];
+            } else {
+                [self handleAppDidEnterBackgroundReal];
+            }
         });
     }
 }

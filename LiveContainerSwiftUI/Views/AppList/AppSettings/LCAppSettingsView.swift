@@ -11,7 +11,8 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct LCAppSettingsView: View {
-    @State private var documentPickerCoordinator = DocumentPickerCoordinator()
+    private let documentPickerCoordinator = DocumentPickerCoordinator()
+    @Environment(\.dismiss) private var dismiss
 
     private class DocumentPickerCoordinator: NSObject, UIDocumentPickerDelegate {
         var onDocumentPicked: ((URL) -> Void)?
@@ -160,7 +161,7 @@ struct LCAppSettingsView: View {
                     Text("lc.appSettings.launchWithJit".loc)
                 }
                 .disabled(model.uiIs32bit)
-                if #available(iOS 26.0, *), model.uiIsJITNeeded, !model.uiIs32bit {
+                if model.uiIsJITNeeded, !model.uiIs32bit {
                     HStack {
                         Text("lc.appSettings.jit26.script".loc)
                         Spacer()
@@ -198,10 +199,7 @@ struct LCAppSettingsView: View {
                             }
                             picker.delegate = documentPickerCoordinator
 
-                            if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                               let rootViewController = windowScene.windows.first?.rootViewController {
-                                rootViewController.present(picker, animated: true)
-                            }
+                            UIApplication.shared.lcTopmostViewController()?.present(picker, animated: true)
                         }) {
                             Text("lc.common.select".loc)
                         }
@@ -209,38 +207,37 @@ struct LCAppSettingsView: View {
                 }
                 if model.uiIs32bit {
                     Picker(selection: $model.uiSelected32BitEmulator) {
+                        Text("lc.common.default".loc).tag("")
                         ForEach(sharedModel.arm32EmuApps, id: \.self) { app in
-                            Text("lc.common.default".loc).tag("")
-                            Text(app.appInfo.displayName()).tag(app.appInfo.relativeBundlePath!)
+                            Text(app.appInfo.displayName()).tag(app.appInfo.relativeBundlePath ?? "")
                         }
                     } label: {
                         Text("lc.appSettings.selected32BitEmulator".loc)
                     }
                 }
             } footer: {
-                    if #available(iOS 26.0, *), model.uiIsJITNeeded {
-                        Text("lc.appSettings.launchWithJitDesc".loc + "\n" + "lc.appSettings.jit26.scriptDesc".loc)
-
-                    } else {
-                        Text("lc.appSettings.launchWithJitDesc".loc)
-                    }
+                if model.uiIsJITNeeded {
+                    Text("lc.appSettings.launchWithJitDesc".loc + "\n" + "lc.appSettings.jit26.scriptDesc".loc)
+                } else {
+                    Text("lc.appSettings.launchWithJitDesc".loc)
+                }
             }
 
             Section {
                 Toggle(isOn: $model.uiIsLocked) {
                     Text("lc.appSettings.lockApp".loc)
                 }
-                .onChange(of: model.uiIsLocked, perform: { newValue in
+                .onChange(of: model.uiIsLocked) { _, newValue in
                     Task { await model.setLocked(newLockState: newValue) }
-                })
+                }
 
                 if model.uiIsLocked {
                     Toggle(isOn: $model.uiIsHidden) {
                         Text("lc.appSettings.hideApp".loc)
                     }
-                    .onChange(of: model.uiIsHidden, perform: { _ in
+                    .onChange(of: model.uiIsHidden) { _, _ in
                         Task { await toggleHidden() }
-                    })
+                    }
                     .transition(.opacity.combined(with: .slide)) 
                 }
             } footer: {
@@ -250,15 +247,13 @@ struct LCAppSettingsView: View {
                 }
             }
             
-            if #available(iOS 16.0, *) {
-                Section {
-                    Picker(selection: $model.uiIsMultitaskModeSpecificed) {
-                        Text("lc.common.default".loc).tag(MultitaskSpecified.default)
-                        Text("lc.common.no".loc).tag(MultitaskSpecified.no)
-                        Text("lc.common.yes".loc).tag(MultitaskSpecified.yes)
-                    } label: {
-                        Text("lc.appBanner.multitask".loc)
-                    }
+            Section {
+                Picker(selection: $model.uiIsMultitaskModeSpecificed) {
+                    Text("lc.common.default".loc).tag(MultitaskSpecified.default)
+                    Text("lc.common.no".loc).tag(MultitaskSpecified.no)
+                    Text("lc.common.yes".loc).tag(MultitaskSpecified.yes)
+                } label: {
+                    Text("lc.appBanner.multitask".loc)
                 }
             }
             
@@ -316,10 +311,8 @@ struct LCAppSettingsView: View {
                 Toggle(isOn: $model.uiFixLocalNotification) {
                     Text("lc.appSettings.fixLocalNotification".loc)
                 }
-                if #available(iOS 26.0, *) {
-                    Toggle(isOn: $model.uiFixBackgroundTaskIdentifiers) {
-                        Text("lc.appSettings.fixBackgroundTaskIdentifiers".loc)
-                    }
+                Toggle(isOn: $model.uiFixBackgroundTaskIdentifiers) {
+                    Text("lc.appSettings.fixBackgroundTaskIdentifiers".loc)
                 }
                 Toggle(isOn: $model.uiUseLCBundleId) {
                     Text("lc.appSettings.useLCBundleId".loc)
@@ -355,20 +348,35 @@ struct LCAppSettingsView: View {
                     Toggle(isOn: $model.uiDontLoadTweakLoader) {
                         Text("lc.appSettings.dontLoadTweakLoader".loc)
                     }
+                } else {
+                    Toggle("Export Tweak Symbols Globally (RTLD_GLOBAL)", isOn: $model.uiExportTweakSymbolsGlobally)
                 }
                 
             } footer: {
                 Text("lc.appSettings.hideLiveContainerDesc".loc)
             }
-            
-            if #available(iOS 16.0, *) {
-                Section {
-                    Toggle(isOn: $model.uiClassicMode) {
-                        Text("lc.appSettings.classicMode".loc)
-                    }
-                } footer: {
-                    Text("lc.appSettings.classicModeDesc".loc)
+
+            Section {
+                Toggle("Enable Developer Live Debugging Mode", isOn: $model.uiDebugModeEnabled)
+                Button {
+                    sharedModel.activeDebugApp = model
+                    dismiss()
+                } label: {
+                    Label("Launch in Debug Studio", systemImage: "ladybug.fill")
                 }
+                .buttonStyle(.glassProminent)
+            } header: {
+                Text("Developer Live Debugging")
+            } footer: {
+                Text("Runs the app in a resizable centered frame surrounded by real-time Console, HTTP Sniffer, UI X-Ray, Tap Inspector, Dylib/ObjC Browser, Sandbox/Keychain Viewer, and toggleable Mac Local Network access.")
+            }
+            
+            Section {
+                Toggle(isOn: $model.uiClassicMode) {
+                    Text("lc.appSettings.classicMode".loc)
+                }
+            } footer: {
+                Text("lc.appSettings.classicModeDesc".loc)
             }
             
             Section {
@@ -669,7 +677,7 @@ struct LCAppSettingsView: View {
         }
         
         sharedModel.appDataFolderNames.append(newName)
-        let newContainer = LCContainer(folderName: newName, name: displayName, isShared: model.uiIsShared)
+        let newContainer = LCContainer.makeNewContainer(folderName: newName, name: displayName, isShared: model.uiIsShared)
         // assign keychain group
         var keychainGroupSet : Set<Int> = Set(minimumCapacity: 3)
         for i in 0..<SharedModel.keychainAccessGroupCount {
@@ -728,13 +736,21 @@ struct LCAppSettingsView: View {
             if fm.fileExists(atPath: url.appendingPathComponent("LCContainerInfo.plist").path) {
                 let plistInfo = try PropertyListSerialization.propertyList(from: Data(contentsOf: url.appendingPathComponent("LCContainerInfo.plist")), format: nil)
                 if let plistInfo = plistInfo as? [String : Any] {
-                    let name = plistInfo["folderName"] as? String ?? url.lastPathComponent
+                    let name = plistInfo["name"] as? String ?? plistInfo["folderName"] as? String ?? url.lastPathComponent
                     container = LCContainer(infoDict: ["folderName": url.lastPathComponent, "name": name, "bookmarkData":bookmark], isShared: false)
                 }
             }
             if container == nil {
-                // it's an empty folder, we assign a new keychain group to it.
-                container = LCContainer(infoDict: ["folderName": url.lastPathComponent, "name": url.lastPathComponent, "bookmarkData": bookmark], isShared: false)
+                // it's an empty folder, we assign a new keychain group and global default profile preset to it.
+                let freshContainer = LCContainer.makeNewContainer(
+                    folderName: url.lastPathComponent,
+                    name: url.lastPathComponent,
+                    isShared: false,
+                    bookmarkData: bookmark,
+                    resolvedContainerURL: url
+                )
+                freshContainer.bookmarkResolved = true
+                container = freshContainer
                 // assign keychain group
                 var keychainGroupSet : Set<Int> = Set(minimumCapacity: 3)
                 for i in 0..<SharedModel.keychainAccessGroupCount {

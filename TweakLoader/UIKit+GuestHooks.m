@@ -4,14 +4,15 @@
 @import AVFoundation;
 @import Network;
 @import CFNetwork;
-#if __IPHONE_OS_VERSION_MIN_REQUIRED >= 260100
 @import Accessibility;
-#endif
 #import "LCSharedUtils.h"
 #import "UIKitPrivate.h"
 #import "../LiveContainer/utils.h"
+#import "../LiveContainer/LCDeviceProfileCatalog.h"
 #import <LocalAuthentication/LocalAuthentication.h>
 #import "Localization.h"
+#pragma clang diagnostic ignored "-Wundeclared-selector"
+#include <dlfcn.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
@@ -21,6 +22,9 @@
 #include <errno.h>
 #include <math.h>
 #include <mach/machine.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <time.h>
 
 UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
@@ -106,13 +110,103 @@ time_t spoofStorageVolumeCreationTime = 1704067200;
 NSString *spoofCustomUserAgent = nil;
 NSString *spoofWebGLVendor = @"Apple Inc.";
 NSString *spoofWebGLRenderer = @"Apple GPU";
-NSString *spoofWebCanvasDataURL = @"data:image/png;base64,iVBORw0KGgo=";
+NSString *spoofWebCanvasDataURL = @"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 NSInteger spoofWebColorDepth = 24;
 NSDictionary<NSString *, NSNumber *> *spoofFeatureOverrides = nil;
+NSString *spoofDeviceVariantId = nil;
+CGFloat spoofScreenPointWidth = 0;
+CGFloat spoofScreenPointHeight = 0;
+
+static NSString *sRealHostMachine = nil;
+static _Atomic uint64_t sHardwareInterceptions = 0;
+static _Atomic uint64_t sNetworkInterceptions = 0;
+static _Atomic uint64_t sWebKitInterceptions = 0;
+static atomic_flag sTelemetryFlushScheduled = ATOMIC_FLAG_INIT;
+static CFAbsoluteTime sLastTelemetryFlushTimestamp = 0;
+static os_unfair_lock sTelemetryLock = OS_UNFAIR_LOCK_INIT;
+static NSString *sTelemetryFilePath = nil;
+
+typedef NS_ENUM(NSInteger, LCProfileTelemetryVector) {
+    LCProfileTelemetryVectorHardware = 0,
+    LCProfileTelemetryVectorNetwork = 1,
+    LCProfileTelemetryVectorWebKit = 2
+};
+
+/**
+ Returns a point-in-time snapshot of spoof interception counters and host comparison
+ metrics for Debug Studio, the Mac LAN Web Console, and the Leak Inspector.
+ */
+NSDictionary *LCProfileGetTelemetrySnapshot(void) {
+    uint64_t hwCount = atomic_load_explicit(&sHardwareInterceptions, memory_order_relaxed);
+    uint64_t netCount = atomic_load_explicit(&sNetworkInterceptions, memory_order_relaxed);
+    uint64_t webCount = atomic_load_explicit(&sWebKitInterceptions, memory_order_relaxed);
+    return @{
+        @"spoofProfileEnabled": @(spoofProfileEnabled),
+        @"blockDeviceInfoReads": @(blockDeviceInfoReads),
+        @"realHostMachine": sRealHostMachine ?: @"",
+        @"spoofedHardwareModel": spoofHardwareModel ?: @"",
+        @"spoofedBoardModel": spoofBoardModel ?: @"",
+        @"spoofedSystemVersion": spoofSystemVersion ?: @"",
+        @"hardwareInterceptions": @(hwCount),
+        @"networkInterceptions": @(netCount),
+        @"webkitInterceptions": @(webCount),
+        @"updatedAt": @((long long)time(NULL))
+    };
+}
+
+static void LCFlushProfileTelemetryToDisk(BOOL force) {
+    if (sTelemetryFilePath.length == 0) {
+        return;
+    }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    os_unfair_lock_lock(&sTelemetryLock);
+    BOOL shouldWrite = force || (now - sLastTelemetryFlushTimestamp >= 2.5);
+    if (shouldWrite) {
+        sLastTelemetryFlushTimestamp = now;
+    }
+    os_unfair_lock_unlock(&sTelemetryLock);
+    if (!shouldWrite) {
+        return;
+    }
+    NSDictionary *snapshot = LCProfileGetTelemetrySnapshot();
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:snapshot
+                                                              format:NSPropertyListBinaryFormat_v1_0
+                                                             options:0
+                                                               error:nil];
+    if (data.length > 0) {
+        [data writeToFile:sTelemetryFilePath atomically:YES];
+    }
+}
+
+static void LCRecordProfileInterception(LCProfileTelemetryVector vector) {
+    switch (vector) {
+        case LCProfileTelemetryVectorHardware:
+            atomic_fetch_add_explicit(&sHardwareInterceptions, 1, memory_order_relaxed);
+            break;
+        case LCProfileTelemetryVectorNetwork:
+            atomic_fetch_add_explicit(&sNetworkInterceptions, 1, memory_order_relaxed);
+            break;
+        case LCProfileTelemetryVectorWebKit:
+            atomic_fetch_add_explicit(&sWebKitInterceptions, 1, memory_order_relaxed);
+            break;
+    }
+    if (sTelemetryFilePath.length > 0 && !atomic_flag_test_and_set_explicit(&sTelemetryFlushScheduled, memory_order_acq_rel)) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            atomic_flag_clear_explicit(&sTelemetryFlushScheduled, memory_order_release);
+            LCFlushProfileTelemetryToDisk(NO);
+        });
+    }
+}
 
 static BOOL LCFeatureEnabled(NSString *key) {
-    NSNumber *value = spoofFeatureOverrides[key];
-    return [value isKindOfClass:NSNumber.class] ? value.boolValue : YES;
+    if (spoofProfileEnabled) {
+        NSNumber *value = spoofFeatureOverrides[key];
+        if ([value isKindOfClass:NSNumber.class]) {
+            return value.boolValue;
+        }
+    }
+    return key.length > 0 ? LCDefaultFeatureFlagEnabled(key.UTF8String) : YES;
 }
 
 @interface LCTelephonyNetworkInfoHookProvider : NSObject
@@ -127,13 +221,32 @@ static BOOL LCFeatureEnabled(NSString *key) {
 @interface LCNetworkExtensionStrictHookProvider : NSObject
 @end
 
+@interface LCLSApplicationWorkspaceHookProvider : NSObject
+@end
+
 static void LCSwizzleIfPresent(Class cls, SEL originalAction, SEL swizzledAction) {
     if(!cls) {
         return;
     }
     Method originalMethod = class_getInstanceMethod(cls, originalAction);
     Method swizzledMethod = class_getInstanceMethod(cls, swizzledAction);
-    if(originalMethod && swizzledMethod) {
+    if(!originalMethod || !swizzledMethod) {
+        return;
+    }
+    BOOL didAdd = class_addMethod(
+        cls,
+        originalAction,
+        method_getImplementation(swizzledMethod),
+        method_getTypeEncoding(swizzledMethod)
+    );
+    if(didAdd) {
+        class_replaceMethod(
+            cls,
+            swizzledAction,
+            method_getImplementation(originalMethod),
+            method_getTypeEncoding(originalMethod)
+        );
+    } else {
         method_exchangeImplementations(originalMethod, swizzledMethod);
     }
 }
@@ -154,7 +267,23 @@ static void LCSwizzleIfPresentWithSourceClass(Class cls, Class sourceCls, SEL or
         method_getTypeEncoding(sourceMethod)
     );
     Method swizzledMethod = class_getInstanceMethod(cls, swizzledAction);
-    if(swizzledMethod) {
+    if(!swizzledMethod) {
+        return;
+    }
+    BOOL didAdd = class_addMethod(
+        cls,
+        originalAction,
+        method_getImplementation(swizzledMethod),
+        method_getTypeEncoding(swizzledMethod)
+    );
+    if(didAdd) {
+        class_replaceMethod(
+            cls,
+            swizzledAction,
+            method_getImplementation(originalMethod),
+            method_getTypeEncoding(originalMethod)
+        );
+    } else {
         method_exchangeImplementations(originalMethod, swizzledMethod);
     }
 }
@@ -165,7 +294,24 @@ static void LCSwizzleClassIfPresent(Class cls, SEL originalAction, SEL swizzledA
     }
     Method originalMethod = class_getClassMethod(cls, originalAction);
     Method swizzledMethod = class_getClassMethod(cls, swizzledAction);
-    if(originalMethod && swizzledMethod) {
+    if(!originalMethod || !swizzledMethod) {
+        return;
+    }
+    Class metaClass = object_getClass((id)cls);
+    BOOL didAdd = class_addMethod(
+        metaClass,
+        originalAction,
+        method_getImplementation(swizzledMethod),
+        method_getTypeEncoding(swizzledMethod)
+    );
+    if(didAdd) {
+        class_replaceMethod(
+            metaClass,
+            swizzledAction,
+            method_getImplementation(originalMethod),
+            method_getTypeEncoding(originalMethod)
+        );
+    } else {
         method_exchangeImplementations(originalMethod, swizzledMethod);
     }
 }
@@ -187,7 +333,23 @@ static void LCSwizzleClassIfPresentWithSourceClass(Class cls, Class sourceCls, S
         method_getTypeEncoding(sourceMethod)
     );
     Method swizzledMethod = class_getClassMethod(cls, swizzledAction);
-    if(swizzledMethod) {
+    if(!swizzledMethod) {
+        return;
+    }
+    BOOL didAdd = class_addMethod(
+        metaClass,
+        originalAction,
+        method_getImplementation(swizzledMethod),
+        method_getTypeEncoding(swizzledMethod)
+    );
+    if(didAdd) {
+        class_replaceMethod(
+            metaClass,
+            swizzledAction,
+            method_getImplementation(originalMethod),
+            method_getTypeEncoding(originalMethod)
+        );
+    } else {
         method_exchangeImplementations(originalMethod, swizzledMethod);
     }
 }
@@ -195,14 +357,22 @@ static void LCSwizzleClassIfPresentWithSourceClass(Class cls, Class sourceCls, S
 static BOOL LCNeutralAccessibilityFlag(id self, SEL _cmd) { return NO; }
 
 static id LCEmptyArrayGetter(id self, SEL _cmd) { return @[]; }
-static NSString *LCNeutralStringGetter(id self, SEL _cmd) { return spoofGPUName ?: @"Apple GPU"; }
+static NSArray<NSString *> *LCBaselineFontFamiliesGetter(id self, SEL _cmd) {
+    return @[@"Arial", @"Courier New", @"Georgia", @"Helvetica Neue", @"San Francisco", @"Times New Roman", @"Verdana"];
+}
+static NSString *LCNeutralStringGetter(id self, SEL _cmd) {
+    LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+    return spoofGPUName.length > 0 ? spoofGPUName : @"Apple GPU";
+}
 static BOOL LCConfiguredBoolGetter(id self, SEL _cmd) {
     if(sel_isEqual(_cmd, NSSelectorFromString(@"isOtherAudioPlaying"))) return spoofAudioOtherPlaying;
     return spoofGraphicsSupportsRayTracing;
 }
 static BOOL LCTrueIntegerArgumentGetter(id self, SEL _cmd, NSInteger value) { return spoofGraphicsSupportsAllFamilies; }
+static int LCDeniedCLAuthorizationGetter(id self, SEL _cmd) { return 2; }
 static NSInteger LCDeniedAuthorizationGetter(id self, SEL _cmd) { return 2; }
 static NSInteger LCDeniedMediaAuthorizationGetter(id self, SEL _cmd) { return 1; }
+static NSInteger LCDeniedObjectArgumentGetter(id self, SEL _cmd, id value) { return 2; }
 static NSInteger LCDeniedAuthorizationArgumentGetter(id self, SEL _cmd, NSInteger value) { return 2; }
 static double LCAudioDoubleGetter(id self, SEL _cmd) {
     if(sel_isEqual(_cmd, NSSelectorFromString(@"sampleRate"))) return spoofAudioSampleRate;
@@ -215,17 +385,23 @@ static NSInteger LCConfiguredChannelCountGetter(id self, SEL _cmd) {
         ? spoofAudioOutputChannels : spoofAudioInputChannels;
 }
 static unsigned long long LCNeutralWorkingSetGetter(id self, SEL _cmd) {
+    LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
     return spoofGPUWorkingSetSize;
 }
 
 static void LCReplaceInstanceMethod(Class cls, NSString *selectorName, IMP implementation) {
-    Method method = class_getInstanceMethod(cls, NSSelectorFromString(selectorName));
-    if(method) method_setImplementation(method, implementation);
+    if(!cls) return;
+    SEL sel = NSSelectorFromString(selectorName);
+    Method method = class_getInstanceMethod(cls, sel);
+    if(method) class_replaceMethod(cls, sel, implementation, method_getTypeEncoding(method));
 }
 
 static void LCReplaceClassMethod(Class cls, NSString *selectorName, IMP implementation) {
-    Method method = class_getClassMethod(cls, NSSelectorFromString(selectorName));
-    if(method) method_setImplementation(method, implementation);
+    if(!cls) return;
+    SEL sel = NSSelectorFromString(selectorName);
+    Method method = class_getClassMethod(cls, sel);
+    Class metaClass = object_getClass((id)cls);
+    if(method && metaClass) class_replaceMethod(metaClass, sel, implementation, method_getTypeEncoding(method));
 }
 
 static void LCInstallNeutralAccessibilityProfile(void) {
@@ -235,7 +411,8 @@ static void LCInstallNeutralAccessibilityProfile(void) {
         @"isGuidedAccessEnabled": @"accessibility.guidedAccess", @"isGrayscaleEnabled": @"accessibility.grayscale",
         @"isInvertColorsEnabled": @"accessibility.invertColors", @"isReduceMotionEnabled": @"accessibility.reduceMotion",
         @"isAssistiveTouchRunning": @"accessibility.assistiveTouch", @"isShakeToUndoEnabled": @"accessibility.shakeToUndo",
-        @"isBoldTextEnabled": @"accessibility.boldText", @"isDarkerSystemColorsEnabled": @"accessibility.darkerColors",
+        @"isBoldTextEnabled": @"accessibility.boldText", @"isButtonShapesEnabled": @"accessibility.buttonShapes",
+        @"isDarkerSystemColorsEnabled": @"accessibility.darkerColors",
         @"isReduceTransparencyEnabled": @"accessibility.reduceTransparency", @"isMonoAudioEnabled": @"accessibility.monoAudio",
         @"isSpeakScreenEnabled": @"accessibility.speakScreen", @"isSpeakSelectionEnabled": @"accessibility.speakSelection",
         @"isClosedCaptioningEnabled": @"accessibility.closedCaptions", @"isVideoAutoplayEnabled": @"accessibility.videoAutoplay",
@@ -286,7 +463,7 @@ static void LCInstallGraphicsPrivacyProfile(void) {
 }
 
 static void LCInstallAppEnumerationPrivacyProfile(void) {
-    if(LCFeatureEnabled(@"app.fonts")) LCReplaceClassMethod(UIFont.class, @"familyNames", (IMP)LCEmptyArrayGetter);
+    if(LCFeatureEnabled(@"app.fonts")) LCReplaceClassMethod(UIFont.class, @"familyNames", (IMP)LCBaselineFontFamiliesGetter);
     if(LCFeatureEnabled(@"app.voices")) LCReplaceClassMethod(AVSpeechSynthesisVoice.class, @"speechVoices", (IMP)LCEmptyArrayGetter);
 }
 
@@ -309,8 +486,11 @@ static void LCInstallSensorsAndUserDataPrivacyProfile(void) {
     }
 
     Class location = NSClassFromString(@"CLLocationManager");
-    if(LCFeatureEnabled(@"permissions.location")) LCReplaceInstanceMethod(location, @"authorizationStatus", (IMP)LCDeniedAuthorizationGetter);
-    if(LCFeatureEnabled(@"permissions.capture")) LCReplaceClassMethod(NSClassFromString(@"AVCaptureDevice"), @"authorizationStatusForMediaType:", (IMP)LCDeniedAuthorizationArgumentGetter);
+    if(LCFeatureEnabled(@"permissions.location")) {
+        LCReplaceInstanceMethod(location, @"authorizationStatus", (IMP)LCDeniedCLAuthorizationGetter);
+        LCReplaceClassMethod(location, @"authorizationStatus", (IMP)LCDeniedCLAuthorizationGetter);
+    }
+    if(LCFeatureEnabled(@"permissions.capture")) LCReplaceClassMethod(NSClassFromString(@"AVCaptureDevice"), @"authorizationStatusForMediaType:", (IMP)LCDeniedObjectArgumentGetter);
     if(LCFeatureEnabled(@"permissions.photos")) LCReplaceClassMethod(NSClassFromString(@"PHPhotoLibrary"), @"authorizationStatusForAccessLevel:", (IMP)LCDeniedAuthorizationArgumentGetter);
     if(LCFeatureEnabled(@"permissions.contacts")) LCReplaceClassMethod(NSClassFromString(@"CNContactStore"), @"authorizationStatusForEntityType:", (IMP)LCDeniedAuthorizationArgumentGetter);
     if(LCFeatureEnabled(@"permissions.events")) LCReplaceClassMethod(NSClassFromString(@"EKEventStore"), @"authorizationStatusForEntityType:", (IMP)LCDeniedAuthorizationArgumentGetter);
@@ -324,36 +504,73 @@ static NSString *LCJSONString(id value) {
     return array.length >= 2 ? [array substringWithRange:NSMakeRange(1, array.length - 2)] : @"\"\"";
 }
 
+static NSString *LCPreferredWebKitPlatform(void) {
+    if([spoofDeviceModel rangeOfString:@"ipad" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+       [spoofHardwareModel hasPrefix:@"iPad"]) {
+        return @"iPad";
+    }
+    if(spoofDeviceModel.length > 0 && ![spoofDeviceModel isEqualToString:@"Unknown"]) {
+        return spoofDeviceModel;
+    }
+    return @"iPhone";
+}
+
+static NSString *LCBuildWebKitUserAgent(void) {
+    if(spoofCustomUserAgent.length > 0) {
+        return spoofCustomUserAgent;
+    }
+    NSString *platform = LCPreferredWebKitPlatform();
+    NSString *osVersion = spoofSystemVersion.length > 0 ? spoofSystemVersion : @"27.2";
+    NSString *underscored = [osVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    NSString *cpuToken = [platform isEqualToString:@"iPad"]
+        ? [NSString stringWithFormat:@"CPU OS %@ like Mac OS X", underscored]
+        : [NSString stringWithFormat:@"CPU iPhone OS %@ like Mac OS X", underscored];
+    return [NSString stringWithFormat:@"Mozilla/5.0 (%@; %@) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1",
+            platform, cpuToken, osVersion];
+}
+
+static NSString *LCPreferredAcceptLanguageHeader(void) {
+    NSString *identifier = spoofLocale.localeIdentifier;
+    if(identifier.length == 0) {
+        return nil;
+    }
+    NSString *bcp47 = [identifier stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+    NSString *langOnly = [spoofLocale objectForKey:NSLocaleLanguageCode];
+    if(langOnly.length > 0 && ![bcp47.lowercaseString isEqualToString:langOnly.lowercaseString]) {
+        return [NSString stringWithFormat:@"%@,%@;q=0.9", bcp47, langOnly];
+    }
+    return bcp47;
+}
+
 static NSString *LCWebViewProfileScript(void) {
-    NSString *platform = [spoofDeviceModel.lowercaseString containsString:@"ipad"] ? @"iPad" :
-        (spoofDeviceModel.length > 0 ? spoofDeviceModel : @"iPhone");
-    NSString *version = spoofSystemVersion.length > 0 ? [spoofSystemVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"] : @"26_0";
+    NSString *platform = LCPreferredWebKitPlatform();
     NSString *language = spoofLocale.localeIdentifier.length > 0
         ? [spoofLocale.localeIdentifier stringByReplacingOccurrencesOfString:@"_" withString:@"-"] : @"en-US";
-    NSString *ua = [NSString stringWithFormat:@"Mozilla/5.0 (%@; CPU %@ OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        platform, [platform isEqualToString:@"iPad"] ? @"iPad" : @"iPhone", version];
-    if(spoofCustomUserAgent.length > 0) ua = spoofCustomUserAgent;
+    NSString *ua = LCBuildWebKitUserAgent();
     NSInteger cores = spoofProcessorCount > 0 ? spoofProcessorCount : 6;
-    unsigned long long memoryGB = spoofPhysicalMemory > 0 ? MAX(2, spoofPhysicalMemory / (1024ULL * 1024ULL * 1024ULL)) : 8;
-    CGFloat pointsWidth = spoofScreenScale > 0 ? spoofScreenWidth / spoofScreenScale : spoofScreenWidth;
-    CGFloat pointsHeight = spoofScreenScale > 0 ? spoofScreenHeight / spoofScreenScale : spoofScreenHeight;
+    CGFloat pointsWidth = spoofScreenPointWidth > 0 ? spoofScreenPointWidth
+        : (spoofScreenScale > 0 ? spoofScreenWidth / spoofScreenScale : spoofScreenWidth);
+    CGFloat pointsHeight = spoofScreenPointHeight > 0 ? spoofScreenPointHeight
+        : (spoofScreenScale > 0 ? spoofScreenHeight / spoofScreenScale : spoofScreenHeight);
+    CGFloat safePointW = pointsWidth > 0 ? pointsWidth : 402.0;
+    CGFloat safePointH = pointsHeight > 0 ? pointsHeight : 874.0;
     NSInteger timezoneOffset = spoofTimeZone ? -[spoofTimeZone secondsFromGMT] / 60 : 0;
-    NSMutableString *script = [@"(()=>{const d=(o,k,v)=>{try{Object.defineProperty(o,k,{get:()=>v,configurable:true})}catch(e){}};" mutableCopy];
+    NSMutableString *script = [@"(()=>{const d=(o,k,v)=>{try{const fn=Object.defineProperty(function(){return v},'toString',{value:()=>'function get '+k+'() { [native code] }'});Object.defineProperty(o,k,{get:fn,configurable:true})}catch(e){}};" mutableCopy];
     if(LCFeatureEnabled(@"web.navigator")) {
-        [script appendFormat:@"d(Navigator.prototype,'userAgent',%@);d(Navigator.prototype,'platform',%@);d(Navigator.prototype,'language',%@);d(Navigator.prototype,'languages',[%@]);d(Navigator.prototype,'hardwareConcurrency',%ld);d(Navigator.prototype,'deviceMemory',%llu);",
-            LCJSONString(ua), LCJSONString(platform), LCJSONString(language), LCJSONString(language), (long)cores, memoryGB];
+        [script appendFormat:@"d(Navigator.prototype,'userAgent',%@);d(Navigator.prototype,'platform',%@);d(Navigator.prototype,'language',%@);d(Navigator.prototype,'languages',[%@]);d(Navigator.prototype,'hardwareConcurrency',%ld);d(Navigator.prototype,'maxTouchPoints',5);",
+            LCJSONString(ua), LCJSONString(platform), LCJSONString(language), LCJSONString(language), (long)cores];
     }
     if(LCFeatureEnabled(@"web.screen")) {
-        [script appendFormat:@"d(Screen.prototype,'width',%.0f);d(Screen.prototype,'height',%.0f);d(Screen.prototype,'colorDepth',%ld);d(Screen.prototype,'pixelDepth',%ld);d(window,'devicePixelRatio',%.3f);",
-            pointsWidth > 0 ? pointsWidth : 393, pointsHeight > 0 ? pointsHeight : 852,
-            (long)spoofWebColorDepth, (long)spoofWebColorDepth, spoofScreenScale > 0 ? spoofScreenScale : 3];
+        [script appendFormat:@"d(Screen.prototype,'width',%.0f);d(Screen.prototype,'height',%.0f);d(Screen.prototype,'availWidth',%.0f);d(Screen.prototype,'availHeight',%.0f);d(Screen.prototype,'colorDepth',%ld);d(Screen.prototype,'pixelDepth',%ld);d(window,'devicePixelRatio',%.3f);",
+            safePointW, safePointH, safePointW, safePointH,
+            (long)spoofWebColorDepth, (long)spoofWebColorDepth, spoofScreenScale > 0 ? spoofScreenScale : 3.0];
     }
     if(LCFeatureEnabled(@"web.timeZone")) {
         [script appendFormat:@"Date.prototype.getTimezoneOffset=function(){return %ld};const ir=Intl.DateTimeFormat.prototype.resolvedOptions;Intl.DateTimeFormat.prototype.resolvedOptions=function(){const r=ir.call(this);r.timeZone=%@;return r};",
             (long)timezoneOffset, LCJSONString(spoofTimeZone.name ?: @"Etc/UTC")];
     }
     if(LCFeatureEnabled(@"web.webGL")) {
-        [script appendFormat:@"const gp=typeof WebGLRenderingContext!=='undefined'&&WebGLRenderingContext.prototype.getParameter;if(gp)WebGLRenderingContext.prototype.getParameter=function(p){if(p===37445)return %@;if(p===37446)return %@;return gp.call(this,p)};",
+        [script appendFormat:@"const wglPatch=proto=>{const gp=proto&&proto.getParameter;if(gp)proto.getParameter=function(p){if(p===37445)return %@;if(p===37446)return %@;return gp.call(this,p)}};if(typeof WebGLRenderingContext!=='undefined')wglPatch(WebGLRenderingContext.prototype);if(typeof WebGL2RenderingContext!=='undefined')wglPatch(WebGL2RenderingContext.prototype);",
             LCJSONString(spoofWebGLVendor), LCJSONString(spoofWebGLRenderer)];
     }
     if(LCFeatureEnabled(@"web.canvas")) {
@@ -487,99 +704,272 @@ static UIWindowLevel LCOverlayWindowLevel(void) {
     return (keyWindow ? keyWindow.windowLevel : UIWindowLevelNormal) + 1;
 }
 
-static CGRect LCActiveScreenBounds(void) {
-    UIWindow *keyWindow = LCKeyWindowForScene(LCForegroundWindowScene());
-    if(keyWindow) return keyWindow.bounds;
-    UIWindowScene *scene = LCForegroundWindowScene();
-    return scene ? scene.screen.bounds : CGRectZero;
+static UIWindow *LCCreateOverlayAlertWindow(void) {
+    UIWindowScene *scene = LCForegroundWindowScene() ?: (UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject;
+    if (!scene) return nil;
+    UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
+    window.rootViewController = [UIViewController new];
+    window.windowLevel = LCOverlayWindowLevel();
+    return window;
+}
+
+static void LCPresentAlertInOverlayWindow(UIWindow *window, UIAlertController *alert) {
+    if (!window) return;
+    [window makeKeyAndVisible];
+    [window.rootViewController presentViewController:alert animated:YES completion:nil];
+    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // MARK: - System & Display Profile: kernel identity
-// Intercept low-level C APIs that analytics SDKs use to read the real hardware
-// identifier (e.g. "iPhoneXX,X"). UIDevice.model only returns "iPhone" so apps
-// bypass it entirely via these C calls.
+// Intercept low-level C APIs (`sysctlbyname`, numeric MIB `sysctl`, `uname`)
+// that analytics and anti-fraud SDKs use to read the real hardware identifier,
+// board config, memory, CPU count, OS build, and Darwin kernel release.
+
+static NSInteger LCEffectiveOSMajorVersion(void) {
+    if (spoofOperatingSystemVersionValid && spoofOperatingSystemVersion.majorVersion > 0) {
+        return spoofOperatingSystemVersion.majorVersion;
+    }
+    return 27;
+}
+
+static NSString *LCDerivedDarwinRelease(void) {
+    NSInteger osMajor = LCEffectiveOSMajorVersion();
+    int32_t darwinMajor = LCExpectedDarwinMajorForOSMajor((int32_t)osMajor);
+    NSInteger darwinMinor = (osMajor >= 27) ? 2 : 0;
+    return [NSString stringWithFormat:@"%d.%ld.0", darwinMajor, (long)darwinMinor];
+}
+
+static NSString *LCDerivedOSBuildVersion(void) {
+    NSInteger osMajor = LCEffectiveOSMajorVersion();
+    if (osMajor >= 27) return @"24C101";
+    if (osMajor == 26) return @"23A340";
+    if (osMajor == 18) return @"22B83";
+    if (osMajor == 17) return @"21A329";
+    return @"20A362";
+}
+
+static NSUUID *LCBlockedZeroUUID(void) {
+    static NSUUID *zeroUUID = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        zeroUUID = [[NSUUID alloc] initWithUUIDString:@"00000000-0000-0000-0000-000000000000"];
+    });
+    return zeroUUID;
+}
+
+static BOOL LCHostNameSpoofActive(void) {
+    if (blockDeviceInfoReads) {
+        return YES;
+    }
+    if (!spoofProfileEnabled) {
+        return NO;
+    }
+    if (spoofIdentityCategoryEnabled && spoofHostName.length > 0) {
+        return YES;
+    }
+    return spoofNetworkEnvironmentCategoryEnabled && LCFeatureEnabled(@"network.hostName");
+}
+
+static NSString *LCEffectiveSpoofHostName(void) {
+    return spoofHostName.length > 0 ? spoofHostName : @"iphone.local";
+}
+
+static BOOL LCWriteSysctlString(NSString *value, void *oldp, size_t *oldlenp, int *outErrnoReturn) {
+    if (value.length == 0 || !oldlenp) {
+        return NO;
+    }
+    const char *utf8 = value.UTF8String;
+    size_t requiredLength = strlen(utf8) + 1;
+    if (!oldp) {
+        *oldlenp = requiredLength;
+        *outErrnoReturn = 0;
+        return YES;
+    }
+    if (*oldlenp < requiredLength) {
+        *oldlenp = requiredLength;
+        errno = ENOMEM;
+        *outErrnoReturn = -1;
+        return YES;
+    }
+    memcpy(oldp, utf8, requiredLength);
+    *oldlenp = requiredLength;
+    *outErrnoReturn = 0;
+    return YES;
+}
+
+static BOOL LCWriteSysctlBytes(const void *bytes, size_t length, void *oldp, size_t *oldlenp, int *outErrnoReturn) {
+    if (!bytes || length == 0 || !oldlenp) {
+        return NO;
+    }
+    if (!oldp) {
+        *oldlenp = length;
+        *outErrnoReturn = 0;
+        return YES;
+    }
+    if (*oldlenp < length) {
+        *oldlenp = length;
+        errno = ENOMEM;
+        *outErrnoReturn = -1;
+        return YES;
+    }
+    memcpy(oldp, bytes, length);
+    *oldlenp = length;
+    *outErrnoReturn = 0;
+    return YES;
+}
+
+static BOOL LCInterceptSysctlByKey(const char *name, void *oldp, size_t *oldlenp, void *newp, int *outReturn) {
+    if (!name || newp || !oldlenp) {
+        return NO;
+    }
+    NSString *spoofedValue = nil;
+    if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofIdentityCategoryEnabled)) && strcmp(name, "hw.machine") == 0) {
+        spoofedValue = spoofHardwareModel;
+    } else if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofIdentityCategoryEnabled)) &&
+               (strcmp(name, "hw.model") == 0 || strcmp(name, "hw.target") == 0)) {
+        spoofedValue = spoofBoardModel.length > 0 ? spoofBoardModel : spoofHardwareModel;
+    } else if (strcmp(name, "kern.hostname") == 0 && LCHostNameSpoofActive()) {
+        spoofedValue = LCEffectiveSpoofHostName();
+    } else if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) && strcmp(name, "kern.version") == 0) {
+        spoofedValue = spoofKernelVersion;
+    } else if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) &&
+               strcmp(name, "kern.osproductversion") == 0 && spoofSystemVersion.length > 0) {
+        spoofedValue = spoofSystemVersion;
+    } else if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) &&
+               strcmp(name, "kern.osrelease") == 0 && (spoofSystemVersion.length > 0 || blockDeviceInfoReads)) {
+        spoofedValue = LCDerivedDarwinRelease();
+    } else if ((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) &&
+               strcmp(name, "kern.osversion") == 0 && (spoofSystemVersion.length > 0 || blockDeviceInfoReads)) {
+        spoofedValue = LCDerivedOSBuildVersion();
+    }
+    if (spoofedValue.length > 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlString(spoofedValue, oldp, oldlenp, outReturn);
+    }
+
+    int32_t cpuType = blockDeviceInfoReads ? CPU_TYPE_ARM64 : ((spoofProfileEnabled && spoofSystemCategoryEnabled) ? spoofCPUType : 0);
+    int32_t cpuSubtype = blockDeviceInfoReads ? 0 : ((spoofProfileEnabled && spoofSystemCategoryEnabled) ? spoofCPUSubtype : -1);
+    int32_t ncpu = blockDeviceInfoReads ? 6 : ((spoofProfileEnabled && spoofSystemCategoryEnabled && spoofProcessorCount > 0) ? (int32_t)spoofProcessorCount : 0);
+    uint64_t memSize = blockDeviceInfoReads
+        ? (8ULL * 1024ULL * 1024ULL * 1024ULL)
+        : ((spoofProfileEnabled && spoofSystemCategoryEnabled && spoofPhysicalMemory > 0) ? (uint64_t)spoofPhysicalMemory : 0ULL);
+    uint32_t physMem32 = (uint32_t)MIN(memSize, (uint64_t)INT32_MAX);
+    struct timeval bootTime = {
+        .tv_sec = blockDeviceInfoReads ? 0 : ((spoofProfileEnabled && spoofSystemCategoryEnabled) ? spoofBootTime : 0),
+        .tv_usec = 0
+    };
+
+    if (strcmp(name, "hw.cputype") == 0 && cpuType > 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&cpuType, sizeof(cpuType), oldp, oldlenp, outReturn);
+    }
+    if (strcmp(name, "hw.cpusubtype") == 0 && cpuSubtype >= 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&cpuSubtype, sizeof(cpuSubtype), oldp, oldlenp, outReturn);
+    }
+    if (ncpu > 0 && (strcmp(name, "hw.ncpu") == 0 || strcmp(name, "hw.activecpu") == 0 ||
+                     strcmp(name, "hw.physicalcpu") == 0 || strcmp(name, "hw.physicalcpu_max") == 0 ||
+                     strcmp(name, "hw.logicalcpu") == 0 || strcmp(name, "hw.logicalcpu_max") == 0)) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&ncpu, sizeof(ncpu), oldp, oldlenp, outReturn);
+    }
+    if (memSize > 0 && strcmp(name, "hw.memsize") == 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&memSize, sizeof(memSize), oldp, oldlenp, outReturn);
+    }
+    if (memSize > 0 && (strcmp(name, "hw.physmem") == 0 || strcmp(name, "hw.usermem") == 0)) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&physMem32, sizeof(physMem32), oldp, oldlenp, outReturn);
+    }
+    if (strcmp(name, "kern.boottime") == 0 &&
+        (blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled && spoofBootTime > 0))) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&bootTime, sizeof(bootTime), oldp, oldlenp, outReturn);
+    }
+    return NO;
+}
 
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    NSString *spoofedValue = nil;
-    if(name && !newp) {
-        if((blockDeviceInfoReads || spoofIdentityCategoryEnabled) && strcmp(name, "hw.machine") == 0) {
-            spoofedValue = spoofHardwareModel;
-        } else if((blockDeviceInfoReads || spoofIdentityCategoryEnabled) && strcmp(name, "hw.model") == 0) {
-            spoofedValue = spoofBoardModel ?: spoofHardwareModel;
-        } else if((blockDeviceInfoReads || spoofIdentityCategoryEnabled) && strcmp(name, "kern.hostname") == 0) {
-            spoofedValue = spoofHostName;
-        } else if((blockDeviceInfoReads || spoofSystemCategoryEnabled) && strcmp(name, "kern.version") == 0) {
-            spoofedValue = spoofKernelVersion;
-        }
-    }
-    if(spoofedValue.length > 0 && oldlenp) {
-        const char *spoofed = spoofedValue.UTF8String;
-        size_t requiredLength = strlen(spoofed) + 1;
-        if(!oldp) {
-            *oldlenp = requiredLength;
-            return 0;
-        }
-        if(*oldlenp < requiredLength) {
-            *oldlenp = requiredLength;
-            errno = ENOMEM;
-            return -1;
-        }
-        memcpy(oldp, spoofed, requiredLength);
-        *oldlenp = requiredLength;
-        return 0;
-    }
-    const void *numericValue = nil;
-    size_t numericLength = 0;
-    int32_t cpuType = blockDeviceInfoReads ? CPU_TYPE_ARM64 : (spoofSystemCategoryEnabled ? spoofCPUType : 0);
-    int32_t cpuSubtype = blockDeviceInfoReads ? 0 : (spoofSystemCategoryEnabled ? spoofCPUSubtype : -1);
-    struct timeval bootTime = { .tv_sec = blockDeviceInfoReads ? 0 : (spoofSystemCategoryEnabled ? spoofBootTime : 0), .tv_usec = 0 };
-    if(name && !newp) {
-        if(strcmp(name, "hw.cputype") == 0 && cpuType > 0) {
-            numericValue = &cpuType;
-            numericLength = sizeof(cpuType);
-        } else if(strcmp(name, "hw.cpusubtype") == 0 && cpuSubtype >= 0) {
-            numericValue = &cpuSubtype;
-            numericLength = sizeof(cpuSubtype);
-        } else if(strcmp(name, "kern.boottime") == 0 && (blockDeviceInfoReads || spoofBootTime > 0)) {
-            numericValue = &bootTime;
-            numericLength = sizeof(bootTime);
-        }
-    }
-    if(numericValue && oldlenp) {
-        if(!oldp) {
-            *oldlenp = numericLength;
-            return 0;
-        }
-        if(*oldlenp < numericLength) {
-            *oldlenp = numericLength;
-            errno = ENOMEM;
-            return -1;
-        }
-        memcpy(oldp, numericValue, numericLength);
-        *oldlenp = numericLength;
-        return 0;
+    int handledReturn = 0;
+    if (LCInterceptSysctlByKey(name, oldp, oldlenp, newp, &handledReturn)) {
+        return handledReturn;
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
+static const char *LCSysctlNameFromMIB(const int *name, u_int namelen) {
+    if (!name || namelen < 2) {
+        return NULL;
+    }
+    if (name[0] == CTL_HW) {
+        switch (name[1]) {
+            case HW_MACHINE: return "hw.machine";
+            case HW_MODEL: return "hw.model";
+            case HW_NCPU: return "hw.ncpu";
+            case HW_PHYSMEM: return "hw.physmem";
+            case HW_USERMEM: return "hw.usermem";
+#ifdef HW_MEMSIZE
+            case HW_MEMSIZE: return "hw.memsize";
+#endif
+#ifdef HW_AVAILCPU
+            case HW_AVAILCPU: return "hw.activecpu";
+#endif
+#ifdef HW_TARGET
+            case HW_TARGET: return "hw.target";
+#endif
+            default: return NULL;
+        }
+    }
+    if (name[0] == CTL_KERN) {
+        switch (name[1]) {
+            case KERN_HOSTNAME: return "kern.hostname";
+            case KERN_VERSION: return "kern.version";
+            case KERN_OSRELEASE: return "kern.osrelease";
+            case KERN_BOOTTIME: return "kern.boottime";
+#ifdef KERN_OSVERSION
+            case KERN_OSVERSION: return "kern.osversion";
+#endif
+            default: return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    const char *mappedName = LCSysctlNameFromMIB(name, namelen);
+    int handledReturn = 0;
+    if (mappedName && LCInterceptSysctlByKey(mappedName, oldp, oldlenp, newp, &handledReturn)) {
+        return handledReturn;
+    }
+    return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
 static int hook_uname(struct utsname *uts) {
     int ret = uname(uts);
-    if(ret == 0 && (blockDeviceInfoReads || spoofIdentityCategoryEnabled) && spoofHardwareModel) {
-        strlcpy(uts->machine, spoofHardwareModel.UTF8String, sizeof(uts->machine));
-    }
-    if(ret == 0 && (blockDeviceInfoReads || spoofIdentityCategoryEnabled) && spoofHostName) {
-        strlcpy(uts->nodename, spoofHostName.UTF8String, sizeof(uts->nodename));
-    }
-    if(ret == 0 && (blockDeviceInfoReads || spoofSystemCategoryEnabled) && spoofKernelVersion) {
-        strlcpy(uts->version, spoofKernelVersion.UTF8String, sizeof(uts->version));
+    if(ret == 0 && uts) {
+        if((blockDeviceInfoReads || (spoofProfileEnabled && spoofIdentityCategoryEnabled)) && spoofHardwareModel.length > 0) {
+            strlcpy(uts->machine, spoofHardwareModel.UTF8String, sizeof(uts->machine));
+            LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        }
+        if(LCHostNameSpoofActive()) {
+            strlcpy(uts->nodename, LCEffectiveSpoofHostName().UTF8String, sizeof(uts->nodename));
+            LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        }
+        if((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) && spoofKernelVersion.length > 0) {
+            strlcpy(uts->version, spoofKernelVersion.UTF8String, sizeof(uts->version));
+        }
+        if((blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled)) &&
+           (spoofSystemVersion.length > 0 || blockDeviceInfoReads)) {
+            strlcpy(uts->release, LCDerivedDarwinRelease().UTF8String, sizeof(uts->release));
+        }
     }
     return ret;
 }
 
 static int hook_gethostname(char *name, size_t namelen) {
-    if((blockDeviceInfoReads || (spoofProfileEnabled && spoofNetworkEnvironmentCategoryEnabled && LCFeatureEnabled(@"network.hostName"))) && namelen > 0) {
-        NSString *value = spoofHostName.length > 0 ? spoofHostName : @"localhost";
-        strlcpy(name, value.UTF8String, namelen);
+    if(LCHostNameSpoofActive() && namelen > 0 && name) {
+        strlcpy(name, LCEffectiveSpoofHostName().UTF8String, namelen);
+        LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
         return 0;
     }
     return gethostname(name, namelen);
@@ -605,9 +995,7 @@ LC_ACCESSIBILITY_HOOK(UIAccessibilityIsClosedCaptioningEnabled, @"accessibility.
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsInvertColorsEnabled, @"accessibility.invertColors")
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsGuidedAccessEnabled, @"accessibility.guidedAccess")
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsBoldTextEnabled, @"accessibility.boldText")
-#if __IPHONE_OS_VERSION_MIN_REQUIRED >= 260100
 LC_ACCESSIBILITY_HOOK(AXShowBordersEnabled, @"accessibility.buttonShapes")
-#endif
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsGrayscaleEnabled, @"accessibility.grayscale")
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsReduceTransparencyEnabled, @"accessibility.reduceTransparency")
 LC_ACCESSIBILITY_HOOK(UIAccessibilityIsReduceMotionEnabled, @"accessibility.reduceMotion")
@@ -663,8 +1051,9 @@ static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
     { (const void *)&_hook, (const void *)&_orig }
 
 // These interpose entries are conditionally effective — the hook functions
-// check spoofHardwareModel at runtime and pass through if NULL.
+// check runtime spoof configuration and pass through when inactive.
 DYLD_INTERPOSE(hook_sysctlbyname, sysctlbyname);
+DYLD_INTERPOSE(hook_sysctl, sysctl);
 DYLD_INTERPOSE(hook_uname, uname);
 DYLD_INTERPOSE(hook_gethostname, gethostname);
 DYLD_INTERPOSE(hook_getifaddrs, getifaddrs);
@@ -678,9 +1067,7 @@ DYLD_INTERPOSE(hook_UIAccessibilityIsClosedCaptioningEnabled, UIAccessibilityIsC
 DYLD_INTERPOSE(hook_UIAccessibilityIsInvertColorsEnabled, UIAccessibilityIsInvertColorsEnabled);
 DYLD_INTERPOSE(hook_UIAccessibilityIsGuidedAccessEnabled, UIAccessibilityIsGuidedAccessEnabled);
 DYLD_INTERPOSE(hook_UIAccessibilityIsBoldTextEnabled, UIAccessibilityIsBoldTextEnabled);
-#if __IPHONE_OS_VERSION_MIN_REQUIRED >= 260100
 DYLD_INTERPOSE(hook_AXShowBordersEnabled, AXShowBordersEnabled);
-#endif
 DYLD_INTERPOSE(hook_UIAccessibilityIsGrayscaleEnabled, UIAccessibilityIsGrayscaleEnabled);
 DYLD_INTERPOSE(hook_UIAccessibilityIsReduceTransparencyEnabled, UIAccessibilityIsReduceTransparencyEnabled);
 DYLD_INTERPOSE(hook_UIAccessibilityIsReduceMotionEnabled, UIAccessibilityIsReduceMotionEnabled);
@@ -722,12 +1109,12 @@ static NSRegularExpression *_uaHwMachineRegex = nil;
 static NSRegularExpression *_uaIOSVersionSlashRegex = nil;
 static NSRegularExpression *_uaIOSVersionCPURegex = nil;
 static NSRegularExpression *_uaIOSVersionParenRegex = nil;
+static NSRegularExpression *_uaDarwinVersionRegex = nil;
 
 static void LCInitUserAgentRegexes(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         // Match hw.machine identifiers: iPhoneXX,X  iPadXX,X  etc.
-        // This is the most important one — catches ALL formats
         _uaHwMachineRegex = [NSRegularExpression
             regularExpressionWithPattern:@"(iPhone|iPad|iPod)\\d+,\\d+"
             options:0 error:nil];
@@ -737,88 +1124,137 @@ static void LCInitUserAgentRegexes(void) {
             regularExpressionWithPattern:@"iOS/[\\d.]+"
             options:0 error:nil];
 
-        // Match "CPU iPhone OS 18_0 like Mac OS X" (WebKit/Safari UA)
+        // Match "CPU iPhone OS 18_0 like Mac OS X" and iPad "CPU OS 18_0 like Mac OS X"
         _uaIOSVersionCPURegex = [NSRegularExpression
-            regularExpressionWithPattern:@"CPU iPhone OS [\\d_]+ like Mac OS X"
+            regularExpressionWithPattern:@"CPU (iPhone )?OS [\\d_]+ like Mac OS X"
             options:0 error:nil];
 
         // Match "(iOS 18.0;" or "iOS 18.0)" (Dart/Flutter, generic)
         _uaIOSVersionParenRegex = [NSRegularExpression
             regularExpressionWithPattern:@"iOS [\\d.]+"
             options:0 error:nil];
+
+        // Match CFNetwork's "Darwin/25.0.0" token
+        _uaDarwinVersionRegex = [NSRegularExpression
+            regularExpressionWithPattern:@"Darwin/[\\d.]+"
+            options:0 error:nil];
     });
 }
 
 static NSString* LCRewriteUserAgent(NSString *ua) {
     if(!ua || ua.length == 0) return ua;
-    if(!LCFeatureEnabled(@"networkHeaders.userAgent")) return ua;
-    if(spoofCustomUserAgent.length > 0) return spoofCustomUserAgent;
+    if(!blockDeviceInfoReads && !LCFeatureEnabled(@"networkHeaders.userAgent")) return ua;
+    if(spoofCustomUserAgent.length > 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        return spoofCustomUserAgent;
+    }
 
     NSMutableString *result = [ua mutableCopy];
     NSRange fullRange = NSMakeRange(0, result.length);
+    BOOL isPadProfile = [LCPreferredWebKitPlatform() isEqualToString:@"iPad"];
 
-    // 1. Replace all hw.machine identifiers (iPhoneXX,X → spoofed)
-    // This is the primary catch-all — works for ANY format
-    if(spoofHardwareModel) {
+    if(spoofHardwareModel.length > 0 && (blockDeviceInfoReads || spoofIdentityCategoryEnabled)) {
         [_uaHwMachineRegex replaceMatchesInString:result
             options:0 range:fullRange
             withTemplate:spoofHardwareModel];
         fullRange = NSMakeRange(0, result.length);
     }
 
-    // 2. Replace iOS version in various formats
-    if(spoofSystemVersion) {
-        // "iOS/XX.X" → "iOS/{spoofed}" (custom app UAs, analytics SDKs, etc.)
+    if(spoofSystemVersion.length > 0 && (blockDeviceInfoReads || spoofSystemCategoryEnabled)) {
         [_uaIOSVersionSlashRegex replaceMatchesInString:result
             options:0 range:fullRange
             withTemplate:[NSString stringWithFormat:@"iOS/%@", spoofSystemVersion]];
         fullRange = NSMakeRange(0, result.length);
 
-        // "CPU iPhone OS 18_0 like Mac OS X" → spoofed (WebKit)
         NSString *underscoreVersion = [spoofSystemVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
-        NSString *cpuReplacement = [NSString stringWithFormat:@"CPU iPhone OS %@ like Mac OS X", underscoreVersion];
+        NSString *cpuReplacement = isPadProfile
+            ? [NSString stringWithFormat:@"CPU OS %@ like Mac OS X", underscoreVersion]
+            : [NSString stringWithFormat:@"CPU iPhone OS %@ like Mac OS X", underscoreVersion];
         [_uaIOSVersionCPURegex replaceMatchesInString:result
             options:0 range:fullRange
             withTemplate:cpuReplacement];
         fullRange = NSMakeRange(0, result.length);
 
-        // "iOS 18.0" → "iOS {spoofed}" (Dart/Flutter, generic)
         [_uaIOSVersionParenRegex replaceMatchesInString:result
             options:0 range:fullRange
             withTemplate:[NSString stringWithFormat:@"iOS %@", spoofSystemVersion]];
+        fullRange = NSMakeRange(0, result.length);
+
+        [_uaDarwinVersionRegex replaceMatchesInString:result
+            options:0 range:fullRange
+            withTemplate:[NSString stringWithFormat:@"Darwin/%@", LCDerivedDarwinRelease()]];
     }
 
+    if (![result isEqualToString:ua]) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+    }
     return result;
 }
 
-// Helper: check if a header name is User-Agent (case-insensitive per HTTP spec)
-static BOOL LCIsUserAgentHeader(NSString *field) {
-    return [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame;
+static BOOL LCIsHeaderField(NSString *field, NSString *target) {
+    return [field caseInsensitiveCompare:target] == NSOrderedSame;
 }
 
-// Helper: rewrite a User-Agent value in a dictionary (for HTTPAdditionalHeaders)
-static NSDictionary* LCRewriteHeaderDict(NSDictionary *headers) {
-    if(!headers) return headers;
-    NSMutableDictionary *result = nil;
-    for(NSString *key in headers) {
-        if(LCIsUserAgentHeader(key)) {
-            NSString *val = headers[key];
+static NSString *LCDefaultSynthesizedCFNetworkUserAgent(void) {
+    if (spoofCustomUserAgent.length > 0) {
+        return spoofCustomUserAgent;
+    }
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *execName = info[@"CFBundleName"] ?: NSProcessInfo.processInfo.processName ?: @"App";
+    NSString *buildVer = info[@"CFBundleVersion"] ?: @"1";
+    return [NSString stringWithFormat:@"%@/%@ CFNetwork/3826.500.131 Darwin/%@",
+            execName, buildVer, LCDerivedDarwinRelease()];
+}
+
+static NSDictionary* LCRewriteHeaderDict(NSDictionary *headers, BOOL injectMissingDefaults) {
+    NSMutableDictionary *result = headers ? [headers mutableCopy] : [NSMutableDictionary dictionary];
+    BOOL modified = NO;
+    BOOL hasUserAgent = NO;
+    BOOL hasAcceptLanguage = NO;
+
+    NSString *acceptLang = (blockDeviceInfoReads || (spoofProfileEnabled && spoofLocaleCategoryEnabled && spoofLocale))
+        ? (blockDeviceInfoReads ? @"en-US,en;q=0.9" : LCPreferredAcceptLanguageHeader())
+        : nil;
+
+    for(NSString *key in [result allKeys]) {
+        if(LCIsHeaderField(key, @"User-Agent")) {
+            hasUserAgent = YES;
+            NSString *val = result[key];
             if([val isKindOfClass:NSString.class]) {
                 NSString *rewritten = LCRewriteUserAgent(val);
                 if(![rewritten isEqualToString:val]) {
-                    if(!result) result = [headers mutableCopy];
                     result[key] = rewritten;
+                    modified = YES;
                 }
             }
+        } else if(LCIsHeaderField(key, @"Accept-Language") && acceptLang.length > 0) {
+            hasAcceptLanguage = YES;
+            result[key] = acceptLang;
+            modified = YES;
         }
     }
-    return result ?: headers;
+
+    if (injectMissingDefaults) {
+        BOOL shouldSetUA = !hasUserAgent &&
+            (spoofCustomUserAgent.length > 0 || blockDeviceInfoReads ||
+             (spoofProfileEnabled && spoofNetworkHeadersCategoryEnabled && LCFeatureEnabled(@"networkHeaders.userAgent")));
+        if (shouldSetUA) {
+            result[@"User-Agent"] = LCDefaultSynthesizedCFNetworkUserAgent();
+            modified = YES;
+            LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        }
+        if (!hasAcceptLanguage && acceptLang.length > 0) {
+            result[@"Accept-Language"] = acceptLang;
+            modified = YES;
+            LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        }
+    }
+
+    return modified ? result : headers;
 }
 
 // --- NSMutableURLRequest hooks ---
-// These intercept User-Agent being set on ANY outgoing HTTP request.
-// Covers: NSURLSession (native iOS, React Native, Expo),
-//         CFNetwork (Flutter dart:io), Firebase, PostHog, Adjust, AppsFlyer, etc.
+// These intercept User-Agent and Accept-Language being set on outgoing HTTP requests.
 
 @interface NSMutableURLRequest(LCDeviceSpoof)
 @end
@@ -826,32 +1262,42 @@ static NSDictionary* LCRewriteHeaderDict(NSDictionary *headers) {
 @implementation NSMutableURLRequest(LCDeviceSpoof)
 
 - (void)hook_setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
-    if(value && LCIsUserAgentHeader(field)) {
+    if(value && LCIsHeaderField(field, @"User-Agent")) {
         value = LCRewriteUserAgent(value);
+    } else if(LCIsHeaderField(field, @"Accept-Language") &&
+              (blockDeviceInfoReads || (spoofProfileEnabled && spoofLocaleCategoryEnabled && spoofLocale))) {
+        NSString *spoofLang = blockDeviceInfoReads ? @"en-US,en;q=0.9" : LCPreferredAcceptLanguageHeader();
+        if (spoofLang.length > 0) {
+            value = spoofLang;
+            LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        }
     }
     [self hook_setValue:value forHTTPHeaderField:field];
 }
 
 - (void)hook_addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
-    if(value && LCIsUserAgentHeader(field)) {
+    if(value && LCIsHeaderField(field, @"User-Agent")) {
         value = LCRewriteUserAgent(value);
+    } else if(LCIsHeaderField(field, @"Accept-Language") &&
+              (blockDeviceInfoReads || (spoofProfileEnabled && spoofLocaleCategoryEnabled && spoofLocale))) {
+        NSString *spoofLang = blockDeviceInfoReads ? @"en-US,en;q=0.9" : LCPreferredAcceptLanguageHeader();
+        if (spoofLang.length > 0) {
+            value = spoofLang;
+            LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        }
     }
     [self hook_addValue:value forHTTPHeaderField:field];
 }
 
 - (void)hook_setAllHTTPHeaderFields:(NSDictionary *)headerFields {
-    [self hook_setAllHTTPHeaderFields:LCRewriteHeaderDict(headerFields)];
+    [self hook_setAllHTTPHeaderFields:LCRewriteHeaderDict(headerFields, NO)];
 }
 
 @end
 
 // --- NSURLSessionConfiguration hooks ---
-// Catches apps that set User-Agent at the session level via HTTPAdditionalHeaders.
-// This is the recommended Apple API for setting global headers, used by:
-// - React Native (RCTSetCustomNSURLSessionConfigurationProvider)
-// - Firebase SDK
-// - Alamofire (Swift networking library)
-// - Any app following Apple best practices
+// Rewrites HTTPAdditionalHeaders and seeds default/ephemeral session configurations
+// so CFNetwork does not fall back to real host Darwin version or Accept-Language headers.
 
 @interface NSURLSessionConfiguration(LCDeviceSpoof)
 @end
@@ -859,7 +1305,25 @@ static NSDictionary* LCRewriteHeaderDict(NSDictionary *headers) {
 @implementation NSURLSessionConfiguration(LCDeviceSpoof)
 
 - (void)hook_setHTTPAdditionalHeaders:(NSDictionary *)headers {
-    [self hook_setHTTPAdditionalHeaders:LCRewriteHeaderDict(headers)];
+    [self hook_setHTTPAdditionalHeaders:LCRewriteHeaderDict(headers, YES)];
+}
+
++ (NSURLSessionConfiguration *)hook_defaultSessionConfiguration {
+    NSURLSessionConfiguration *config = [self hook_defaultSessionConfiguration];
+    NSDictionary *updated = LCRewriteHeaderDict(config.HTTPAdditionalHeaders, YES);
+    if (updated && updated != config.HTTPAdditionalHeaders) {
+        [config hook_setHTTPAdditionalHeaders:updated];
+    }
+    return config;
+}
+
++ (NSURLSessionConfiguration *)hook_ephemeralSessionConfiguration {
+    NSURLSessionConfiguration *config = [self hook_ephemeralSessionConfiguration];
+    NSDictionary *updated = LCRewriteHeaderDict(config.HTTPAdditionalHeaders, YES);
+    if (updated && updated != config.HTTPAdditionalHeaders) {
+        [config hook_setHTTPAdditionalHeaders:updated];
+    }
+    return config;
 }
 
 @end
@@ -886,73 +1350,80 @@ static NSArray<NSNumber *> *LCParseRotationOSMajorVersions(id value) {
     return versions.count > 0 ? versions.array : @[@18, @26, @27];
 }
 
-static void LCApplyRotatingDeviceTemplateMetrics(void) {
-    if(!rotateUsesRealDeviceTemplates || spoofHardwareModel.length == 0) return;
-    BOOL isPad = [spoofHardwareModel hasPrefix:@"iPad"];
-    BOOL isLarge = [spoofHardwareModel hasSuffix:@",2"] || [spoofHardwareModel hasSuffix:@",4"] || [spoofHardwareModel hasSuffix:@",5"] ||
-        [spoofHardwareModel hasSuffix:@",10"];
-    BOOL isPro = [spoofHardwareModel hasPrefix:@"iPhone18,1"] || [spoofHardwareModel hasPrefix:@"iPhone18,2"] ||
-        [spoofHardwareModel hasPrefix:@"iPhone17,1"] || [spoofHardwareModel hasPrefix:@"iPhone17,2"] ||
-        [spoofHardwareModel hasPrefix:@"iPhone16,1"] || [spoofHardwareModel hasPrefix:@"iPhone16,2"];
-    if(isPad) {
-        spoofScreenWidth = isLarge ? 2064 : 1668;
-        spoofScreenHeight = isLarge ? 2752 : 2420;
-        spoofScreenScale = 2;
-        spoofScreenNativeScale = 2;
-        spoofMaximumFramesPerSecond = [spoofHardwareModel hasPrefix:@"iPad16"] ? 120 : 60;
-        spoofProcessorCount = [spoofHardwareModel hasPrefix:@"iPad16"] ? 10 : 8;
-        spoofPhysicalMemory = 8ULL * 1024ULL * 1024ULL * 1024ULL;
-        spoofHorizontalSizeClass = UIUserInterfaceSizeClassRegular;
-        spoofVerticalSizeClass = UIUserInterfaceSizeClassRegular;
-        spoofSafeAreaInsets = UIEdgeInsetsMake(24, 0, 20, 0);
-    } else {
-        spoofScreenWidth = isLarge ? 1290 : (isPro ? 1206 : 1179);
-        spoofScreenHeight = isLarge ? 2796 : (isPro ? 2622 : 2556);
-        spoofScreenScale = 3;
-        spoofScreenNativeScale = 3;
-        spoofMaximumFramesPerSecond = isPro ? 120 : 60;
-        spoofProcessorCount = 6;
-        spoofPhysicalMemory = 8ULL * 1024ULL * 1024ULL * 1024ULL;
-        spoofHorizontalSizeClass = UIUserInterfaceSizeClassCompact;
-        spoofVerticalSizeClass = UIUserInterfaceSizeClassRegular;
-        spoofSafeAreaInsets = UIEdgeInsetsMake(59, 0, 34, 0);
-    }
+static void LCApplyHardwareSpecToGlobals(const LCDeviceHardwareSpec *spec) {
+    if (!spec) return;
+    spoofDeviceVariantId = @(spec->variantId);
+    spoofHardwareModel = @(spec->hwMachine);
+    spoofBoardModel = @(spec->hwModel);
+    spoofDeviceModel = @(spec->deviceModel);
+    spoofProcessorCount = spec->cpuCores;
+    spoofPhysicalMemory = (unsigned long long)spec->physicalMemoryGB * 1024ULL * 1024ULL * 1024ULL;
+    spoofGPUName = @(spec->gpuName);
+    spoofGPUWorkingSetSize = (unsigned long long)spec->gpuWorkingSetGB * 1024ULL * 1024ULL * 1024ULL;
+    spoofGraphicsSupportsRayTracing = spec->supportsRayTracing;
+    spoofGraphicsSupportsAllFamilies = NO;
+    spoofWebGLVendor = @"Apple Inc.";
+    spoofWebGLRenderer = @"Apple GPU";
+    spoofScreenWidth = spec->pixelWidth;
+    spoofScreenHeight = spec->pixelHeight;
+    spoofScreenPointWidth = spec->pointWidth;
+    spoofScreenPointHeight = spec->pointHeight;
+    spoofScreenScale = spec->scale;
+    spoofScreenNativeScale = spec->nativeScale;
+    spoofMaximumFramesPerSecond = spec->maxFPS;
+    spoofHorizontalSizeClass = spec->horizontalSizeClass;
+    spoofVerticalSizeClass = spec->verticalSizeClass;
+    spoofSafeAreaInsets = UIEdgeInsetsMake(spec->safeAreaTop, 0, spec->safeAreaBottom, 0);
 }
 
 static void LCRotateSpoofProfile(void) {
+    const LCDeviceHardwareSpec *selectedSpec = NULL;
     if(spoofIdentityCategoryEnabled) {
         idForVendorUUID = NSUUID.UUID;
         if(rotateUsesRealDeviceTemplates) {
             BOOL usePad = [spoofDeviceModel.lowercaseString containsString:@"ipad"] ||
                 [spoofHardwareModel hasPrefix:@"iPad"];
-            NSArray<NSString *> *models = usePad
-                ? @[@"iPad16,3", @"iPad16,5", @"iPad14,8", @"iPad14,10"]
-                : @[@"iPhone18,1", @"iPhone18,2", @"iPhone18,3", @"iPhone18,4",
-                    @"iPhone17,1", @"iPhone17,2", @"iPhone17,3", @"iPhone17,4",
-                    @"iPhone16,1", @"iPhone16,2", @"iPhone15,4", @"iPhone15,5"];
-            spoofDeviceModel = usePad ? @"iPad" : @"iPhone";
-            spoofHardwareModel = LCRandomArrayValue(models);
-            LCApplyRotatingDeviceTemplateMetrics();
+            NSMutableArray<NSNumber *> *matchingIndices = [NSMutableArray array];
+            size_t totalSpecs = LCDeviceHardwareSpecCount();
+            for (size_t i = 0; i < totalSpecs; i++) {
+                const LCDeviceHardwareSpec *candidate = LCDeviceHardwareSpecAt(i);
+                if (!candidate) continue;
+                BOOL candidateIsPad = (candidate->userInterfaceIdiom == UIUserInterfaceIdiomPad);
+                if (candidateIsPad == usePad) {
+                    [matchingIndices addObject:@(i)];
+                }
+            }
+            if (matchingIndices.count > 0) {
+                NSUInteger idx = [LCRandomArrayValue(matchingIndices) unsignedIntegerValue];
+                selectedSpec = LCDeviceHardwareSpecAt(idx);
+                if (selectedSpec) {
+                    LCApplyHardwareSpecToGlobals(selectedSpec);
+                }
+            }
         }
     }
 
     if(spoofSystemCategoryEnabled) {
-        if(spoofSystemVersion.length > 0) {
-            NSInteger major = [LCRandomArrayValue(rotateOSMajorVersions ?: @[@18, @26, @27]) integerValue];
-            NSInteger minor = arc4random_uniform(8);
-            NSInteger patch = arc4random_uniform(4);
+        if(spoofSystemVersion.length > 0 || rotateUsesRealDeviceTemplates) {
+            NSInteger requestedMajor = [LCRandomArrayValue(rotateOSMajorVersions ?: @[@18, @26, @27]) integerValue];
+            if (selectedSpec && requestedMajor < selectedSpec->minOSMajor) {
+                requestedMajor = selectedSpec->minOSMajor;
+            }
+            NSInteger minor = arc4random_uniform(4);
+            NSInteger patch = arc4random_uniform(3);
             spoofSystemVersion = patch == 0
-                ? [NSString stringWithFormat:@"%ld.%ld", (long)major, (long)minor]
-                : [NSString stringWithFormat:@"%ld.%ld.%ld", (long)major, (long)minor, (long)patch];
+                ? [NSString stringWithFormat:@"%ld.%ld", (long)requestedMajor, (long)minor]
+                : [NSString stringWithFormat:@"%ld.%ld.%ld", (long)requestedMajor, (long)minor, (long)patch];
             spoofOperatingSystemVersionValid = LCParseSystemVersion(spoofSystemVersion, &spoofOperatingSystemVersion);
-            if(rotateUsesRealDeviceTemplates && spoofKernelVersion.length > 0) {
-                NSInteger darwinMajor = major >= 26 ? major - 1 : major + 6;
-                spoofKernelVersion = [NSString stringWithFormat:@"Darwin Kernel Version %ld.0.0", (long)darwinMajor];
+            if(rotateUsesRealDeviceTemplates) {
+                spoofKernelVersion = [NSString stringWithFormat:@"Darwin Kernel Version %@", LCDerivedDarwinRelease()];
             }
         }
         if(spoofBootTime > 0) spoofBootTime = time(NULL) - (time_t)(3600 + arc4random_uniform(1209600));
-        if(spoofProcessorCount > 0) spoofProcessorCount = 2 + arc4random_uniform(11);
-        if(spoofPhysicalMemory > 0) spoofPhysicalMemory = (2 + arc4random_uniform(15)) * 1024ULL * 1024ULL * 1024ULL;
+        if(!rotateUsesRealDeviceTemplates) {
+            if(spoofProcessorCount > 0) spoofProcessorCount = 2 + arc4random_uniform(11);
+            if(spoofPhysicalMemory > 0) spoofPhysicalMemory = (2 + arc4random_uniform(15)) * 1024ULL * 1024ULL * 1024ULL;
+        }
     }
 
     if(spoofDisplayCategoryEnabled) {
@@ -1047,9 +1518,46 @@ static void LCRotateSpoofProfile(void) {
 
 BOOL launchURLProcessed = NO;
 
+static CFAbsoluteTime LCProcessStartWallTime(void) {
+    static CFAbsoluteTime wallTimeAtLaunch = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSTimeInterval currentUptime = NSProcessInfo.processInfo.systemUptime;
+        wallTimeAtLaunch = (CFAbsoluteTime)time(NULL) - currentUptime;
+    });
+    return wallTimeAtLaunch;
+}
+
 __attribute__((constructor))
-static void UIKitGuestHooksInit() {
+static void UIKitGuestHooksInit(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
     if(!NSUserDefaults.lcGuestAppId) return;
+
+    struct utsname rawUts;
+    int (*real_uname)(struct utsname *) = (int (*)(struct utsname *))dlsym(RTLD_NEXT, "uname");
+    if ((real_uname ? real_uname(&rawUts) : uname(&rawUts)) == 0) {
+        sRealHostMachine = @(rawUts.machine);
+    }
+
+    const char *homeEnv = getenv("HOME");
+    NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
+    if (homePath.length > 0 && !NSUserDefaults.isSideStore) {
+        sTelemetryFilePath = [homePath stringByAppendingPathComponent:@".lc_profile_telemetry.plist"];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                        object:nil
+                                                         queue:nil
+                                                    usingBlock:^(NSNotification * _Nonnull note) {
+            LCFlushProfileTelemetryToDisk(YES);
+        }];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillTerminateNotification
+                                                        object:nil
+                                                         queue:nil
+                                                    usingBlock:^(NSNotification * _Nonnull note) {
+            LCFlushProfileTelemetryToDisk(YES);
+        }];
+    }
+
     swizzle(UIApplication.class, @selector(_applicationOpenURLAction:payload:origin:), @selector(hook__applicationOpenURLAction:payload:origin:));
     swizzle(UIApplication.class, @selector(_connectUISceneFromFBSScene:transitionContext:), @selector(hook__connectUISceneFromFBSScene:transitionContext:));
     swizzle(UIApplication.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
@@ -1113,7 +1621,7 @@ static void UIKitGuestHooksInit() {
     spoofGraphicsCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofGraphicsCategoryEnabled", YES);
     spoofWebViewCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofWebViewCategoryEnabled", YES);
     spoofAppPrivacyCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofAppPrivacyCategoryEnabled", YES);
-    spoofSensorsAndUserDataCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofSensorsAndUserDataCategoryEnabled", YES);
+    spoofSensorsAndUserDataCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofSensorsAndUserDataCategoryEnabled", NO);
     if(shouldEnableSpoofProfile && spoofAppPrivacyCategoryEnabled && LCFeatureEnabled(@"app.pasteboard") && !strictTestMode) {
         strictPrivatePasteboard = [UIPasteboard pasteboardWithUniqueName];
         LCSwizzleClassIfPresent(UIPasteboard.class, @selector(generalPasteboard), @selector(hook_generalPasteboard));
@@ -1126,15 +1634,22 @@ static void UIKitGuestHooksInit() {
     if(shouldSpoofIdentifierForVendor) {
         NSString* idForVendorStr = guestContainerInfo[@"spoofedIdentifierForVendor"];
         if([idForVendorStr isKindOfClass:NSString.class]) {
-            idForVendorUUID = [[NSUUID UUID] initWithUUIDString:idForVendorStr];
+            idForVendorUUID = [[NSUUID alloc] initWithUUIDString:idForVendorStr];
         }
     }
     if(blockDeviceInfoReads || (shouldSpoofIdentifierForVendor && (idForVendorUUID != nil || rotateSpoofProfileOnLaunch))) {
         swizzle(UIDevice.class, @selector(identifierForVendor), @selector(hook_identifierForVendor));
+        Class workspaceClass = objc_lookUpClass("LSApplicationWorkspace");
+        LCSwizzleIfPresentWithSourceClass(workspaceClass, LCLSApplicationWorkspaceHookProvider.class,
+            @selector(deviceIdentifierForVendor), @selector(hook_deviceIdentifierForVendor));
     }
 
     if(shouldEnableSpoofProfile) {
         spoofProfileEnabled = YES;
+        NSString *deviceVariantId = guestContainerInfo[@"spoofDeviceVariantId"];
+        if([deviceVariantId isKindOfClass:NSString.class] && deviceVariantId.length > 0) {
+            spoofDeviceVariantId = deviceVariantId;
+        }
         NSString *deviceName = guestContainerInfo[@"spoofDeviceName"];
         NSString *deviceModel = guestContainerInfo[@"spoofDeviceModel"];
         NSString *systemName = guestContainerInfo[@"spoofSystemName"];
@@ -1223,9 +1738,6 @@ static void UIKitGuestHooksInit() {
             NSTimeZone *candidateTimeZone = [NSTimeZone timeZoneWithName:timeZoneIdentifier];
             if(candidateTimeZone) {
                 spoofTimeZone = candidateTimeZone;
-                if(!blockDeviceInfoReads && spoofLocaleCategoryEnabled) {
-                    [NSTimeZone setDefaultTimeZone:candidateTimeZone];
-                }
             }
         }
         if([batteryLevelNumber isKindOfClass:NSNumber.class]) {
@@ -1343,6 +1855,30 @@ static void UIKitGuestHooksInit() {
         if([webCanvasDataURL isKindOfClass:NSString.class]) spoofWebCanvasDataURL = webCanvasDataURL;
         if([webColorDepth isKindOfClass:NSNumber.class] && webColorDepth.integerValue > 0) spoofWebColorDepth = webColorDepth.integerValue;
 
+        const LCDeviceHardwareSpec *matchedSpec = spoofDeviceVariantId.length > 0
+            ? LCDeviceHardwareSpecFindByVariant(spoofDeviceVariantId.UTF8String)
+            : LCDeviceHardwareSpecFindByMachine(spoofHardwareModel.UTF8String);
+        if(matchedSpec) {
+            spoofScreenPointWidth = matchedSpec->pointWidth;
+            spoofScreenPointHeight = matchedSpec->pointHeight;
+        } else if(spoofScreenWidth > 0 && spoofScreenHeight > 0) {
+            CGFloat divisor = spoofScreenScale > 0 ? spoofScreenScale : 3.0;
+            spoofScreenPointWidth = round(spoofScreenWidth / divisor);
+            spoofScreenPointHeight = round(spoofScreenHeight / divisor);
+        }
+    }
+
+    if(shouldEnableSpoofProfile && rotateSpoofProfileOnLaunch) {
+        LCRotateSpoofProfile();
+    }
+
+    if(shouldEnableSpoofProfile && spoofLocaleCategoryEnabled && spoofTimeZone && !blockDeviceInfoReads) {
+        [NSTimeZone setDefaultTimeZone:spoofTimeZone];
+        setenv("TZ", spoofTimeZone.name.UTF8String, 1);
+        tzset();
+    } else if(blockDeviceInfoReads) {
+        setenv("TZ", "GMT", 1);
+        tzset();
     }
 
     if(shouldEnableSpoofProfile && spoofAccessibilityCategoryEnabled) {
@@ -1379,16 +1915,18 @@ static void UIKitGuestHooksInit() {
     }
     if(shouldEnableSpoofProfile && spoofWebViewCategoryEnabled) {
         LCSwizzleIfPresent(WKWebView.class, @selector(initWithFrame:configuration:), @selector(hook_initWithFrame:configuration:));
+        LCSwizzleIfPresent(WKWebView.class, @selector(setCustomUserAgent:), @selector(hook_setCustomUserAgent:));
     }
 
-    if(shouldEnableSpoofProfile && rotateSpoofProfileOnLaunch) {
-        LCRotateSpoofProfile();
-    }
     if(blockDeviceInfoReads) {
-        spoofHardwareModel = @"iPhone";
-        spoofHostName = @"localhost";
-        spoofBoardModel = @"Unknown";
-        spoofKernelVersion = @"Unknown";
+        spoofHardwareModel = @"iPhone17,3";
+        spoofHostName = @"iphone.local";
+        spoofBoardModel = @"D47AP";
+        spoofKernelVersion = @"Darwin Kernel Version 26.2.0";
+        if(spoofSystemVersion.length == 0) {
+            spoofSystemVersion = @"27.2";
+            spoofOperatingSystemVersionValid = LCParseSystemVersion(spoofSystemVersion, &spoofOperatingSystemVersion);
+        }
     }
 
     if(blockDeviceInfoReads ||
@@ -1397,6 +1935,7 @@ static void UIKitGuestHooksInit() {
         swizzle(UIDevice.class, @selector(name), @selector(hook_name));
         swizzle(UIDevice.class, @selector(model), @selector(hook_model));
         swizzle(UIDevice.class, @selector(localizedModel), @selector(hook_localizedModel));
+        swizzle(UIDevice.class, @selector(userInterfaceIdiom), @selector(hook_userInterfaceIdiom));
         swizzle(UIDevice.class, @selector(systemName), @selector(hook_systemName));
         swizzle(UIDevice.class, @selector(systemVersion), @selector(hook_systemVersion));
     }
@@ -1411,6 +1950,13 @@ static void UIKitGuestHooksInit() {
         swizzle(NSProcessInfo.class, @selector(operatingSystemVersionString), @selector(hook_operatingSystemVersionString));
         swizzle(NSProcessInfo.class, @selector(isOperatingSystemAtLeastVersion:), @selector(hook_isOperatingSystemAtLeastVersion:));
     }
+    if(LCHostNameSpoofActive()) {
+        LCSwizzleIfPresent(NSProcessInfo.class, @selector(hostName), @selector(hook_hostName));
+    }
+    if(blockDeviceInfoReads || (spoofSystemCategoryEnabled && spoofBootTime > 0)) {
+        (void)LCProcessStartWallTime();
+        LCSwizzleIfPresent(NSProcessInfo.class, @selector(systemUptime), @selector(hook_systemUptime));
+    }
     if(blockDeviceInfoReads || (spoofBatteryCategoryEnabled && spoofLowPowerModeEnabledSet)) {
         swizzle(NSProcessInfo.class, @selector(isLowPowerModeEnabled), @selector(hook_isLowPowerModeEnabled));
     }
@@ -1420,13 +1966,14 @@ static void UIKitGuestHooksInit() {
         swizzle(NSProcessInfo.class, @selector(activeProcessorCount), @selector(hook_activeProcessorCount));
         swizzle(NSProcessInfo.class, @selector(physicalMemory), @selector(hook_physicalMemory));
     }
-    if(blockDeviceInfoReads || (spoofBatteryCategoryEnabled && spoofThermalState >= 0)) {
+    if(blockDeviceInfoReads || ((spoofBatteryCategoryEnabled || spoofSystemCategoryEnabled) && spoofThermalState >= 0)) {
         swizzle(NSProcessInfo.class, @selector(thermalState), @selector(hook_thermalState));
     }
     if(blockDeviceInfoReads || (spoofDisplayCategoryEnabled &&
        (spoofScreenWidth > 0 || spoofScreenHeight > 0 || spoofScreenScale > 0 ||
         spoofScreenNativeScale > 0 || spoofMaximumFramesPerSecond > 0 || spoofScreenBrightness >= 0))) {
         swizzle(UIScreen.class, @selector(nativeBounds), @selector(hook_nativeBounds));
+        swizzle(UIScreen.class, @selector(bounds), @selector(hook_bounds));
         swizzle(UIScreen.class, @selector(scale), @selector(hook_scale));
         swizzle(UIScreen.class, @selector(nativeScale), @selector(hook_nativeScale));
         swizzle(UIScreen.class, @selector(maximumFramesPerSecond), @selector(hook_maximumFramesPerSecond));
@@ -1435,8 +1982,11 @@ static void UIKitGuestHooksInit() {
         LCSwizzleIfPresent(UITraitCollection.class, @selector(horizontalSizeClass), @selector(hook_horizontalSizeClass));
         LCSwizzleIfPresent(UITraitCollection.class, @selector(verticalSizeClass), @selector(hook_verticalSizeClass));
         LCSwizzleIfPresent(UITraitCollection.class, @selector(preferredContentSizeCategory), @selector(hook_preferredContentSizeCategory));
-        LCSwizzleIfPresent(UITraitCollection.class, @selector(userInterfaceStyle), @selector(hook_userInterfaceStyle));
         LCSwizzleIfPresent(UIWindow.class, @selector(safeAreaInsets), @selector(hook_safeAreaInsets));
+        if(!blockDeviceInfoReads && spoofUserInterfaceStyle != UIUserInterfaceStyleUnspecified) {
+            LCSwizzleIfPresent(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_spoof_makeKeyAndVisible));
+            LCSwizzleIfPresent(UIWindow.class, @selector(setHidden:), @selector(hook_spoof_setHidden:));
+        }
     }
     if(blockDeviceInfoReads || (spoofLocaleCategoryEnabled && spoofLocale)) {
         LCSwizzleClassIfPresent(NSLocale.class, @selector(currentLocale), @selector(hook_currentLocale));
@@ -1455,6 +2005,7 @@ static void UIKitGuestHooksInit() {
     if(blockDeviceInfoReads || (spoofTelephonyCategoryEnabled && spoofRadioAccessTechnology)) {
         Class telephonyClass = NSClassFromString(@"CTTelephonyNetworkInfo");
         LCSwizzleIfPresentWithSourceClass(telephonyClass, LCTelephonyNetworkInfoHookProvider.class, @selector(serviceCurrentRadioAccessTechnology), @selector(hook_serviceCurrentRadioAccessTechnology));
+        LCSwizzleIfPresentWithSourceClass(telephonyClass, LCTelephonyNetworkInfoHookProvider.class, @selector(dataServiceIdentifier), @selector(hook_dataServiceIdentifier));
     }
     if(blockDeviceInfoReads || (spoofTelephonyCategoryEnabled &&
        (spoofSubscriberIdentifier || spoofSubscriberCarrierToken || spoofSubscriberSIMInsertedEnabled))) {
@@ -1467,11 +2018,9 @@ static void UIKitGuestHooksInit() {
         LCSwizzleClassIfPresentWithSourceClass(subscriberInfoClass, LCSubscriberInfoHookProvider.class, @selector(subscribers), @selector(hook_subscribers));
     }
 
-    // HTTP header device identity rewriting
-    // Hook NSMutableURLRequest to rewrite User-Agent in ALL outgoing HTTP requests.
-    // This catches native iOS, Flutter, React Native, Expo, Firebase, PostHog,
-    // Adjust, AppsFlyer, and any analytics SDK — they all go through NSMutableURLRequest.
-    if((blockDeviceInfoReads || spoofNetworkHeadersCategoryEnabled) && (spoofHardwareModel || spoofSystemVersion)) {
+    // HTTP header device identity and locale rewriting across NSMutableURLRequest & NSURLSessionConfiguration.
+    if(blockDeviceInfoReads || (shouldEnableSpoofProfile &&
+       (spoofNetworkHeadersCategoryEnabled || (spoofLocaleCategoryEnabled && spoofLocale != nil) || spoofCustomUserAgent.length > 0))) {
         LCInitUserAgentRegexes();
         swizzle(NSMutableURLRequest.class,
             @selector(setValue:forHTTPHeaderField:),
@@ -1485,7 +2034,18 @@ static void UIKitGuestHooksInit() {
         swizzle(NSURLSessionConfiguration.class,
             @selector(setHTTPAdditionalHeaders:),
             @selector(hook_setHTTPAdditionalHeaders:));
+        LCSwizzleClassIfPresent(NSURLSessionConfiguration.class,
+            @selector(defaultSessionConfiguration),
+            @selector(hook_defaultSessionConfiguration));
+        LCSwizzleClassIfPresent(NSURLSessionConfiguration.class,
+            @selector(ephemeralSessionConfiguration),
+            @selector(hook_ephemeralSessionConfiguration));
     }
+
+    if (shouldEnableSpoofProfile || blockDeviceInfoReads) {
+        LCFlushProfileTelemetryToDisk(YES);
+    }
+    });
 }
 
 NSString* findDefaultContainerWithBundleId(NSString* bundleId) {
@@ -1496,7 +2056,8 @@ NSString* findDefaultContainerWithBundleId(NSString* bundleId) {
     NSString* bundleInfoPath = [NSString stringWithFormat:@"%@/Applications/%@/LCAppInfo.plist", appGroupFolder, bundleId];
     NSDictionary* infoDict = [NSDictionary dictionaryWithContentsOfFile:bundleInfoPath];
     if(!infoDict) {
-        NSString* lcDocFolder = [[NSString stringWithUTF8String:getenv("LC_HOME_PATH")] stringByAppendingPathComponent:@"Documents"];
+        NSString* lcHome = [NSClassFromString(@"LCSharedUtils") cachedLcHomePath] ?: NSHomeDirectory();
+        NSString* lcDocFolder = [lcHome stringByAppendingPathComponent:@"Documents"];
 
         bundleInfoPath = [NSString stringWithFormat:@"%@/Applications/%@/LCAppInfo.plist", lcDocFolder, bundleId];
         infoDict = [NSDictionary dictionaryWithContentsOfFile:bundleInfoPath];
@@ -1510,7 +2071,10 @@ void forEachInstalledNotCurrentLC(BOOL isFree, void (^block)(NSString* scheme, B
         if([scheme isEqualToString:NSUserDefaults.lcAppUrlScheme]) {
             continue;
         }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         BOOL isInstalled = [UIApplication.sharedApplication canOpenURL:[NSURL URLWithString: [NSString stringWithFormat: @"%@://", scheme]]];
+#pragma clang diagnostic pop
         if(!isInstalled) {
             continue;
         }
@@ -1550,7 +2114,7 @@ void LCShowSwitchAppConfirmation(NSURL *url, NSString* bundleId, bool isSharedAp
     }
 
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:bundleId];
-    UIWindow *window = [[UIWindow alloc] initWithFrame:LCActiveScreenBounds()];
+    UIWindow *window = LCCreateOverlayAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSUserDefaults.lcUserDefaults setBool:NO forKey:@"LCOpenSideStore"];
@@ -1574,27 +2138,17 @@ void LCShowSwitchAppConfirmation(NSURL *url, NSString* bundleId, bool isSharedAp
         window.windowScene = nil;
     }];
     [alert addAction:cancelAction];
-    window.rootViewController = [UIViewController new];
-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
-    [window makeKeyAndVisible];
-    [window.rootViewController presentViewController:alert animated:YES completion:nil];
-    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    LCPresentAlertInOverlayWindow(window, alert);
 }
 
 void LCShowAlert(NSString* message) {
-    UIWindow *window = [[UIWindow alloc] initWithFrame:LCActiveScreenBounds()];
+    UIWindow *window = LCCreateOverlayAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         window.windowScene = nil;
     }];
     [alert addAction:okAction];
-    window.rootViewController = [UIViewController new];
-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
-    [window makeKeyAndVisible];
-    [window.rootViewController presentViewController:alert animated:YES completion:nil];
-    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    LCPresentAlertInOverlayWindow(window, alert);
 }
 
 void LCShowAppNotFoundAlert(NSString* bundleId) {
@@ -1651,7 +2205,7 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
     }
 
     NSString *message = @"lc.guestTweak.openWebPageTip".loc;
-    UIWindow *window = [[UIWindow alloc] initWithFrame:LCActiveScreenBounds()];
+    UIWindow *window = LCCreateOverlayAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSClassFromString(@"LCSharedUtils") setWebPageUrlForNextLaunch:webPageUrlString];
@@ -1677,12 +2231,7 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
         window.windowScene = nil;
     }];
     [alert addAction:cancelAction];
-    window.rootViewController = [UIViewController new];
-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
-    [window makeKeyAndVisible];
-    [window.rootViewController presentViewController:alert animated:YES completion:nil];
-    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    LCPresentAlertInOverlayWindow(window, alert);
 
 
 }
@@ -1692,9 +2241,10 @@ void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
         [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
         [NSUserDefaults.lcUserDefaults setObject:@"builtinSideStore" forKey:@"selected"];
         [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
+        return;
     }
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:@"SideStore"];
-    UIWindow *window = [[UIWindow alloc] initWithFrame:LCActiveScreenBounds()];
+    UIWindow *window = LCCreateOverlayAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
@@ -1707,12 +2257,7 @@ void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
         window.windowScene = nil;
     }];
     [alert addAction:cancelAction];
-    window.rootViewController = [UIViewController new];
-    window.windowLevel = UIApplication.sharedApplication.windows.lastObject.windowLevel + 1;
-    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
-    [window makeKeyAndVisible];
-    [window.rootViewController presentViewController:alert animated:YES completion:nil];
-    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    LCPresentAlertInOverlayWindow(window, alert);
 
 }
 
@@ -1907,7 +2452,8 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
             return LCControlAppURLHandlingStop;
         }
 
-        NSString* containerId = [NSString stringWithUTF8String:getenv("HOME")].lastPathComponent;
+        const char *homeEnv = getenv("HOME");
+        NSString* containerId = (homeEnv ? [NSString stringWithUTF8String:homeEnv] : NSHomeDirectory()).lastPathComponent;
         if(!containerFolderName) {
             containerFolderName = findDefaultContainerWithBundleId(bundleName);
         }
@@ -1966,6 +2512,8 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 
 // Handler for AppDelegate
 @implementation UIApplication(LiveContainerHook)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 - (void)hook__applicationOpenURLAction:(id)action payload:(NSDictionary *)payload origin:(id)origin {
     NSURL *url = [NSURL URLWithString:payload[UIApplicationLaunchOptionsURLKey]];
     NSString* replacementURLString = nil;
@@ -2014,6 +2562,7 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
         NSMutableDictionary* newDict = [context.payload mutableCopy];
         if(!newDict) newDict = [NSMutableDictionary new];
         newDict[UIApplicationLaunchOptionsURLKey] = decodedUrlStr;
+#pragma clang diagnostic pop
         context.payload = newDict;
 
 
@@ -2289,19 +2838,47 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 @end
 
+static const char kLCWebUserContentConfiguredKey = 0;
+
 @implementation WKWebView(LCFingerprintProfile)
 
+- (void)hook_setCustomUserAgent:(NSString *)customUserAgent {
+    NSString *effectiveUA = customUserAgent;
+    if(spoofProfileEnabled && spoofWebViewCategoryEnabled && LCFeatureEnabled(@"web.navigator")) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorWebKit);
+        if(spoofCustomUserAgent.length > 0) {
+            effectiveUA = spoofCustomUserAgent;
+        } else if(effectiveUA.length > 0) {
+            effectiveUA = LCRewriteUserAgent(effectiveUA);
+        } else {
+            effectiveUA = LCBuildWebKitUserAgent();
+        }
+    }
+    [self hook_setCustomUserAgent:effectiveUA];
+}
+
 - (instancetype)hook_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    WKWebViewConfiguration *effectiveConfig = configuration ?: [[WKWebViewConfiguration alloc] init];
     NSString *profileScript = nil;
     if(spoofProfileEnabled && spoofWebViewCategoryEnabled) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorWebKit);
         profileScript = LCWebViewProfileScript();
-        WKUserScript *script = [[WKUserScript alloc] initWithSource:profileScript
-            injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-            forMainFrameOnly:NO];
-        [configuration.userContentController addUserScript:script];
-        if(spoofSystemVersion.length > 0) configuration.applicationNameForUserAgent = @"Mobile/15E148";
+        WKUserContentController *ucc = effectiveConfig.userContentController;
+        if(ucc && !objc_getAssociatedObject(ucc, &kLCWebUserContentConfiguredKey)) {
+            WKUserScript *script = [[WKUserScript alloc] initWithSource:profileScript
+                injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                forMainFrameOnly:NO];
+            [ucc addUserScript:script];
+            objc_setAssociatedObject(ucc, &kLCWebUserContentConfiguredKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if(spoofSystemVersion.length > 0 && effectiveConfig.applicationNameForUserAgent.length == 0) {
+            effectiveConfig.applicationNameForUserAgent = @"Mobile/15E148";
+        }
     }
-    WKWebView *webView = [self hook_initWithFrame:frame configuration:configuration];
+    WKWebView *webView = [self hook_initWithFrame:frame configuration:effectiveConfig];
+    if(spoofProfileEnabled && spoofWebViewCategoryEnabled && LCFeatureEnabled(@"web.navigator")) {
+        [webView hook_setCustomUserAgent:LCBuildWebKitUserAgent()];
+    }
     if(profileScript.length > 0) {
         [webView evaluateJavaScript:profileScript completionHandler:nil];
     }
@@ -2310,13 +2887,31 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 @end
 
+@implementation LCLSApplicationWorkspaceHookProvider
+
+- (id)hook_deviceIdentifierForVendor {
+    if(blockDeviceInfoReads) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCBlockedZeroUUID();
+    }
+    if(spoofIdentityCategoryEnabled && idForVendorUUID) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return idForVendorUUID;
+    }
+    return [self hook_deviceIdentifierForVendor];
+}
+
+@end
+
 @implementation UIDevice(hook)
 
 - (NSUUID*)hook_identifierForVendor {
     if(blockDeviceInfoReads) {
-        return nil;
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCBlockedZeroUUID();
     }
     if(spoofIdentityCategoryEnabled && idForVendorUUID) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
         return idForVendorUUID;
     }
     return [self hook_identifierForVendor];
@@ -2324,9 +2919,11 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSString *)hook_name {
     if(blockDeviceInfoReads) {
-        return @"Unknown";
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return @"iPhone";
     }
     if(spoofProfileEnabled && spoofIdentityCategoryEnabled && spoofDeviceName.length > 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
         return spoofDeviceName;
     }
     return [self hook_name];
@@ -2334,7 +2931,7 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSString *)hook_model {
     if(blockDeviceInfoReads) {
-        return @"Unknown";
+        return @"iPhone";
     }
     if(spoofProfileEnabled && spoofIdentityCategoryEnabled && spoofDeviceModel.length > 0) {
         return spoofDeviceModel;
@@ -2344,7 +2941,7 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSString *)hook_localizedModel {
     if(blockDeviceInfoReads) {
-        return @"Unknown";
+        return @"iPhone";
     }
     if(spoofProfileEnabled && spoofIdentityCategoryEnabled && spoofDeviceModel.length > 0) {
         return spoofDeviceModel;
@@ -2352,9 +2949,22 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
     return [self hook_localizedModel];
 }
 
+- (UIUserInterfaceIdiom)hook_userInterfaceIdiom {
+    if(blockDeviceInfoReads) {
+        return UIUserInterfaceIdiomPhone;
+    }
+    if(spoofProfileEnabled && spoofIdentityCategoryEnabled && spoofDeviceModel.length > 0) {
+        if([spoofDeviceModel rangeOfString:@"ipad" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return UIUserInterfaceIdiomPad;
+        }
+        return UIUserInterfaceIdiomPhone;
+    }
+    return [self hook_userInterfaceIdiom];
+}
+
 - (NSString *)hook_systemName {
     if(blockDeviceInfoReads) {
-        return @"Unknown";
+        return @"iOS";
     }
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofSystemName.length > 0) {
         return spoofSystemName;
@@ -2364,9 +2974,11 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSString *)hook_systemVersion {
     if(blockDeviceInfoReads) {
-        return @"0.0";
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return spoofSystemVersion.length > 0 ? spoofSystemVersion : @"27.2";
     }
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofSystemVersion.length > 0) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
         return spoofSystemVersion;
     }
     return [self hook_systemVersion];
@@ -2408,7 +3020,7 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSOperatingSystemVersion)hook_operatingSystemVersion {
     if(blockDeviceInfoReads) {
-        return (NSOperatingSystemVersion){ .majorVersion = 0, .minorVersion = 0, .patchVersion = 0 };
+        return (NSOperatingSystemVersion){ .majorVersion = 27, .minorVersion = 2, .patchVersion = 0 };
     }
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofOperatingSystemVersionValid) {
         return spoofOperatingSystemVersion;
@@ -2418,7 +3030,7 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (NSString *)hook_operatingSystemVersionString {
     if(blockDeviceInfoReads) {
-        return @"Unknown";
+        return @"iOS 27.2";
     }
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofSystemVersion.length > 0) {
         NSString *name = spoofSystemName.length > 0 ? spoofSystemName : @"iOS";
@@ -2429,12 +3041,32 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 - (BOOL)hook_isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion)version {
     if(blockDeviceInfoReads) {
-        return NO;
+        NSOperatingSystemVersion blockedVersion = { .majorVersion = 27, .minorVersion = 2, .patchVersion = 0 };
+        return LCCompareOSVersion(blockedVersion, version) >= 0;
     }
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofOperatingSystemVersionValid) {
         return LCCompareOSVersion(spoofOperatingSystemVersion, version) >= 0;
     }
     return [self hook_isOperatingSystemAtLeastVersion:version];
+}
+
+- (NSString *)hook_hostName {
+    if(LCHostNameSpoofActive()) {
+        LCRecordProfileInterception(LCProfileTelemetryVectorNetwork);
+        return LCEffectiveSpoofHostName();
+    }
+    return [self hook_hostName];
+}
+
+- (NSTimeInterval)hook_systemUptime {
+    if(blockDeviceInfoReads) {
+        return 3600.0;
+    }
+    if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofBootTime > 0) {
+        NSTimeInterval delta = (NSTimeInterval)((CFAbsoluteTime)time(NULL) - (CFAbsoluteTime)spoofBootTime);
+        return MAX(1.0, delta);
+    }
+    return [self hook_systemUptime];
 }
 
 - (BOOL)hook_isLowPowerModeEnabled {
@@ -2448,26 +3080,27 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 }
 
 - (NSUInteger)hook_processorCount {
-    if(blockDeviceInfoReads) return 1;
+    if(blockDeviceInfoReads) return 6;
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofProcessorCount > 0) return spoofProcessorCount;
     return [self hook_processorCount];
 }
 
 - (NSUInteger)hook_activeProcessorCount {
-    if(blockDeviceInfoReads) return 1;
+    if(blockDeviceInfoReads) return 6;
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofProcessorCount > 0) return spoofProcessorCount;
     return [self hook_activeProcessorCount];
 }
 
 - (unsigned long long)hook_physicalMemory {
-    if(blockDeviceInfoReads) return 0;
+    if(blockDeviceInfoReads) return 8ULL * 1024ULL * 1024ULL * 1024ULL;
     if(spoofProfileEnabled && spoofSystemCategoryEnabled && spoofPhysicalMemory > 0) return spoofPhysicalMemory;
     return [self hook_physicalMemory];
 }
 
 - (NSProcessInfoThermalState)hook_thermalState {
     if(blockDeviceInfoReads) return NSProcessInfoThermalStateNominal;
-    if(spoofProfileEnabled && spoofBatteryCategoryEnabled && spoofThermalState >= NSProcessInfoThermalStateNominal &&
+    if(spoofProfileEnabled && (spoofBatteryCategoryEnabled || spoofSystemCategoryEnabled) &&
+       spoofThermalState >= NSProcessInfoThermalStateNominal &&
        spoofThermalState <= NSProcessInfoThermalStateCritical) {
         return (NSProcessInfoThermalState)spoofThermalState;
     }
@@ -2481,21 +3114,40 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 @implementation UIScreen(LCSystemDisplayProfile)
 
 - (CGRect)hook_nativeBounds {
-    if(blockDeviceInfoReads) return CGRectMake(0, 0, 1, 1);
+    if(blockDeviceInfoReads) return CGRectMake(0, 0, 1170, 2532);
     CGRect bounds = [self hook_nativeBounds];
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenWidth > 0) bounds.size.width = spoofScreenWidth;
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenHeight > 0) bounds.size.height = spoofScreenHeight;
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenWidth > 0 && spoofScreenHeight > 0) {
+        bounds.size.width = spoofScreenWidth;
+        bounds.size.height = spoofScreenHeight;
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+    }
     return bounds;
 }
 
+- (CGRect)hook_bounds {
+    CGRect realBounds = [self hook_bounds];
+    if(blockDeviceInfoReads) {
+        BOOL landscape = realBounds.size.width > realBounds.size.height;
+        return landscape ? CGRectMake(0, 0, 844, 390) : CGRectMake(0, 0, 390, 844);
+    }
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenWidth > 0 && spoofScreenHeight > 0) {
+        CGFloat scaleFactor = spoofScreenScale > 0 ? spoofScreenScale : 3.0;
+        CGFloat ptW = spoofScreenPointWidth > 0 ? spoofScreenPointWidth : round(spoofScreenWidth / scaleFactor);
+        CGFloat ptH = spoofScreenPointHeight > 0 ? spoofScreenPointHeight : round(spoofScreenHeight / scaleFactor);
+        BOOL landscape = realBounds.size.width > realBounds.size.height;
+        return CGRectMake(0, 0, landscape ? MAX(ptW, ptH) : MIN(ptW, ptH), landscape ? MIN(ptW, ptH) : MAX(ptW, ptH));
+    }
+    return realBounds;
+}
+
 - (CGFloat)hook_scale {
-    if(blockDeviceInfoReads) return 1;
+    if(blockDeviceInfoReads) return 3.0;
     if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenScale > 0) return spoofScreenScale;
     return [self hook_scale];
 }
 
 - (CGFloat)hook_nativeScale {
-    if(blockDeviceInfoReads) return 1;
+    if(blockDeviceInfoReads) return 3.0;
     if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofScreenNativeScale > 0) return spoofScreenNativeScale;
     return [self hook_nativeScale];
 }
@@ -2522,13 +3174,21 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 }
 
 - (UIUserInterfaceSizeClass)hook_horizontalSizeClass {
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled) return (UIUserInterfaceSizeClass)spoofHorizontalSizeClass;
-    return [self hook_horizontalSizeClass];
+    UIUserInterfaceSizeClass original = [self hook_horizontalSizeClass];
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && original != UIUserInterfaceSizeClassUnspecified &&
+       spoofHorizontalSizeClass != UIUserInterfaceSizeClassUnspecified) {
+        return (UIUserInterfaceSizeClass)spoofHorizontalSizeClass;
+    }
+    return original;
 }
 
 - (UIUserInterfaceSizeClass)hook_verticalSizeClass {
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled) return (UIUserInterfaceSizeClass)spoofVerticalSizeClass;
-    return [self hook_verticalSizeClass];
+    UIUserInterfaceSizeClass original = [self hook_verticalSizeClass];
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && original != UIUserInterfaceSizeClassUnspecified &&
+       spoofVerticalSizeClass != UIUserInterfaceSizeClassUnspecified) {
+        return (UIUserInterfaceSizeClass)spoofVerticalSizeClass;
+    }
+    return original;
 }
 
 - (UIContentSizeCategory)hook_preferredContentSizeCategory {
@@ -2536,13 +3196,6 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
         return spoofPreferredContentSizeCategory ?: UIContentSizeCategoryLarge;
     }
     return [self hook_preferredContentSizeCategory];
-}
-
-- (UIUserInterfaceStyle)hook_userInterfaceStyle {
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofUserInterfaceStyle != UIUserInterfaceStyleUnspecified) {
-        return (UIUserInterfaceStyle)spoofUserInterfaceStyle;
-    }
-    return [self hook_userInterfaceStyle];
 }
 
 - (UIAccessibilityContrast)hook_accessibilityContrast {
@@ -2554,11 +3207,34 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 @implementation UIWindow(LCFingerprintProfile)
 
-- (UIEdgeInsets)hook_safeAreaInsets {
-    if(spoofProfileEnabled && spoofDisplayCategoryEnabled) {
-        return spoofSafeAreaInsets;
+- (void)hook_spoof_makeKeyAndVisible {
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofUserInterfaceStyle != UIUserInterfaceStyleUnspecified) {
+        self.overrideUserInterfaceStyle = (UIUserInterfaceStyle)spoofUserInterfaceStyle;
     }
-    return [self hook_safeAreaInsets];
+    [self hook_spoof_makeKeyAndVisible];
+}
+
+- (void)hook_spoof_setHidden:(BOOL)hidden {
+    if(!hidden && spoofProfileEnabled && spoofDisplayCategoryEnabled && spoofUserInterfaceStyle != UIUserInterfaceStyleUnspecified) {
+        self.overrideUserInterfaceStyle = (UIUserInterfaceStyle)spoofUserInterfaceStyle;
+    }
+    [self hook_spoof_setHidden:hidden];
+}
+
+- (UIEdgeInsets)hook_safeAreaInsets {
+    UIEdgeInsets original = [self hook_safeAreaInsets];
+    if(spoofProfileEnabled && spoofDisplayCategoryEnabled && self.windowScene) {
+        CGRect screenBounds = self.windowScene.screen ? self.windowScene.screen.bounds : self.bounds;
+        if(fabs(CGRectGetWidth(self.bounds) - CGRectGetWidth(screenBounds)) < 2.0 &&
+           fabs(CGRectGetHeight(self.bounds) - CGRectGetHeight(screenBounds)) < 2.0) {
+            if(self.bounds.size.width > self.bounds.size.height) {
+                return UIEdgeInsetsMake(0, MAX(spoofSafeAreaInsets.top, spoofSafeAreaInsets.left),
+                                        MIN(21.0, spoofSafeAreaInsets.bottom), MAX(spoofSafeAreaInsets.top, spoofSafeAreaInsets.right));
+            }
+            return spoofSafeAreaInsets;
+        }
+    }
+    return original;
 }
 
 @end
@@ -2690,6 +3366,16 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
         };
     }
     return [self hook_serviceCurrentRadioAccessTechnology];
+}
+
+- (id)hook_dataServiceIdentifier {
+    if(blockDeviceInfoReads) {
+        return nil;
+    }
+    if(spoofProfileEnabled && spoofTelephonyCategoryEnabled && spoofRadioAccessTechnology.length > 0) {
+        return @"0000000100000001";
+    }
+    return [self hook_dataServiceIdentifier];
 }
 
 @end

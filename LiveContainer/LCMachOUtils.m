@@ -68,7 +68,7 @@ static void insertDylibCommand(uint32_t cmd, const char *path, struct mach_heade
         dylib = (struct dylib_command *)(sizeof(struct mach_header_64) + (void *)header+header->sizeofcmds);
     }
     dylib->cmd = cmd;
-    dylib->cmdsize = cmdsize;
+    dylib->cmdsize = (uint32_t)cmdsize;
     dylib->dylib.name.offset = sizeof(struct dylib_command);
     dylib->dylib.compatibility_version = 0x10000;
     dylib->dylib.current_version = 0x10000;
@@ -414,10 +414,18 @@ uint64_t LCFindSymbolOffset(const char *basePath, const char *symbol) {
 }
 
 mach_header_u *LCGetLoadedImageHeader(int i0, const char* name) {
+    if(!name) {
+        return NULL;
+    }
+    size_t nameLen = strlen(name);
     for(uint32_t i = i0; i < _dyld_image_count(); ++i) {
         const char* imgName = _dyld_get_image_name(i);
-        // cover simulator path aswell
-        if(imgName && strcmp(imgName + (strlen(imgName) - strlen(name)), name) == 0) {
+        if(!imgName) {
+            continue;
+        }
+        size_t imgLen = strlen(imgName);
+        // cover simulator path as well without unsigned underflow
+        if(imgLen >= nameLen && strcmp(imgName + (imgLen - nameLen), name) == 0) {
             return (struct mach_header_64*)_dyld_get_image_header(i);
         }
     }

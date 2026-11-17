@@ -152,49 +152,47 @@ static BOOL hook_isPermissibleIdentifier(id self, SEL selector, NSString *identi
 __attribute__((constructor))
 static void BackgroundTasksGuestHooksInit(void) {
     if (!NSUserDefaults.lcGuestAppId || ![NSUserDefaults.guestAppInfo[@"fixBackgroundTaskIdentifiers"] boolValue]) return;
-    if (@available(iOS 26.0, *)) {
-        NSString *guestBundleIdentifier = NSUserDefaults.lcGuestAppId;
-        NSBundle *hostBundle = NSUserDefaults.lcMainBundle;
-        if (NSUserDefaults.isLiveProcess) {
-            // dasd uses the root application's identity, not LiveProcess.appex's ID.
-            hostBundle = [NSBundle bundleWithPath:hostBundle.bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent];
-        }
-        NSString *hostBundleIdentifier = hostBundle.bundleIdentifier;
-        if (!guestBundleIdentifier.length || !hostBundleIdentifier.length ||
-            [guestBundleIdentifier isEqualToString:hostBundleIdentifier]) return;
-        guestTaskPrefix = [guestBundleIdentifier stringByAppendingString:@"."];
-        hostTaskPrefix = [hostBundleIdentifier stringByAppendingString:@"."];
-
-        NSMutableSet *identifiers = [NSMutableSet set];
-        NSMutableArray *families = [NSMutableArray array];
-        id declarations = NSBundle.mainBundle.infoDictionary[@"BGTaskSchedulerPermittedIdentifiers"];
-        if (![declarations isKindOfClass:NSArray.class]) return;
-        for (NSString *identifier in declarations) {
-            if (![identifier isKindOfClass:NSString.class] || ![identifier hasPrefix:guestTaskPrefix] ||
-                identifier.length == 0 || identifier.length > 128) continue;
-            if ([identifier hasSuffix:@".*"] && [identifier componentsSeparatedByString:@"*"].count == 2) {
-                [families addObject:[identifier substringToIndex:identifier.length - 1]];
-            } else if (![identifier containsString:@"*"]) {
-                [identifiers addObject:identifier];
-            }
-        }
-        guestTaskIdentifiers = [identifiers copy];
-        guestTaskFamilies = [families copy];
-        if (!identifiers.count && !families.count) return;
-
-        dlopen("/System/Library/Frameworks/BackgroundTasks.framework/BackgroundTasks", RTLD_LAZY);
-        Class activityClass = NSClassFromString(@"_DASActivity");
-        Class schedulerClass = NSClassFromString(@"_DASScheduler");
-        Class registryClass = NSClassFromString(@"_BGTaskIdentifierRegistry");
-        Method encode = class_getInstanceMethod(activityClass, @selector(encodeWithCoder:));
-        Method decode = class_getInstanceMethod(activityClass, @selector(initWithCoder:));
-        Method cancel = class_getInstanceMethod(schedulerClass, NSSelectorFromString(@"cancelTaskRequestWithIdentifier:"));
-        Method permissible = class_getInstanceMethod(registryClass, NSSelectorFromString(@"isPermissibleFullyComposedIdentifier:"));
-        // Install only when the complete round trip is available on this OS.
-        if (!encode || !decode || !cancel || !permissible) return;
-        originalEncodeActivity = (void *)method_setImplementation(encode, (IMP)hook_encodeActivity);
-        originalDecodeActivity = (void *)method_setImplementation(decode, (IMP)hook_decodeActivity);
-        originalCancelTask = (void *)method_setImplementation(cancel, (IMP)hook_cancelTask);
-        originalIsPermissibleIdentifier = (void *)method_setImplementation(permissible, (IMP)hook_isPermissibleIdentifier);
+    NSString *guestBundleIdentifier = NSUserDefaults.lcGuestAppId;
+    NSBundle *hostBundle = NSUserDefaults.lcMainBundle;
+    if (NSUserDefaults.isLiveProcess) {
+        // dasd uses the root application's identity, not LiveProcess.appex's ID.
+        hostBundle = [NSBundle bundleWithPath:hostBundle.bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent];
     }
+    NSString *hostBundleIdentifier = hostBundle.bundleIdentifier;
+    if (!guestBundleIdentifier.length || !hostBundleIdentifier.length ||
+        [guestBundleIdentifier isEqualToString:hostBundleIdentifier]) return;
+    guestTaskPrefix = [guestBundleIdentifier stringByAppendingString:@"."];
+    hostTaskPrefix = [hostBundleIdentifier stringByAppendingString:@"."];
+
+    NSMutableSet *identifiers = [NSMutableSet set];
+    NSMutableArray *families = [NSMutableArray array];
+    id declarations = NSBundle.mainBundle.infoDictionary[@"BGTaskSchedulerPermittedIdentifiers"];
+    if (![declarations isKindOfClass:NSArray.class]) return;
+    for (NSString *identifier in declarations) {
+        if (![identifier isKindOfClass:NSString.class] || ![identifier hasPrefix:guestTaskPrefix] ||
+            identifier.length == 0 || identifier.length > 128) continue;
+        if ([identifier hasSuffix:@".*"] && [identifier componentsSeparatedByString:@"*"].count == 2) {
+            [families addObject:[identifier substringToIndex:identifier.length - 1]];
+        } else if (![identifier containsString:@"*"]) {
+            [identifiers addObject:identifier];
+        }
+    }
+    guestTaskIdentifiers = [identifiers copy];
+    guestTaskFamilies = [families copy];
+    if (!identifiers.count && !families.count) return;
+
+    dlopen("/System/Library/Frameworks/BackgroundTasks.framework/BackgroundTasks", RTLD_LAZY);
+    Class activityClass = NSClassFromString(@"_DASActivity");
+    Class schedulerClass = NSClassFromString(@"_DASScheduler");
+    Class registryClass = NSClassFromString(@"_BGTaskIdentifierRegistry");
+    Method encode = class_getInstanceMethod(activityClass, @selector(encodeWithCoder:));
+    Method decode = class_getInstanceMethod(activityClass, @selector(initWithCoder:));
+    Method cancel = class_getInstanceMethod(schedulerClass, NSSelectorFromString(@"cancelTaskRequestWithIdentifier:"));
+    Method permissible = class_getInstanceMethod(registryClass, NSSelectorFromString(@"isPermissibleFullyComposedIdentifier:"));
+    // Install only when the complete round trip is available on this OS.
+    if (!encode || !decode || !cancel || !permissible) return;
+    originalEncodeActivity = (void *)method_setImplementation(encode, (IMP)hook_encodeActivity);
+    originalDecodeActivity = (void *)method_setImplementation(decode, (IMP)hook_decodeActivity);
+    originalCancelTask = (void *)method_setImplementation(cancel, (IMP)hook_cancelTask);
+    originalIsPermissibleIdentifier = (void *)method_setImplementation(permissible, (IMP)hook_isPermissibleIdentifier);
 }

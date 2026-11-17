@@ -77,7 +77,7 @@ extension View {
 public struct DocModifier: ViewModifier {
     @EnvironmentObject var sceneDelegate: SceneDelegate
     @State private var docController: UIDocumentPickerViewController?
-    @State private var delegate : UIDocumentPickerDelegate
+    private let delegate: Coordinator
 
     @Binding var isPresented: Bool
 
@@ -96,14 +96,14 @@ public struct DocModifier: ViewModifier {
     }
 
     public func body(content: Content) -> some View {
-        content.onChange(of: isPresented) { isPresented in
-            if isPresented, docController == nil {
+        content.onChange(of: isPresented) { _, newValue in
+            if newValue, docController == nil {
                 let controller = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
                 controller.allowsMultipleSelection = multiple
                 controller.delegate = delegate
                 self.docController = controller
-                sceneDelegate.window?.rootViewController?.present(controller, animated: true)
-            } else if !isPresented, let docController = docController {
+                UIApplication.shared.lcTopmostViewController(in: sceneDelegate.window)?.present(controller, animated: true)
+            } else if !newValue, let docController = docController {
                 docController.dismiss(animated: true)
                 self.docController = nil
             }
@@ -148,12 +148,12 @@ public struct TextFieldAlertModifier: ViewModifier {
     let actionCancel: (String?) -> Void
 
     public func body(content: Content) -> some View {
-        content.onChange(of: isPresented) { isPresented in
-            if isPresented, alertController == nil {
+        content.onChange(of: isPresented) { _, newValue in
+            if newValue, alertController == nil {
                 let alertController = makeAlertController()
                 self.alertController = alertController
-                sceneDelegate.window?.rootViewController?.present(alertController, animated: true)
-            } else if !isPresented, let alertController = alertController {
+                UIApplication.shared.lcTopmostViewController(in: sceneDelegate.window)?.present(alertController, animated: true)
+            } else if !newValue, let alertController = alertController {
                 alertController.dismiss(animated: true)
                 self.alertController = nil
             }
@@ -191,7 +191,7 @@ struct NavigationBarProgressModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .background(NavigationBarProgressView(show: $show, progress: $progress))
+            .background { NavigationBarProgressView(show: $show, progress: $progress) }
     }
 }
 
@@ -273,22 +273,71 @@ struct RainbowAnimation: ViewModifier {
     func body(content: Content) -> some View {
     // 3
         let gradient = LinearGradient(gradient: Gradient(colors: hueColors+hueColors), startPoint: .leading, endPoint: .trailing)
-        return content.overlay(GeometryReader { proxy in
-            ZStack {
-                gradient
+        return content.overlay {
+            GeometryReader { proxy in
+                ZStack {
+                    gradient
     // 4
-                    .frame(width: 2*proxy.size.width)
+                        .frame(width: 2*proxy.size.width)
     // 5
-                    .offset(x: self.isOn ? -proxy.size.width : 0)
+                        .offset(x: self.isOn ? -proxy.size.width : 0)
+                }
             }
-        })
+        }
     // 6
         .onAppear {
             withAnimation(self.animation) {
                 self.isOn = true
             }
         }
-        .mask(content)
+        .mask { content }
+    }
+}
+
+extension UIApplication {
+    func lcTopmostViewController(in window: UIWindow? = nil) -> UIViewController? {
+        let targetWindow = window ?? connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .sorted { $0.activationState == .foregroundActive && $1.activationState != .foregroundActive }
+            .flatMap { $0.windows }
+            .first(where: { $0.isKeyWindow }) ?? (connectedScenes.first as? UIWindowScene)?.windows.first
+        var top = targetWindow?.rootViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
+
+extension FileManager {
+    func calculateDirectorySize(at url: URL) -> UInt64 {
+        var totalSize: UInt64 = 0
+        let keys: [URLResourceKey] = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileSizeKey]
+        guard let enumerator = enumerator(at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else {
+            return 0
+        }
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true else { continue }
+            totalSize += UInt64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
+        }
+        return totalSize
+    }
+
+    func nextAvailableCopyURL(for url: URL, isDirectory: Bool) -> URL {
+        let dir = url.deletingLastPathComponent()
+        let baseName = isDirectory ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+        let ext = isDirectory ? "" : url.pathExtension
+        var index = 1
+        while true {
+            let suffix = index == 1 ? "-copy" : "-copy-\(index)"
+            let candidateName = ext.isEmpty ? "\(baseName)\(suffix)" : "\(baseName)\(suffix).\(ext)"
+            let candidateURL = dir.appendingPathComponent(candidateName, isDirectory: isDirectory)
+            if !fileExists(atPath: candidateURL.path) {
+                return candidateURL
+            }
+            index += 1
+        }
     }
 }
 

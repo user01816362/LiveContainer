@@ -20,7 +20,7 @@ struct LCSelectContainerView : View{
     @EnvironmentObject private var sharedModel : SharedModel
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List(selection: $multiSelection) {
                 ForEach(unusedContainers, id: \.folderName) { container in
                     VStack(alignment: .leading) {

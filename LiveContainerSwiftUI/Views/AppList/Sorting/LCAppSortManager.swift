@@ -45,11 +45,7 @@ enum AppSortType: String, CaseIterable {
         case .lastLaunched:
             return "clock"
         case .installationDate:
-            if #available(iOS 18.0, *) {
-                return "square.and.arrow.down.badge.clock"
-            } else {
-                return "square.and.arrow.down"
-            }
+            return "square.and.arrow.down.badge.clock"
         case .custom:
             return "list.bullet"
         }

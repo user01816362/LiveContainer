@@ -6,6 +6,8 @@
 #include "../LCMachOUtils.h"
 #include <dlfcn.h>
 
+#pragma clang diagnostic ignored "-Wundeclared-selector"
+
 BOOL isolateAppGroup = NO;
 BOOL strictTestMode = NO;
 static NSString *extensionParentContainerPath;
@@ -50,12 +52,14 @@ void NSFMGuestHooksInit(void) {
     }
     NSURL *result;
     if(isolateAppGroup) {
-        NSString *homePath = extensionParentContainerPath ?: @(getenv("HOME"));
+        const char *homeEnv = getenv("HOME");
+        NSString *homePath = extensionParentContainerPath ?: (homeEnv ? @(homeEnv) : NSHomeDirectory());
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LCAppGroup/%@", homePath, groupIdentifier]];
     } else if (NSUserDefaults.lcAppGroupPath){
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LiveContainer/Data/AppGroup/%@", NSUserDefaults.lcAppGroupPath, groupIdentifier]];
     } else {
-        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/Documents/Data/AppGroup/%@", getenv("LC_HOME_PATH"), groupIdentifier]];
+        NSString *lcHome = [NSClassFromString(@"LCSharedUtils") cachedLcHomePath] ?: NSHomeDirectory();
+        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/Documents/Data/AppGroup/%@", lcHome, groupIdentifier]];
     }
     [NSFileManager.defaultManager createDirectoryAtURL:[result URLByAppendingPathComponent:@"Library/Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
     return result;
@@ -64,18 +68,24 @@ void NSFMGuestHooksInit(void) {
 - (bool)hook_createDirectoryAtPath:(NSString *)path withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary<NSFileAttributeKey,id> *)attributes error:(NSError *__autoreleasing  _Nullable *)error {
     bool ans = [self hook_createDirectoryAtPath:path withIntermediateDirectories:createIntermediates attributes:attributes error:error];
     void* callerAddr = __builtin_return_address(0);
-    if(callerAddr > webKitHeader && callerAddr < (webKitHeader + (32 << 20) )) {
+    if(webKitHeader && callerAddr > webKitHeader && callerAddr < (webKitHeader + (32 << 20) )) {
         if([path hasSuffix:@"Library/Cookies"]) {
             // symlink Cookies folder
             // https://github.com/apple-oss-distributions/WebKit/blob/0c8cf3581e5c01d970ea411128007c9325ba2d48/Source/WebKit/Shared/Cocoa/SandboxUtilities.mm#L56
             // unfortunately we cannot hook sandbox_container_path_for_pid, so we symlink Cookies folder in normal mode
             // see NSFileManager+GuestHooks.m for more info
             NSFileManager *fm = NSFileManager.defaultManager;
-            const char *lcHomePath = getenv(NSUserDefaults.isLiveProcess ? "LP_HOME_PATH" : "LC_HOME_PATH");
-            NSString *libraryPath = [@(lcHomePath) stringByAppendingPathComponent:@"Library"];
+            NSString *lcHomePath = NSUserDefaults.isLiveProcess
+                ? [NSClassFromString(@"LCSharedUtils") cachedLpHomePath]
+                : [NSClassFromString(@"LCSharedUtils") cachedLcHomePath];
+            const char *homeEnv = getenv("HOME");
+            if (lcHomePath.length == 0 || !homeEnv) {
+                return YES;
+            }
+            NSString *libraryPath = [lcHomePath stringByAppendingPathComponent:@"Library"];
             NSString *cookies2Path = [libraryPath stringByAppendingPathComponent:@"Cookies2"];
             NSString *cookiesPath = [libraryPath stringByAppendingPathComponent:@"Cookies"];
-            NSString* appCookiesPath = [@(getenv("HOME")) stringByAppendingPathComponent:@"Library/Cookies"];
+            NSString* appCookiesPath = [@(homeEnv) stringByAppendingPathComponent:@"Library/Cookies"];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:cookies2Path isDirectory:&isDir]) {
                 if([fm fileExistsAtPath:cookiesPath isDirectory:&isDir]) {

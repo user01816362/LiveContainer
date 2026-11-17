@@ -1,7 +1,6 @@
 #import "FoundationPrivate.h"
 #import "AppSceneViewController.h"
 
-API_AVAILABLE(ios(16.0))
 @interface DecoratedAppSceneViewController : UIViewController<AppSceneViewControllerDelegate>
 @property(nonatomic) AppSceneViewController* appSceneVC;
 @property(nonatomic) UIStackView *view;

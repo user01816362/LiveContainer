@@ -15,6 +15,7 @@
 @property(nonatomic) CGRect originalFrame;
 @property(nonatomic) UIBarButtonItem *maximizeButton;
 @property(nonatomic) bool isAppTerminationRequested;
+@property(nonatomic) BOOL isObservingDefaults;
 @end
 
 static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
@@ -32,10 +33,11 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
             windowScene = candidateScene;
         }
     }
-    return windowScene ? windowScene.interfaceOrientation : UIInterfaceOrientationPortrait;
+    return windowScene ? windowScene.effectiveGeometry.interfaceOrientation : UIInterfaceOrientationPortrait;
 }
 
 @implementation DecoratedAppSceneViewController
+@dynamic view;
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC {
     self = [super initWithNibName:nil bundle:nil];
     self.view = [[UIStackView alloc] initWithFrame:self.view.frame];
@@ -114,7 +116,6 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 
 - (void)setupDecoratedView {
     CGFloat navBarHeight = 44;
-    self.view = [UIStackView new];
     BOOL isLandscape = UIInterfaceOrientationIsLandscape(LCCurrentInterfaceOrientation());
     CGRect frame = CGRectMake(0, 0, isLandscape ? 480 : 320, (isLandscape ? 320 : 480) + navBarHeight);
     CGPoint rootViewCenter = self.view.superview.center;
@@ -122,9 +123,13 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     
     if(_isMaximized) {
         CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, self.view.window.safeAreaInsets);
-        // save origin as normalized coordinates
-        frame.origin.x /= maxFrame.size.width;
-        frame.origin.y /= maxFrame.size.height;
+        if (maxFrame.size.width > 0 && maxFrame.size.height > 0) {
+            // save origin as normalized coordinates
+            frame.origin.x /= maxFrame.size.width;
+            frame.origin.y /= maxFrame.size.height;
+        } else {
+            frame.origin = CGPointZero;
+        }
         self.originalFrame = frame;
     } else {
         self.view.frame = frame;
@@ -191,9 +196,18 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     
     
     NSUserDefaults *defaults = NSUserDefaults.lcSharedDefaults;
-
-    [defaults addObserver:self forKeyPath:@"LCMultitaskBottomWindowBar" options:NSKeyValueObservingOptionNew context:NULL];
+    if (!self.isObservingDefaults) {
+        self.isObservingDefaults = YES;
+        [defaults addObserver:self forKeyPath:@"LCMultitaskBottomWindowBar" options:NSKeyValueObservingOptionNew context:NULL];
+    }
     [self updateOriginalFrame];
+}
+
+- (void)dealloc {
+    if (_isObservingDefaults) {
+        _isObservingDefaults = NO;
+        [NSUserDefaults.lcSharedDefaults removeObserver:self forKeyPath:@"LCMultitaskBottomWindowBar"];
+    }
 }
 
 
@@ -351,10 +365,12 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         [dock removeRunningApp:self.dataUUID];
         
         self.view.layer.masksToBounds = NO;
+        [self willMoveToParentViewController:nil];
         [UIView transitionWithView:self.view duration:0.4 options:UIViewAnimationOptionTransitionCurlUp animations:^{
             self.view.hidden = YES;
         } completion:^(BOOL b){
             [self.view removeFromSuperview];
+            [self removeFromParentViewController];
         }];
         
         if(skipTerminationScreen) {
@@ -604,6 +620,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 - (void)updateOriginalFrame {
     if(_isMaximized) return;
     CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, self.view.window.safeAreaInsets);
+    if (maxFrame.size.width <= 0 || maxFrame.size.height <= 0) return;
     // save origin as normalized coordinates
     self.originalFrame = CGRectMake(self.view.frame.origin.x / maxFrame.size.width, self.view.frame.origin.y / maxFrame.size.height, self.view.frame.size.width, self.view.frame.size.height);
 }

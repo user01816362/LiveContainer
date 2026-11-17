@@ -7,6 +7,26 @@
 
 import Foundation
 
+/// Runtime interception telemetry recorded inside a container by `TweakLoader` hooks.
+struct LCProfileRuntimeTelemetry: Equatable {
+    let spoofProfileEnabled: Bool
+    let blockDeviceInfoReads: Bool
+    let realHostMachine: String
+    let spoofedHardwareModel: String
+    let spoofedBoardModel: String
+    let spoofedSystemVersion: String
+    let hardwareInterceptions: Int
+    let networkInterceptions: Int
+    let webkitInterceptions: Int
+    let updatedAt: Date?
+
+    var totalInterceptions: Int {
+        hardwareInterceptions + networkInterceptions + webkitInterceptions
+    }
+}
+
+/// Persistent per-container isolation and device-fingerprint spoof configuration
+/// serialized to `LCContainerInfo.plist`.
 class LCContainer : ObservableObject, Hashable {
     @Published var folderName : String
     @Published var name : String
@@ -64,6 +84,7 @@ class LCContainer : ObservableObject, Hashable {
     @Published var spoofSubscriberSIMInserted: Bool
     @Published var spoofRadioAccessTechnology: String
     @Published var spoofHardwareModel: String
+    @Published var spoofDeviceVariantId: String
     @Published var spoofHostName: String
     @Published var spoofBoardModel: String
     @Published var spoofKernelVersion: String
@@ -178,7 +199,8 @@ class LCContainer : ObservableObject, Hashable {
         spoofGraphicsCategoryEnabled: Bool = true,
         spoofWebViewCategoryEnabled: Bool = true,
         spoofAppPrivacyCategoryEnabled: Bool = true,
-        spoofSensorsAndUserDataCategoryEnabled: Bool = true,
+        spoofSensorsAndUserDataCategoryEnabled: Bool = false,
+        spoofDeviceVariantId: String = "",
         spoofDeviceName: String = "",
         spoofDeviceModel: String = "",
         spoofSystemName: String = "",
@@ -196,32 +218,32 @@ class LCContainer : ObservableObject, Hashable {
         spoofHardwareModel: String = "",
         spoofHostName: String = "",
         spoofBoardModel: String = "",
-        spoofKernelVersion: String = "Darwin Kernel Version 25.0.0",
-        spoofBootTime: Int64 = 0,
+        spoofKernelVersion: String = "Darwin Kernel Version 26.2.0",
+        spoofBootTime: Int64 = Int64(Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime),
         spoofCPUType: Int = 16_777_228,
         spoofCPUSubtype: Int = 2,
         spoofProcessorCount: Int = 6,
-        spoofPhysicalMemory: Int64 = 6_442_450_944,
+        spoofPhysicalMemory: Int64 = 8_589_934_592,
         spoofThermalState: Int = 0,
-        spoofScreenWidth: Double = 1179,
-        spoofScreenHeight: Double = 2556,
+        spoofScreenWidth: Double = 1206,
+        spoofScreenHeight: Double = 2622,
         spoofScreenScale: Double = 3,
         spoofScreenNativeScale: Double = 3,
-        spoofMaximumFramesPerSecond: Int = 60,
+        spoofMaximumFramesPerSecond: Int = 120,
         spoofScreenBrightness: Double = 0.5,
-        spoofUserInterfaceStyle: Int = 1,
+        spoofUserInterfaceStyle: Int = 0,
         spoofAccessibilityContrast: Int = 0,
         spoofDisplayGamut: Int = 2,
         spoofHorizontalSizeClass: Int = 1,
         spoofVerticalSizeClass: Int = 2,
         spoofPreferredContentSizeCategory: String = "UICTContentSizeCategoryL",
-        spoofSafeAreaTop: Double = 59,
+        spoofSafeAreaTop: Double = 62,
         spoofSafeAreaLeft: Double = 0,
         spoofSafeAreaBottom: Double = 34,
         spoofSafeAreaRight: Double = 0,
-        spoofStorageTotalCapacity: Int64 = 137_438_953_472,
-        spoofStorageAvailableCapacity: Int64 = 68_719_476_736,
-        spoofGPUName: String = "Apple GPU",
+        spoofStorageTotalCapacity: Int64 = 274_877_906_944,
+        spoofStorageAvailableCapacity: Int64 = 137_438_953_472,
+        spoofGPUName: String = "Apple A19 Pro GPU",
         spoofAudioOutputVolume: Double = 0.5,
         spoofAudioSampleRate: Double = 48_000,
         spoofAudioOutputLatency: Double = 0.01,
@@ -229,9 +251,9 @@ class LCContainer : ObservableObject, Hashable {
         spoofAudioOtherPlaying: Bool = false,
         spoofAudioOutputChannels: Int = 2,
         spoofAudioInputChannels: Int = 1,
-        spoofGPUWorkingSetSize: Int64 = 4_294_967_296,
+        spoofGPUWorkingSetSize: Int64 = 6_442_450_944,
         spoofGraphicsSupportsRayTracing: Bool = true,
-        spoofGraphicsSupportsAllFamilies: Bool = true,
+        spoofGraphicsSupportsAllFamilies: Bool = false,
         spoofStorageVolumeName: String = "Data",
         spoofStorageVolumeUUID: String = "00000000-0000-0000-0000-000000000000",
         spoofStorageFileCreationTime: Int64 = 1_735_689_600,
@@ -239,7 +261,7 @@ class LCContainer : ObservableObject, Hashable {
         spoofCustomUserAgent: String = "",
         spoofWebGLVendor: String = "Apple Inc.",
         spoofWebGLRenderer: String = "Apple GPU",
-        spoofWebCanvasDataURL: String = "data:image/png;base64,iVBORw0KGgo=",
+        spoofWebCanvasDataURL: String = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
         spoofWebColorDepth: Int = 24,
         spoofFeatureOverrides: [String: Bool] = [:],
         bookmarkData: Data? = nil,
@@ -272,6 +294,7 @@ class LCContainer : ObservableObject, Hashable {
         self.spoofWebViewCategoryEnabled = spoofWebViewCategoryEnabled
         self.spoofAppPrivacyCategoryEnabled = spoofAppPrivacyCategoryEnabled
         self.spoofSensorsAndUserDataCategoryEnabled = spoofSensorsAndUserDataCategoryEnabled
+        self.spoofDeviceVariantId = spoofDeviceVariantId
         self.spoofDeviceName = spoofDeviceName
         self.spoofDeviceModel = spoofDeviceModel
         self.spoofSystemName = spoofSystemName
@@ -341,123 +364,151 @@ class LCContainer : ObservableObject, Hashable {
     
     convenience init(infoDict : [String : Any], isShared : Bool) {
         let bookmarkData : Data? = infoDict["bookmarkData"] as? Data
-        
-        self.init(folderName: infoDict["folderName"] as? String ?? "ERROR",
-                  name: infoDict["name"] as? String ?? "ERROR",
-                  isShared: isShared,
-                  isolateAppGroup: false,
-                  spoofIdentifierForVendor: false,
-                  strictTestMode: false,
-                  strictAutoWipeOnExit: false,
-                  blockDeviceInfoReads: false,
-                  spoofProfileEnabled: false,
-                  rotateSpoofProfileOnLaunch: false,
-                  rotateOSMajorVersions: "18,26,27",
-                  rotateUsesRealDeviceTemplates: true,
-                  spoofIdentityCategoryEnabled: true,
-                  spoofSystemCategoryEnabled: true,
-                  spoofDisplayCategoryEnabled: true,
-                  spoofLocaleCategoryEnabled: true,
-                  spoofBatteryCategoryEnabled: true,
-                  spoofTelephonyCategoryEnabled: true,
-                  spoofNetworkHeadersCategoryEnabled: true,
-                  spoofAccessibilityCategoryEnabled: true,
-                  spoofStorageCategoryEnabled: true,
-                  spoofNetworkEnvironmentCategoryEnabled: true,
-                  spoofAudioCategoryEnabled: true,
-                  spoofGraphicsCategoryEnabled: true,
-                  spoofWebViewCategoryEnabled: true,
-                  spoofAppPrivacyCategoryEnabled: true,
-                  spoofSensorsAndUserDataCategoryEnabled: true,
-                  spoofDeviceName: "",
-                  spoofDeviceModel: "",
-                  spoofSystemName: "",
-                  spoofSystemVersion: "",
-                  spoofLocaleIdentifier: "",
-                  spoofTimeZoneIdentifier: "",
-                  spoofBatteryLevel: 0.8,
-                  spoofBatteryState: 2,
-                  spoofLowPowerModeEnabled: false,
-                  spoofSubscriberIdentifier: "",
-                  spoofSubscriberCarrierTokenBase64: "",
-                  spoofSubscriberSIMInsertedEnabled: false,
-                  spoofSubscriberSIMInserted: false,
-                  spoofRadioAccessTechnology: "",
-                  spoofHardwareModel: "",
-                  spoofHostName: "",
-                  spoofBoardModel: "",
-                  spoofKernelVersion: "Darwin Kernel Version 25.0.0",
-                  spoofBootTime: 0,
-                  spoofCPUType: 16_777_228,
-                  spoofCPUSubtype: 2,
-                  spoofProcessorCount: 6,
-                  spoofPhysicalMemory: 6_442_450_944,
-                  spoofThermalState: 0,
-                  spoofScreenWidth: 1179,
-                  spoofScreenHeight: 2556,
-                  spoofScreenScale: 3,
-                  spoofScreenNativeScale: 3,
-                  spoofMaximumFramesPerSecond: 60,
-                  spoofScreenBrightness: 0.5,
-                  spoofStorageTotalCapacity: 137_438_953_472,
-                  spoofStorageAvailableCapacity: 68_719_476_736,
-                  spoofGPUName: "Apple GPU",
-                  spoofAudioOutputVolume: 0.5,
-                  bookmarkData: bookmarkData,
-                  resolvedContainerURL: nil
+
+        self.init(
+            folderName: infoDict["folderName"] as? String ?? "ERROR",
+            name: infoDict["name"] as? String ?? "ERROR",
+            isShared: isShared,
+            bookmarkData: bookmarkData,
+            resolvedContainerURL: nil
         )
-        
+
         if let bookmarkData {
-
-                do {
-                    var isStale = false
-                    let url = try URL(resolvingBookmarkData: bookmarkData, bookmarkDataIsStale: &isStale)
-
-                    self.resolvedContainerURL = url
-
-                } catch {
-                    print(error.localizedDescription)
-                }
-
-                self.bookmarkResolved = true
+            do {
+                var isStale = false
+                let url = try URL(resolvingBookmarkData: bookmarkData, bookmarkDataIsStale: &isStale)
+                self.resolvedContainerURL = url
+            } catch {
+                print(error.localizedDescription)
+            }
+            self.bookmarkResolved = true
         }
-        
+
         do {
             let fm = FileManager.default
-            if(!fm.fileExists(atPath: infoDictUrl.deletingLastPathComponent().path)) {
+            if !fm.fileExists(atPath: infoDictUrl.deletingLastPathComponent().path) {
                 try fm.createDirectory(at: infoDictUrl.deletingLastPathComponent(), withIntermediateDirectories: true)
             }
-            
             let plistInfo = try PropertyListSerialization.propertyList(from: Data(contentsOf: infoDictUrl), format: nil)
             if let plistInfo = plistInfo as? [String : Any] {
-                isolateAppGroup = plistInfo["isolateAppGroup"] as? Bool ?? false
-                spoofIdentifierForVendor = plistInfo["spoofIdentifierForVendor"] as? Bool ?? false
-                spoofedIdentifier = plistInfo["spoofedIdentifierForVendor"] as? String
-                strictTestMode = plistInfo["strictTestMode"] as? Bool ?? false
-                strictAutoWipeOnExit = plistInfo["strictAutoWipeOnExit"] as? Bool ?? false
-                blockDeviceInfoReads = plistInfo["blockDeviceInfoReads"] as? Bool ?? false
-                spoofProfileEnabled = plistInfo["spoofProfileEnabled"] as? Bool ?? false
-                loadSpoofCategorySettings(from: plistInfo)
-                spoofDeviceName = plistInfo["spoofDeviceName"] as? String ?? ""
-                spoofDeviceModel = plistInfo["spoofDeviceModel"] as? String ?? ""
-                spoofSystemName = plistInfo["spoofSystemName"] as? String ?? ""
-                spoofSystemVersion = plistInfo["spoofSystemVersion"] as? String ?? ""
-                spoofLocaleIdentifier = plistInfo["spoofLocaleIdentifier"] as? String ?? ""
-                spoofTimeZoneIdentifier = plistInfo["spoofTimeZoneIdentifier"] as? String ?? ""
-                spoofBatteryLevel = plistInfo["spoofBatteryLevel"] as? Double ?? 0.8
-                spoofBatteryState = plistInfo["spoofBatteryState"] as? Int ?? 2
-                spoofLowPowerModeEnabled = plistInfo["spoofLowPowerModeEnabled"] as? Bool ?? false
-                spoofSubscriberIdentifier = plistInfo["spoofSubscriberIdentifier"] as? String ?? ""
-                spoofSubscriberCarrierTokenBase64 = plistInfo["spoofSubscriberCarrierTokenBase64"] as? String ?? ""
-                spoofSubscriberSIMInsertedEnabled = plistInfo["spoofSubscriberSIMInsertedEnabled"] as? Bool ?? false
-                spoofSubscriberSIMInserted = plistInfo["spoofSubscriberSIMInserted"] as? Bool ?? false
-                spoofRadioAccessTechnology = plistInfo["spoofRadioAccessTechnology"] as? String ?? ""
-                spoofHardwareModel = plistInfo["spoofHardwareModel"] as? String ?? ""
-                loadSystemDisplayProfile(from: plistInfo)
+                applyPlistDictionary(plistInfo, updateName: false)
             }
         } catch {
-            
+
         }
+    }
+
+    /// Creates a newly initialized container and optionally applies the user's
+    /// configured global default profile preset from Main Settings.
+    static func makeNewContainer(
+        folderName: String,
+        name: String,
+        isShared: Bool,
+        bookmarkData: Data? = nil,
+        resolvedContainerURL: URL? = nil,
+        applyGlobalDefaultPreset: Bool = true
+    ) -> LCContainer {
+        let container = LCContainer(
+            folderName: folderName,
+            name: name,
+            isShared: isShared,
+            bookmarkData: bookmarkData,
+            resolvedContainerURL: resolvedContainerURL
+        )
+        if applyGlobalDefaultPreset {
+            LCProfilePresetStore.applyConfiguredDefault(to: container)
+        }
+        return container
+    }
+
+    /// Returns whether a granular sub-feature key is enabled according to explicit
+    /// container overrides or the shared default policy in `LCDeviceProfileCatalog.h`.
+    func isSpoofFeatureEnabled(_ key: String) -> Bool {
+        if let explicit = spoofFeatureOverrides[key] {
+            return explicit
+        }
+        return LCDefaultFeatureFlagEnabled(key)
+    }
+
+    /// Populates all coherent hardware, display, GPU, and OS fields from a verified catalog model.
+    func applyHardwareSpec(_ spec: LCDeviceModelSpec, osVersionOverride: String? = nil) {
+        spoofDeviceVariantId = spec.variantId
+        spoofHardwareModel = spec.hwMachine
+        spoofBoardModel = spec.hwModel
+        spoofDeviceModel = spec.deviceModel
+        if spoofDeviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            LCDeviceModelSpec.all.contains(where: { $0.marketingName == spoofDeviceName }) {
+            spoofDeviceName = spec.marketingName
+        }
+        if spoofHostName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            spoofHostName == "D93AP" || spoofHostName == "localhost" {
+            spoofHostName = spec.marketingName
+                .replacingOccurrences(of: " ", with: "-")
+                .replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "(", with: "")
+                .replacingOccurrences(of: ")", with: "")
+        }
+        spoofSystemName = spec.systemName
+
+        let targetVersion = (osVersionOverride?.isEmpty == false ? osVersionOverride! : spoofSystemVersion)
+        let currentMajor = Int(targetVersion.split(separator: ".").first ?? "") ?? 0
+        let resolvedOSVersion: String
+        if currentMajor < spec.minOSMajor || targetVersion.isEmpty {
+            resolvedOSVersion = "\(max(spec.minOSMajor, 27)).2"
+        } else {
+            resolvedOSVersion = targetVersion
+        }
+        spoofSystemVersion = resolvedOSVersion
+        let resolvedMajor = Int(resolvedOSVersion.split(separator: ".").first ?? "") ?? max(spec.minOSMajor, 27)
+        let darwinMajor = Int(LCExpectedDarwinMajorForOSMajor(Int32(resolvedMajor)))
+        let darwinMinor = resolvedMajor >= 27 ? 2 : 0
+        spoofKernelVersion = "Darwin Kernel Version \(darwinMajor).\(darwinMinor).0"
+
+        spoofCPUType = 16_777_228
+        spoofCPUSubtype = 2
+        spoofProcessorCount = spec.cpuCores
+        spoofPhysicalMemory = Int64(spec.physicalMemoryGB) * 1_073_741_824
+
+        spoofGPUName = spec.gpuName
+        spoofGPUWorkingSetSize = Int64(spec.gpuWorkingSetGB) * 1_073_741_824
+        spoofGraphicsSupportsRayTracing = spec.supportsRayTracing
+        spoofGraphicsSupportsAllFamilies = false
+        spoofWebGLVendor = "Apple Inc."
+        spoofWebGLRenderer = "Apple GPU"
+
+        spoofScreenWidth = spec.pixelWidth
+        spoofScreenHeight = spec.pixelHeight
+        spoofScreenScale = spec.scale
+        spoofScreenNativeScale = spec.nativeScale
+        spoofMaximumFramesPerSecond = spec.maxFPS
+        spoofHorizontalSizeClass = spec.horizontalSizeClass
+        spoofVerticalSizeClass = spec.verticalSizeClass
+        spoofSafeAreaTop = spec.safeAreaTop
+        spoofSafeAreaLeft = 0
+        spoofSafeAreaBottom = spec.safeAreaBottom
+        spoofSafeAreaRight = 0
+    }
+
+    /// Reads the latest runtime interception counters logged inside this container, if any.
+    func loadTelemetrySnapshot() -> LCProfileRuntimeTelemetry? {
+        let telemetryURL = containerURL.appendingPathComponent(".lc_profile_telemetry.plist")
+        guard let data = try? Data(contentsOf: telemetryURL),
+              let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            return nil
+        }
+        let updatedEpoch = (dict["updatedAt"] as? NSNumber)?.doubleValue
+        return LCProfileRuntimeTelemetry(
+            spoofProfileEnabled: dict["spoofProfileEnabled"] as? Bool ?? false,
+            blockDeviceInfoReads: dict["blockDeviceInfoReads"] as? Bool ?? false,
+            realHostMachine: dict["realHostMachine"] as? String ?? "",
+            spoofedHardwareModel: dict["spoofedHardwareModel"] as? String ?? "",
+            spoofedBoardModel: dict["spoofedBoardModel"] as? String ?? "",
+            spoofedSystemVersion: dict["spoofedSystemVersion"] as? String ?? "",
+            hardwareInterceptions: dict["hardwareInterceptions"] as? Int ?? 0,
+            networkInterceptions: dict["networkInterceptions"] as? Int ?? 0,
+            webkitInterceptions: dict["webkitInterceptions"] as? Int ?? 0,
+            updatedAt: updatedEpoch.map { Date(timeIntervalSince1970: $0) }
+        )
     }
     
     func toDict() -> [String : Any] {
@@ -536,6 +587,9 @@ class LCContainer : ObservableObject, Hashable {
         if !spoofRadioAccessTechnology.isEmpty {
             infoDict!["spoofRadioAccessTechnology"] = spoofRadioAccessTechnology
         }
+        if !spoofDeviceVariantId.isEmpty {
+            infoDict!["spoofDeviceVariantId"] = spoofDeviceVariantId
+        }
         if !spoofHardwareModel.isEmpty {
             infoDict!["spoofHardwareModel"] = spoofHardwareModel
         }
@@ -596,53 +650,60 @@ class LCContainer : ObservableObject, Hashable {
         guard let infoDict else {
             return
         }
-        name = infoDict["name"] as? String ?? "ERROR"
-        isolateAppGroup = infoDict["isolateAppGroup"] as? Bool ?? false
-        spoofIdentifierForVendor = infoDict["spoofIdentifierForVendor"] as? Bool ?? false
-        spoofedIdentifier = infoDict["spoofedIdentifierForVendor"] as? String
-        strictTestMode = infoDict["strictTestMode"] as? Bool ?? false
-        strictAutoWipeOnExit = infoDict["strictAutoWipeOnExit"] as? Bool ?? false
-        blockDeviceInfoReads = infoDict["blockDeviceInfoReads"] as? Bool ?? false
-        spoofProfileEnabled = infoDict["spoofProfileEnabled"] as? Bool ?? false
-        loadSpoofCategorySettings(from: infoDict)
-        spoofDeviceName = infoDict["spoofDeviceName"] as? String ?? ""
-        spoofDeviceModel = infoDict["spoofDeviceModel"] as? String ?? ""
-        spoofSystemName = infoDict["spoofSystemName"] as? String ?? ""
-        spoofSystemVersion = infoDict["spoofSystemVersion"] as? String ?? ""
-        spoofLocaleIdentifier = infoDict["spoofLocaleIdentifier"] as? String ?? ""
-        spoofTimeZoneIdentifier = infoDict["spoofTimeZoneIdentifier"] as? String ?? ""
-        spoofBatteryLevel = infoDict["spoofBatteryLevel"] as? Double ?? 0.8
-        spoofBatteryState = infoDict["spoofBatteryState"] as? Int ?? 2
-        spoofLowPowerModeEnabled = infoDict["spoofLowPowerModeEnabled"] as? Bool ?? false
-        spoofSubscriberIdentifier = infoDict["spoofSubscriberIdentifier"] as? String ?? ""
-        spoofSubscriberCarrierTokenBase64 = infoDict["spoofSubscriberCarrierTokenBase64"] as? String ?? ""
-        spoofSubscriberSIMInsertedEnabled = infoDict["spoofSubscriberSIMInsertedEnabled"] as? Bool ?? false
-        spoofSubscriberSIMInserted = infoDict["spoofSubscriberSIMInserted"] as? Bool ?? false
-        spoofRadioAccessTechnology = infoDict["spoofRadioAccessTechnology"] as? String ?? ""
-        spoofHardwareModel = infoDict["spoofHardwareModel"] as? String ?? ""
-        loadSystemDisplayProfile(from: infoDict)
+        applyPlistDictionary(infoDict, updateName: true)
+    }
+
+    private func applyPlistDictionary(_ dictionary: [String: Any], updateName: Bool) {
+        if updateName {
+            name = dictionary["name"] as? String ?? "ERROR"
+        }
+        isolateAppGroup = dictionary["isolateAppGroup"] as? Bool ?? false
+        spoofIdentifierForVendor = dictionary["spoofIdentifierForVendor"] as? Bool ?? false
+        spoofedIdentifier = dictionary["spoofedIdentifierForVendor"] as? String
+        strictTestMode = dictionary["strictTestMode"] as? Bool ?? false
+        strictAutoWipeOnExit = dictionary["strictAutoWipeOnExit"] as? Bool ?? false
+        blockDeviceInfoReads = dictionary["blockDeviceInfoReads"] as? Bool ?? false
+        spoofProfileEnabled = dictionary["spoofProfileEnabled"] as? Bool ?? false
+        loadSpoofCategorySettings(from: dictionary)
+        spoofDeviceVariantId = dictionary["spoofDeviceVariantId"] as? String ?? ""
+        spoofDeviceName = dictionary["spoofDeviceName"] as? String ?? ""
+        spoofDeviceModel = dictionary["spoofDeviceModel"] as? String ?? ""
+        spoofSystemName = dictionary["spoofSystemName"] as? String ?? ""
+        spoofSystemVersion = dictionary["spoofSystemVersion"] as? String ?? ""
+        spoofLocaleIdentifier = dictionary["spoofLocaleIdentifier"] as? String ?? ""
+        spoofTimeZoneIdentifier = dictionary["spoofTimeZoneIdentifier"] as? String ?? ""
+        spoofBatteryLevel = dictionary["spoofBatteryLevel"] as? Double ?? 0.8
+        spoofBatteryState = dictionary["spoofBatteryState"] as? Int ?? 2
+        spoofLowPowerModeEnabled = dictionary["spoofLowPowerModeEnabled"] as? Bool ?? false
+        spoofSubscriberIdentifier = dictionary["spoofSubscriberIdentifier"] as? String ?? ""
+        spoofSubscriberCarrierTokenBase64 = dictionary["spoofSubscriberCarrierTokenBase64"] as? String ?? ""
+        spoofSubscriberSIMInsertedEnabled = dictionary["spoofSubscriberSIMInsertedEnabled"] as? Bool ?? false
+        spoofSubscriberSIMInserted = dictionary["spoofSubscriberSIMInserted"] as? Bool ?? false
+        spoofRadioAccessTechnology = dictionary["spoofRadioAccessTechnology"] as? String ?? ""
+        spoofHardwareModel = dictionary["spoofHardwareModel"] as? String ?? ""
+        loadSystemDisplayProfile(from: dictionary)
     }
 
     private func loadSystemDisplayProfile(from dictionary: [String: Any]) {
         spoofHostName = dictionary["spoofHostName"] as? String ?? ""
         spoofBoardModel = dictionary["spoofBoardModel"] as? String ?? ""
-        spoofKernelVersion = dictionary["spoofKernelVersion"] as? String ?? "Darwin Kernel Version 25.0.0"
+        spoofKernelVersion = dictionary["spoofKernelVersion"] as? String ?? "Darwin Kernel Version 26.2.0"
         spoofBootTime = dictionary["spoofBootTime"] as? Int64
             ?? Int64(Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime)
         spoofCPUType = dictionary["spoofCPUType"] as? Int ?? 16_777_228
         spoofCPUSubtype = dictionary["spoofCPUSubtype"] as? Int ?? 2
         spoofProcessorCount = dictionary["spoofProcessorCount"] as? Int ?? 6
-        spoofPhysicalMemory = dictionary["spoofPhysicalMemory"] as? Int64 ?? 6_442_450_944
+        spoofPhysicalMemory = dictionary["spoofPhysicalMemory"] as? Int64 ?? 8_589_934_592
         spoofThermalState = dictionary["spoofThermalState"] as? Int ?? 0
-        spoofScreenWidth = dictionary["spoofScreenWidth"] as? Double ?? 1179
-        spoofScreenHeight = dictionary["spoofScreenHeight"] as? Double ?? 2556
+        spoofScreenWidth = dictionary["spoofScreenWidth"] as? Double ?? 1206
+        spoofScreenHeight = dictionary["spoofScreenHeight"] as? Double ?? 2622
         spoofScreenScale = dictionary["spoofScreenScale"] as? Double ?? 3
         spoofScreenNativeScale = dictionary["spoofScreenNativeScale"] as? Double ?? 3
-        spoofMaximumFramesPerSecond = dictionary["spoofMaximumFramesPerSecond"] as? Int ?? 60
+        spoofMaximumFramesPerSecond = dictionary["spoofMaximumFramesPerSecond"] as? Int ?? 120
         spoofScreenBrightness = dictionary["spoofScreenBrightness"] as? Double ?? 0.5
-        spoofStorageTotalCapacity = dictionary["spoofStorageTotalCapacity"] as? Int64 ?? 137_438_953_472
-        spoofStorageAvailableCapacity = dictionary["spoofStorageAvailableCapacity"] as? Int64 ?? 68_719_476_736
-        spoofGPUName = dictionary["spoofGPUName"] as? String ?? "Apple GPU"
+        spoofStorageTotalCapacity = dictionary["spoofStorageTotalCapacity"] as? Int64 ?? 274_877_906_944
+        spoofStorageAvailableCapacity = dictionary["spoofStorageAvailableCapacity"] as? Int64 ?? 137_438_953_472
+        spoofGPUName = dictionary["spoofGPUName"] as? String ?? "Apple A19 Pro GPU"
         spoofAudioOutputVolume = dictionary["spoofAudioOutputVolume"] as? Double ?? 0.5
         spoofAudioSampleRate = dictionary["spoofAudioSampleRate"] as? Double ?? 48_000
         spoofAudioOutputLatency = dictionary["spoofAudioOutputLatency"] as? Double ?? 0.01
@@ -650,9 +711,9 @@ class LCContainer : ObservableObject, Hashable {
         spoofAudioOtherPlaying = dictionary["spoofAudioOtherPlaying"] as? Bool ?? false
         spoofAudioOutputChannels = dictionary["spoofAudioOutputChannels"] as? Int ?? 2
         spoofAudioInputChannels = dictionary["spoofAudioInputChannels"] as? Int ?? 1
-        spoofGPUWorkingSetSize = dictionary["spoofGPUWorkingSetSize"] as? Int64 ?? 4_294_967_296
+        spoofGPUWorkingSetSize = dictionary["spoofGPUWorkingSetSize"] as? Int64 ?? 6_442_450_944
         spoofGraphicsSupportsRayTracing = dictionary["spoofGraphicsSupportsRayTracing"] as? Bool ?? true
-        spoofGraphicsSupportsAllFamilies = dictionary["spoofGraphicsSupportsAllFamilies"] as? Bool ?? true
+        spoofGraphicsSupportsAllFamilies = dictionary["spoofGraphicsSupportsAllFamilies"] as? Bool ?? false
         spoofStorageVolumeName = dictionary["spoofStorageVolumeName"] as? String ?? "Data"
         spoofStorageVolumeUUID = dictionary["spoofStorageVolumeUUID"] as? String ?? "00000000-0000-0000-0000-000000000000"
         spoofStorageFileCreationTime = dictionary["spoofStorageFileCreationTime"] as? Int64 ?? 1_735_689_600
@@ -660,16 +721,17 @@ class LCContainer : ObservableObject, Hashable {
         spoofCustomUserAgent = dictionary["spoofCustomUserAgent"] as? String ?? ""
         spoofWebGLVendor = dictionary["spoofWebGLVendor"] as? String ?? "Apple Inc."
         spoofWebGLRenderer = dictionary["spoofWebGLRenderer"] as? String ?? "Apple GPU"
-        spoofWebCanvasDataURL = dictionary["spoofWebCanvasDataURL"] as? String ?? "data:image/png;base64,iVBORw0KGgo="
+        spoofWebCanvasDataURL = dictionary["spoofWebCanvasDataURL"] as? String
+            ?? "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         spoofWebColorDepth = dictionary["spoofWebColorDepth"] as? Int ?? 24
         spoofFeatureOverrides = dictionary["spoofFeatureOverrides"] as? [String: Bool] ?? [:]
-        spoofUserInterfaceStyle = dictionary["spoofUserInterfaceStyle"] as? Int ?? 1
+        spoofUserInterfaceStyle = dictionary["spoofUserInterfaceStyle"] as? Int ?? 0
         spoofAccessibilityContrast = dictionary["spoofAccessibilityContrast"] as? Int ?? 0
         spoofDisplayGamut = dictionary["spoofDisplayGamut"] as? Int ?? 2
         spoofHorizontalSizeClass = dictionary["spoofHorizontalSizeClass"] as? Int ?? 1
         spoofVerticalSizeClass = dictionary["spoofVerticalSizeClass"] as? Int ?? 2
         spoofPreferredContentSizeCategory = dictionary["spoofPreferredContentSizeCategory"] as? String ?? "UICTContentSizeCategoryL"
-        spoofSafeAreaTop = dictionary["spoofSafeAreaTop"] as? Double ?? 59
+        spoofSafeAreaTop = dictionary["spoofSafeAreaTop"] as? Double ?? 62
         spoofSafeAreaLeft = dictionary["spoofSafeAreaLeft"] as? Double ?? 0
         spoofSafeAreaBottom = dictionary["spoofSafeAreaBottom"] as? Double ?? 34
         spoofSafeAreaRight = dictionary["spoofSafeAreaRight"] as? Double ?? 0
@@ -693,7 +755,7 @@ class LCContainer : ObservableObject, Hashable {
         spoofGraphicsCategoryEnabled = dictionary["spoofGraphicsCategoryEnabled"] as? Bool ?? true
         spoofWebViewCategoryEnabled = dictionary["spoofWebViewCategoryEnabled"] as? Bool ?? true
         spoofAppPrivacyCategoryEnabled = dictionary["spoofAppPrivacyCategoryEnabled"] as? Bool ?? true
-        spoofSensorsAndUserDataCategoryEnabled = dictionary["spoofSensorsAndUserDataCategoryEnabled"] as? Bool ?? true
+        spoofSensorsAndUserDataCategoryEnabled = dictionary["spoofSensorsAndUserDataCategoryEnabled"] as? Bool ?? false
     }
 
     private func writeSystemDisplayProfile(to dictionary: inout [String: Any]) {

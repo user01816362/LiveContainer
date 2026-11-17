@@ -11,6 +11,8 @@ struct LCAppBannerConfiguration {
     let model: LCAppModel
     let dynamicColors: Bool
     let darkModeIcon: Bool
+    let updateCandidate: LCAppUpdateCandidate?
+    let activeDownload: LCDownloadTaskItem?
 }
 
 
@@ -40,18 +42,16 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
 
         preferredContentSize = CGSize(width: 0, height: LCAppBannerRootView.bannerHeight)
         bannerView.runControl.addTarget(self, action: #selector(runButtonTapped), for: .touchUpInside)
+        bannerView.updateButton.addTarget(self, action: #selector(updateButtonTapped), for: .touchUpInside)
         bannerView.addInteraction(UIContextMenuInteraction(delegate: self))
 
         let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(bannerDoubleTapped))
         doubleTapGesture.numberOfTapsRequired = 2
         doubleTapGesture.cancelsTouchesInView = false
         bannerView.addGestureRecognizer(doubleTapGesture)
-    }
 
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-        if previousTraitCollection == nil || traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
-            refreshView()
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _) in
+            self.refreshView()
         }
     }
 
@@ -62,13 +62,17 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
     func update(
         model: LCAppModel,
         dynamicColors: Bool,
-        darkModeIcon: Bool
+        darkModeIcon: Bool,
+        updateCandidate: LCAppUpdateCandidate?,
+        activeDownload: LCDownloadTaskItem?
     ) {
         loadViewIfNeeded()
         configuration = LCAppBannerConfiguration(
             model: model,
             dynamicColors: dynamicColors,
-            darkModeIcon: darkModeIcon
+            darkModeIcon: darkModeIcon,
+            updateCandidate: updateCandidate,
+            activeDownload: activeDownload
         )
         refreshView()
     }
@@ -79,26 +83,34 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             appInfo: configuration.model.appInfo,
             dynamicColors: configuration.dynamicColors,
             darkModeIcon: configuration.darkModeIcon,
+            updateCandidate: configuration.updateCandidate,
+            activeDownload: configuration.activeDownload,
             traitCollection: traitCollection
         )
     }
 
     @objc private func bannerDoubleTapped(_ gestureRecognizer: UITapGestureRecognizer) {
         let location = gestureRecognizer.location(in: bannerView.runControl)
-        guard !bannerView.runControl.bounds.contains(location) else {
+        let updateLoc = gestureRecognizer.location(in: bannerView.updateButton)
+        guard !bannerView.runControl.bounds.contains(location),
+              !(!bannerView.updateButton.isHidden && bannerView.updateButton.bounds.contains(updateLoc)) else {
             return
         }
         openSettings()
     }
 
+    @objc private func updateButtonTapped() {
+        if configuration.activeDownload != nil {
+            LCDownloadManager.shared.isQueueSheetPresented = true
+        } else if let candidate = configuration.updateCandidate {
+            AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
+        }
+    }
+
     @objc private func runButtonTapped() {
-        if #available(iOS 16.0, *),
-           let currentDataFolder = configuration.model.uiSelectedContainer?.folderName,
+        if let currentDataFolder = configuration.model.uiSelectedContainer?.folderName,
            MultitaskManager.isUsing(container: currentDataFolder) {
-            var found = false
-            if #available(iOS 16.1, *) {
-                found = MultitaskWindowManager.openExistingAppWindow(dataUUID: currentDataFolder)
-            }
+            var found = MultitaskWindowManager.openExistingAppWindow(dataUUID: currentDataFolder)
             if !found {
                 found = MultitaskDockManager.shared.bringMultitaskViewToFront(uuid: currentDataFolder)
             }
@@ -136,6 +148,25 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         let appInfo = model.appInfo
         var menuChildren: [UIMenuElement] = []
 
+        // Update Menu Section
+        if let candidate = configuration.updateCandidate {
+            let updateActions = [
+                UIAction(
+                    title: "Update to \(candidate.latestDisplayVersion)",
+                    image: UIImage(systemName: "arrow.down.circle.fill")
+                ) { _ in
+                    AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
+                },
+                UIAction(
+                    title: "Ignore Version \(candidate.latestVersion.version)",
+                    image: UIImage(systemName: "eye.slash")
+                ) { _ in
+                    AltStoreSourcesViewModel.shared.ignoreUpdate(candidate)
+                }
+            ]
+            menuChildren.append(UIMenu(title: "Update Available", options: .displayInline, children: updateActions))
+        }
+
         // 1. Containers Picker (Equivalent to a Menu with single selection)
         if model.uiContainers.count > 1 {
             let containerActions = model.uiContainers.map { [weak self] container in
@@ -162,17 +193,22 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         }
 
         // Multitask Toggle
-        if #available(iOS 16.0, *) {
-            let shouldLaunchInMultitaskMode = model.shouldLaunchInMultitaskMode
-            sectionChildren.append(UIAction(
-                title: shouldLaunchInMultitaskMode ? "lc.appBanner.run".loc : "lc.appBanner.multitask".loc,
-                image: UIImage(systemName: shouldLaunchInMultitaskMode ? "play.fill" : "macwindow.badge.plus")
-            ) { [weak self] _ in
-                Task { [weak self] in
-                    await self?.runApp(multitask: !shouldLaunchInMultitaskMode)
-                }
-            })
-        }
+        let shouldLaunchInMultitaskMode = model.shouldLaunchInMultitaskMode
+        sectionChildren.append(UIAction(
+            title: shouldLaunchInMultitaskMode ? "lc.appBanner.run".loc : "lc.appBanner.multitask".loc,
+            image: UIImage(systemName: shouldLaunchInMultitaskMode ? "play.fill" : "macwindow.badge.plus")
+        ) { [weak self] _ in
+            Task { [weak self] in
+                await self?.runApp(multitask: !shouldLaunchInMultitaskMode)
+            }
+        })
+
+        sectionChildren.append(UIAction(
+            title: "Launch in Debug Studio",
+            image: UIImage(systemName: "ladybug.fill")
+        ) { _ in
+            DataManager.shared.model.activeDebugApp = model
+        })
 
         let addToHomeScreenMenu = UIMenu(
             title: "lc.appBanner.addToHomeScreen".loc,

@@ -10,6 +10,7 @@ final class LCAppBannerRootView: UIView {
     static let bannerHeight: CGFloat = 88
 
     let runControl = LCAppBannerRunControl()
+    let updateButton = UIButton(type: .system)
 
     private let visualBackgroundView = UIView()
     private let iconImageView = UIImageView()
@@ -24,6 +25,7 @@ final class LCAppBannerRootView: UIView {
     private let nameSpacer = UIView()
     private let nameStack = UIStackView()
     private let detailStack = UIStackView()
+    private let trailingControlsStack = UIStackView()
 
     override var intrinsicContentSize: CGSize {
         CGSize(width: UIView.noIntrinsicMetric, height: Self.bannerHeight)
@@ -90,10 +92,25 @@ final class LCAppBannerRootView: UIView {
         detailStack.isAccessibilityElement = true
 
         runControl.translatesAutoresizingMaskIntoConstraints = false
+        updateButton.translatesAutoresizingMaskIntoConstraints = false
+        var updateConfig = UIButton.Configuration.filled()
+        updateConfig.cornerStyle = .capsule
+        updateConfig.buttonSize = .small
+        updateConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        updateButton.configuration = updateConfig
+        updateButton.isHidden = true
+
+        trailingControlsStack.translatesAutoresizingMaskIntoConstraints = false
+        trailingControlsStack.axis = .horizontal
+        trailingControlsStack.alignment = .center
+        trailingControlsStack.spacing = 8
+        trailingControlsStack.addArrangedSubview(updateButton)
+        trailingControlsStack.addArrangedSubview(runControl)
+
         addSubview(visualBackgroundView)
         addSubview(iconImageView)
         addSubview(detailStack)
-        addSubview(runControl)
+        addSubview(trailingControlsStack)
 
         NSLayoutConstraint.activate([
             visualBackgroundView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -107,11 +124,11 @@ final class LCAppBannerRootView: UIView {
             iconImageView.heightAnchor.constraint(equalToConstant: 60),
 
             detailStack.leadingAnchor.constraint(equalTo: iconImageView.trailingAnchor, constant: 10),
-            detailStack.trailingAnchor.constraint(lessThanOrEqualTo: runControl.leadingAnchor, constant: -10),
+            detailStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingControlsStack.leadingAnchor, constant: -10),
             detailStack.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            runControl.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            runControl.centerYAnchor.constraint(equalTo: centerYAnchor),
+            trailingControlsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            trailingControlsStack.centerYAnchor.constraint(equalTo: centerYAnchor),
             runControl.widthAnchor.constraint(equalToConstant: 70),
             runControl.heightAnchor.constraint(equalToConstant: 32)
         ])
@@ -129,6 +146,8 @@ final class LCAppBannerRootView: UIView {
         appInfo: LCAppInfo,
         dynamicColors: Bool,
         darkModeIcon: Bool,
+        updateCandidate: LCAppUpdateCandidate?,
+        activeDownload: LCDownloadTaskItem?,
         traitCollection: UITraitCollection
     ) {
         let icon = appInfo.iconIsDarkIcon(darkModeIcon) ?? UIImage()
@@ -165,6 +184,29 @@ final class LCAppBannerRootView: UIView {
             progress: model.signProgress,
             isEnabled: !model.isAppRunning
         )
+
+        if let activeDownload {
+            var config = updateButton.configuration ?? UIButton.Configuration.filled()
+            config.baseBackgroundColor = accentColor.withAlphaComponent(0.85)
+            config.baseForegroundColor = .white
+            config.image = UIImage(systemName: "arrow.down.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
+            config.imagePadding = 4
+            let pct = Int((activeDownload.progress * 100).rounded())
+            config.title = pct > 0 ? "\(pct)%" : "…"
+            updateButton.configuration = config
+            updateButton.isHidden = false
+        } else if updateCandidate != nil {
+            var config = updateButton.configuration ?? UIButton.Configuration.filled()
+            config.baseBackgroundColor = .systemBlue
+            config.baseForegroundColor = .white
+            config.image = UIImage(systemName: "arrow.down.circle.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
+            config.imagePadding = 4
+            config.title = "Update"
+            updateButton.configuration = config
+            updateButton.isHidden = false
+        } else {
+            updateButton.isHidden = true
+        }
 
         var accessibilityParts = [model.displayName, "\(model.version) - \(model.bundleIdentifier)"]
         if !model.uiRemark.isEmpty {

@@ -47,6 +47,12 @@ typedef NS_ENUM(NSInteger, MultitaskSpecified){
 @property bool spoofSDKVersion;
 @property (nonatomic, strong) NSString* jitLaunchScriptJs;
 @property (nonatomic, strong) NSString* selected32BitEmulator;
+@property (nonatomic, copy) NSString* sourceURL;
+@property (nonatomic, copy) NSString* installedSourceVersion;
+@property (nonatomic, copy) NSString* installedSourceBuildVersion;
+@property (nonatomic, copy) NSString* ignoredUpdateVersion;
+@property bool debugModeEnabled;
+@property bool exportTweakSymbolsGlobally;
 @property NSDate* lastLaunched;
 @property NSDate* installationDate;
 @property NSString* remark;
@@ -68,6 +74,8 @@ typedef NS_ENUM(NSInteger, MultitaskSpecified){
 - (NSString*)bundlePath;
 - (NSString*)bundleIdentifier;
 - (NSString*)version;
+- (NSString*)shortVersion;
+- (NSString*)buildVersion;
 - (NSMutableArray<NSString *>*)urlSchemes;
 - (instancetype)initWithBundlePath:(NSString*)bundlePath;
 - (UIImage *)generateLiveContainerWrappedIconWithStyle:(GeneratedIconStyle)style;

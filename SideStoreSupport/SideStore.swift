@@ -9,7 +9,6 @@ import Foundation
 import AppIntents
 import UserNotifications
 
-@available(iOS 17.0, *)
 func performIntentRefresh(identifier: String, mangledTypeName: String, intentProgress: Progress) async throws {
     intentProgress.totalUnitCount = 100
     if UserDefaults.isSideStore() {
@@ -20,7 +19,6 @@ func performIntentRefresh(identifier: String, mangledTypeName: String, intentPro
     }
 }
 
-@available(iOS 17.0, *)
 public struct RefreshAllAppsWidgetIntent: AppIntent, ProgressReportingIntent
 {
     public static var title: LocalizedStringResource { "Refresh Apps via Widget" }
@@ -35,10 +33,10 @@ public struct RefreshAllAppsWidgetIntent: AppIntent, ProgressReportingIntent
     }
 }
 
-@available(iOS 17.0, *)
-public struct RefreshAllAppsIntent: AppIntent, CustomIntentMigratedAppIntent, PredictableIntent, ProgressReportingIntent, ForegroundContinuableIntent
+public struct RefreshAllAppsIntent: AppIntent, CustomIntentMigratedAppIntent, PredictableIntent, ProgressReportingIntent
 {
     public static let intentClassName = "RefreshAllIntent"
+    public static var supportedModes: IntentModes { [.background, .foreground(.dynamic)] }
     
     public static var title: LocalizedStringResource = "Refresh All Apps"
     public static var description = IntentDescription("Refreshes your sideloaded apps to prevent them from expiring.")
@@ -85,9 +83,9 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
     }
 
     func startRefresh(identifier: String, mangledName: String) async throws {
-        if sideStorePid <= 0 || getpgid(sideStorePid) <= 0, let c {
-            c.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"]))
+        if sideStorePid <= 0 || getpgid(sideStorePid) <= 0, let continuation = self.c {
             self.c = nil
+            continuation.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"]))
         }
         
         if c != nil {
@@ -106,9 +104,12 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
 
         // launch SideStore if it's not running
         if (sideStorePid <= 0 || getpgid(sideStorePid) <= 0) && launchContinuation == nil {
-            let lcHome = String(cString:getenv("LC_HOME_PATH"))
+            let lcHome = getenv("LC_HOME_PATH").map { String(cString: $0) } ?? NSHomeDirectory()
             let sideStoreHomeURL = URL(fileURLWithPath: lcHome).appendingPathComponent("Documents/SideStore")
-            let bookmarkData = bookmarkForURL(sideStoreHomeURL)!
+            try FileManager.default.createDirectory(at: sideStoreHomeURL, withIntermediateDirectories: true)
+            guard let bookmarkData = bookmarkForURL(sideStoreHomeURL) else {
+                throw NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to create security-scoped bookmark for SideStore data folder."])
+            }
 
             // start LiveProcess
             let extensionItem = NSExtensionItem()
@@ -138,10 +139,16 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
             self.ext = ext
             
             ext.setRequestInterruptionBlock { uuid in
-                self.c?.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"]))
-                self.c = nil
+                let crashError = NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"])
+                if let pendingLaunch = self.launchContinuation {
+                    self.launchContinuation = nil
+                    pendingLaunch.resume(throwing: crashError)
+                }
+                if let pendingRefresh = self.c {
+                    self.c = nil
+                    pendingRefresh.resume(throwing: crashError)
+                }
                 self.sideStorePid = 0
-                self.launchContinuation = nil
             }
             
             let uuid = await ext.beginRequest(withInputItems: [extensionItem])
@@ -151,8 +158,8 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
                 self.launchContinuation = c
                 DispatchQueue.main.asyncAfter(deadline: .now() + 300) {
                     if let c = self.launchContinuation {
-                        c.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore failed to start in reasonable time"]))
                         self.launchContinuation = nil
+                        c.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore failed to start in reasonable time"]))
                         self.terminateSideStoreIfNeeded()
                     }
                 }
@@ -171,12 +178,12 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
     }
     
     func finish(_ error: String?) {
+        guard let continuation = self.c else { return }
+        self.c = nil
         if let error {
-            c?.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: error]))
-            c = nil
+            continuation.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: error]))
         } else {
-            c?.resume()
-            c = nil
+            continuation.resume()
         }
     }
     
@@ -186,8 +193,9 @@ final class RefreshHandler: NSObject, RefreshServer, @unchecked Sendable {
     }
     
     func finishedLaunching() {
-        launchContinuation?.resume()
-        launchContinuation = nil
+        guard let continuation = self.launchContinuation else { return }
+        self.launchContinuation = nil
+        continuation.resume()
     }
 
     func add(_ request: UNNotificationRequest) {

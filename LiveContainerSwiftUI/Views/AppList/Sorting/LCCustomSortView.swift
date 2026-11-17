@@ -9,7 +9,7 @@ import Combine
 
 struct LCCustomSortView: View {
     @EnvironmentObject private var sharedModel: SharedModel
-    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.dismiss) private var dismiss
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) var darkModeIcon = false
     
     // Local state for editing without modifying shared model
@@ -17,7 +17,7 @@ struct LCCustomSortView: View {
     @State private var localHiddenApps: [LCAppModel] = []
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
                 // Visible apps section
                 if !localApps.isEmpty {
@@ -131,7 +131,7 @@ struct LCCustomSortView: View {
     }
     
     private func cancelChanges() {
-        presentationMode.wrappedValue.dismiss()
+        dismiss()
     }
     
     private func saveChanges() {
@@ -143,6 +143,6 @@ struct LCCustomSortView: View {
         manager.customSortOrder = newCustomOrder
         manager.appSortType = .custom
         
-        presentationMode.wrappedValue.dismiss()
+        dismiss()
     }
 }

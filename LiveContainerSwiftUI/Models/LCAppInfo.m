@@ -109,6 +109,14 @@
     }
 }
 
+- (NSString*)shortVersion {
+    return _infoPlist[@"CFBundleShortVersionString"];
+}
+
+- (NSString*)buildVersion {
+    return _infoPlist[@"CFBundleVersion"];
+}
+
 - (NSString*)version {
     NSString* version = _infoPlist[@"CFBundleShortVersionString"];
     if (!version) {
@@ -195,7 +203,10 @@
     
     if([NSFileManager.defaultManager fileExistsAtPath:cachedIconPath]) {
         CGImageRef imageRef = loadCGImageFromURL(cachedIconUrl);
-        uiIcon = [UIImage imageWithCGImage:imageRef];
+        if (imageRef) {
+            uiIcon = [UIImage imageWithCGImage:imageRef];
+            CGImageRelease(imageRef);
+        }
     }
     
     // generate and save icon cache to disk
@@ -233,15 +244,19 @@
     }
 
     UIImage *lcIcon = [UIImage imageNamed:@"AppIcon60x60@2x"];
+    if (!lcIcon || lcIcon.size.width <= 0 || lcIcon.size.height <= 0) {
+        return icon;
+    }
     CGFloat iconXY = (lcIcon.size.width - 40) / 2;
-    UIGraphicsBeginImageContextWithOptions(lcIcon.size, NO, 0.0);
-    [lcIcon drawInRect:CGRectMake(0, 0, lcIcon.size.width, lcIcon.size.height)];
-    CGRect rect = CGRectMake(iconXY, iconXY, 40, 40);
-    [[UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:7] addClip];
-    [icon drawInRect:rect];
-    UIImage *newIcon = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return newIcon;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:lcIcon.size format:format];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+        [lcIcon drawInRect:CGRectMake(0, 0, lcIcon.size.width, lcIcon.size.height)];
+        CGRect rect = CGRectMake(iconXY, iconXY, 40, 40);
+        [[UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:7] addClip];
+        [icon drawInRect:rect];
+    }];
 }
 
 - (NSDictionary *)generateWebClipConfigWithContainerId:(NSString*)containerId iconStyle:(GeneratedIconStyle)style{
@@ -427,6 +442,7 @@
 
         // copy remove rename
         NSString *executable = plist[@"CFBundleExecutable"];
+        if (![executable isKindOfClass:NSString.class] || executable.length == 0) continue;
         NSString *path = [bundlePath stringByAppendingPathComponent:executable];
         NSString *temporaryPath = [path stringByAppendingString:@".lcpatch"];
         NSError *fileError = nil;
@@ -441,7 +457,7 @@
             hasARM64 = YES;
             encrypted |= LCIsMachOEncrypted(header);
             if (!encrypted) {
-                mismatch |= (LCPatchExecSlice(path.fileSystemRepresentation, header, false) & PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH) != 0;
+                mismatch |= (LCPatchExecSlice(slicePath, header, false) & PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH) != 0;
             }
         });
         if (!error && (!hasARM64 || encrypted)) {
@@ -511,7 +527,6 @@
         return cachedMode.unsignedIntegerValue;
     }
 
-    NSError *error = nil;
     NSNumber *mode = LCGetDefaultClassicMode([NSURL fileURLWithPath:self.bundlePath]);
 
     _info[@"LCClassicModeCache"] = @{
@@ -668,7 +683,7 @@
 }
 
 - (MultitaskSpecified)multitaskSpecified {
-    return (LCOrientationLock) [((NSNumber*) _info[@"MultitaskSpecified"]) intValue];
+    return (MultitaskSpecified) [((NSNumber*) _info[@"MultitaskSpecified"]) intValue];
 }
 - (void)setMultitaskSpecified:(MultitaskSpecified)multitaskSpecified {
     _info[@"MultitaskSpecified"] = [NSNumber numberWithInt:(int) multitaskSpecified];
@@ -981,6 +996,76 @@
     [_info removeObjectForKey:@"autoCleanHistory"];
     [_info removeObjectForKey:@"lastAutoCleanDate"];
     [_info removeObjectForKey:@"autoCleanTotalBytesSaved"];
+    [self save];
+}
+
+- (NSString *)sourceURL {
+    return _info[@"LCSourceURL"];
+}
+
+- (void)setSourceURL:(NSString *)sourceURL {
+    if (sourceURL.length > 0) {
+        _info[@"LCSourceURL"] = [sourceURL copy];
+    } else {
+        [_info removeObjectForKey:@"LCSourceURL"];
+    }
+    [self save];
+}
+
+- (NSString *)installedSourceVersion {
+    return _info[@"LCInstalledSourceVersion"];
+}
+
+- (void)setInstalledSourceVersion:(NSString *)installedSourceVersion {
+    if (installedSourceVersion.length > 0) {
+        _info[@"LCInstalledSourceVersion"] = [installedSourceVersion copy];
+    } else {
+        [_info removeObjectForKey:@"LCInstalledSourceVersion"];
+    }
+    [self save];
+}
+
+- (NSString *)installedSourceBuildVersion {
+    return _info[@"LCInstalledSourceBuildVersion"];
+}
+
+- (void)setInstalledSourceBuildVersion:(NSString *)installedSourceBuildVersion {
+    if (installedSourceBuildVersion.length > 0) {
+        _info[@"LCInstalledSourceBuildVersion"] = [installedSourceBuildVersion copy];
+    } else {
+        [_info removeObjectForKey:@"LCInstalledSourceBuildVersion"];
+    }
+    [self save];
+}
+
+- (NSString *)ignoredUpdateVersion {
+    return _info[@"LCIgnoredUpdateVersion"];
+}
+
+- (void)setIgnoredUpdateVersion:(NSString *)ignoredUpdateVersion {
+    if (ignoredUpdateVersion.length > 0) {
+        _info[@"LCIgnoredUpdateVersion"] = [ignoredUpdateVersion copy];
+    } else {
+        [_info removeObjectForKey:@"LCIgnoredUpdateVersion"];
+    }
+    [self save];
+}
+
+- (bool)debugModeEnabled {
+    return [_info[@"LCDebugModeEnabled"] boolValue];
+}
+
+- (void)setDebugModeEnabled:(bool)debugModeEnabled {
+    _info[@"LCDebugModeEnabled"] = @(debugModeEnabled);
+    [self save];
+}
+
+- (bool)exportTweakSymbolsGlobally {
+    return [_info[@"exportTweakSymbolsGlobally"] boolValue];
+}
+
+- (void)setExportTweakSymbolsGlobally:(bool)exportTweakSymbolsGlobally {
+    _info[@"exportTweakSymbolsGlobally"] = @(exportTweakSymbolsGlobally);
     [self save];
 }
 

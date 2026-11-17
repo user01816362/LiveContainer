@@ -73,20 +73,18 @@ class SharedModel: ObservableObject {
     @Published var hiddenApps : [LCAppModel] = []
     
     @Published var pidCallback : ((NSNumber, Error?) -> Void)? = nil
+    @Published var activeDebugApp : LCAppModel? = nil
+    var appModelDelegate : LCAppModelDelegate? = nil
     
     static let isPhone: Bool = {
         UIDevice.current.userInterfaceIdiom == .phone
     }()
     
-    static let isLiquidGlassEnabled = {
-        if #available(iOS 19.0, *), (dyld_get_program_sdk_version() >= 0x1a0000 || UserDefaults.standard.bool(forKey: "com.apple.SwiftUI.IgnoreSolariumLinkedOnCheck")) {
-            if let compatibilityEnabled = Bundle.main.infoDictionary?["UIDesignRequiresCompatibility"] as? Bool, compatibilityEnabled {
-                return false
-            }
-            
-            return true
+    static let isLiquidGlassEnabled: Bool = {
+        if let compatibilityEnabled = Bundle.main.infoDictionary?["UIDesignRequiresCompatibility"] as? Bool, compatibilityEnabled {
+            return false
         }
-        return false
+        return true
     }()
     
     var mainWindowOpened = false
@@ -109,6 +107,9 @@ class SharedModel: ObservableObject {
 class DataManager {
     static let shared = DataManager()
     let model = SharedModel()
+    @MainActor var sourcesViewModel: AltStoreSourcesViewModel {
+        AltStoreSourcesViewModel.shared
+    }
 }
 
 class AlertHelper<T> : ObservableObject {
@@ -202,22 +203,34 @@ extension Color {
     func readableTextColor() -> Color {
         let color = Color(.systemBackground)
         let percentage = 0.5
-        
-        // https://stackoverflow.com/a/78649412
-        let components1 = UIColor(self).cgColor.components!
+
+        var fgR: CGFloat = 0, fgG: CGFloat = 0, fgB: CGFloat = 0, fgA: CGFloat = 0
+        if !UIColor(self).getRed(&fgR, green: &fgG, blue: &fgB, alpha: &fgA) {
+            var white: CGFloat = 0.5
+            if UIColor(self).getWhite(&white, alpha: &fgA) {
+                fgR = white
+                fgG = white
+                fgB = white
+            }
+        }
         var bgR: CGFloat = 0, bgG: CGFloat = 0, bgB: CGFloat = 0, bgA: CGFloat = 0
-        UIColor(color).getRed(&bgR, green: &bgG, blue: &bgB, alpha: &bgA)
-        var red = (1.0 - percentage) * components1[0] + percentage * bgR
-        var green = (1.0 - percentage) * components1[1] + percentage * bgG
-        var blue = (1.0 - percentage) * components1[2] + percentage * bgB
-        //var alpha = (1.0 - percentage) * components1[3] + percentage * bgA
-        //UIColor(mix(with: Color(.systemBackground), by: 0.5)).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        if !UIColor(color).getRed(&bgR, green: &bgG, blue: &bgB, alpha: &bgA) {
+            var white: CGFloat = 0.5
+            if UIColor(color).getWhite(&white, alpha: &bgA) {
+                bgR = white
+                bgG = white
+                bgB = white
+            }
+        }
+        var red = (1.0 - percentage) * fgR + percentage * bgR
+        var green = (1.0 - percentage) * fgG + percentage * bgG
+        var blue = (1.0 - percentage) * fgB + percentage * bgB
         
-        let brightness = (0.2126*red + 0.7152*green + 0.0722*blue);
+        let brightness = (0.2126*red + 0.7152*green + 0.0722*blue)
         let brightnessOffset = brightness < 0.5 ? 0.4 : -0.4
-        red = min(Double(red) + brightnessOffset, 1.0)
-        green = min(Double(green) + brightnessOffset, 1.0)
-        blue = min(Double(blue) + brightnessOffset, 1.0)
+        red = min(max(Double(red) + brightnessOffset, 0.0), 1.0)
+        green = min(max(Double(green) + brightnessOffset, 0.0), 1.0)
+        blue = min(max(Double(blue) + brightnessOffset, 0.0), 1.0)
         return Color(red: red, green: green, blue: blue)
     }
 }

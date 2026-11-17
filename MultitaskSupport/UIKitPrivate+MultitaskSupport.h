@@ -79,7 +79,7 @@ extern const UIApplication *UIApp;
 @end
 
 @interface FBScene : NSObject
-@property(nonatomic, assign, readonly) _UISceneRelationshipManagementHostComponent *_relationshipManagementHostComponent API_AVAILABLE(ios(17.4));
+@property(nonatomic, assign, readonly) _UISceneRelationshipManagementHostComponent *_relationshipManagementHostComponent;
 @property(nonatomic, readonly) id delegate;
 - (FBProcess *)clientProcess;
 - (UIScenePresentationManager *)uiPresentationManager;
@@ -89,7 +89,7 @@ extern const UIApplication *UIApp;
 - (void)updateSettingsWithTransitionBlock:(UIApplicationSceneTransitionContext *(^)(/* FBSMutableSceneSettings * */ id settings))transitionBlock;
 - (void)addExtension:(Class)extension;
 - (void)configureParameters:(void(^)(FBSMutableSceneParameters *parameters))parametersBlock;
-- (id)ui_viewServiceComponent;// API_AVAILABLE(ios(26.0));
+- (id)ui_viewServiceComponent;
 @end
 
 @interface FBDisplayManager : NSObject
@@ -160,7 +160,7 @@ extern const UIApplication *UIApp;
 @property(nonatomic, strong, readwrite) NSString *persistenceIdentifier;
 @property (nonatomic, assign, readwrite) UIEdgeInsets peripheryInsets;
 @property (nonatomic, assign, readwrite) UIEdgeInsets safeAreaInsetsPortrait, safeAreaInsetsPortraitUpsideDown, safeAreaInsetsLandscapeLeft, safeAreaInsetsLandscapeRight;
-@property (nonatomic, assign, readwrite) UIEdgeInsets safeAreaEdgeInsets API_AVAILABLE(ios(19.0));
+@property (nonatomic, assign, readwrite) UIEdgeInsets safeAreaEdgeInsets;
 @property(assign, nonatomic, readwrite) UIUserInterfaceStyle userInterfaceStyle;
 @property(assign, nonatomic, readwrite) UIDeviceOrientation deviceOrientation;
 @property (nonatomic, strong, readwrite) BSCornerRadiusConfiguration *cornerRadiusConfiguration;
@@ -208,7 +208,6 @@ extern const UIApplication *UIApp;
 - (void)_performActionsForUIScene:(UIScene *)scene withUpdatedFBSScene:(id)fbsScene settingsDiff:(FBSSceneSettingsDiff *)diff fromSettings:(id)settings transitionContext:(id)context lifecycleActionType:(uint32_t)actionType;
 @end
 
-API_AVAILABLE(ios(17.0))
 @interface _UIFluidSliderInteraction : NSObject
 @end
 
@@ -289,38 +288,34 @@ API_AVAILABLE(ios(17.0))
 @end
 
 /// The following private API is used to properly configure keyboard focus for iOS 17.4+
-API_AVAILABLE(ios(17.4))
 @interface _UISceneHostingControllerAdvancedConfiguration : NSObject
 @property(retain, nonatomic) UIApplicationSceneSpecification *sceneSpecification;
-@property(retain, nonatomic) NSOrderedSet *additionalExtensions API_AVAILABLE(ios(18.0));
+@property(retain, nonatomic) NSOrderedSet *additionalExtensions;
 - (instancetype)initWithProcessIdentity:(RBSProcessIdentity *)identity;
 @end
 
-API_AVAILABLE(ios(17.0))
 @interface _UISceneHostingView : UIView
 - (id)_remoteSheetProvider;
 - (_UIScenePresenter *)_scenePresenter;
 - (void)_applyOverridesToHostedSceneSettings:(UIMutableApplicationSceneSettings *)settings;
-- (void)applyViewGeometryToSettings:(UIMutableApplicationSceneSettings *)settings API_AVAILABLE(ios(19.0));
+- (void)applyViewGeometryToSettings:(UIMutableApplicationSceneSettings *)settings;
 @end
-API_AVAILABLE(ios(17.0))
 @interface _UISceneHostingController : NSObject
-- (instancetype)initWithAdvancedConfiguration:(_UISceneHostingControllerAdvancedConfiguration *)config API_AVAILABLE(ios(17.4));
-//- (instancetype)initWithProcessIdentity:(RBSProcessIdentity *)identity sceneSpecification:(FBSSceneSpecification *)spec API_AVAILABLE(ios(17.0));
-- (_UISceneEventDeferringHostComponent *)_eventDeferringComponent API_AVAILABLE(ios(17.4));
-- (_UISceneHostingView *)sceneView API_AVAILABLE(ios(17.0));
-- (UIViewController *)sceneViewController; // API_AVAILABLE(ios(17.0))
-- (void)invalidate; // API_AVAILABLE(ios(17.0))
+- (instancetype)initWithAdvancedConfiguration:(_UISceneHostingControllerAdvancedConfiguration *)config;
+//- (instancetype)initWithProcessIdentity:(RBSProcessIdentity *)identity sceneSpecification:(FBSSceneSpecification *)spec;
+- (_UISceneEventDeferringHostComponent *)_eventDeferringComponent;
+- (_UISceneHostingView *)sceneView;
+- (UIViewController *)sceneViewController;
+- (void)invalidate;
 @end
 
-API_AVAILABLE(ios(17.4)) // 17.0
 // iOS 17.0-26.x the class was named _UISceneHostingEventDeferringHostComponent
 @interface _UISceneEventDeferringHostComponent : NSObject
-@property(nonatomic) NSInteger grantBehavior API_AVAILABLE(ios(27.0));
-@property(nonatomic) NSInteger selectionRequestBehavior API_AVAILABLE(ios(27.0));
+@property(nonatomic) NSInteger grantBehavior;
+@property(nonatomic) NSInteger selectionRequestBehavior;
 //@property(nonatomic) BOOL maintainHostFirstResponderWhenClientWantsKeyboard;
 //@property(nonatomic) BOOL requestEventDeferralForAllFirstResponderChanges;
-- (void)setFirstResponderTrackingSelectionPath:(UIViewController *)path API_AVAILABLE(ios(27.0));
+- (void)setFirstResponderTrackingSelectionPath:(UIViewController *)path;
 @end
 
 // Not really private ones

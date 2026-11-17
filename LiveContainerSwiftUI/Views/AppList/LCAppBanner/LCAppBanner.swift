@@ -20,33 +20,52 @@ struct LCAppBanner: UIViewControllerRepresentable {
     var delegate: LCAppBannerDelegate
 
     @ObservedObject var model: LCAppModel
+    @ObservedObject private var sourcesVM = AltStoreSourcesViewModel.shared
+    @EnvironmentObject private var downloadManager: LCDownloadManager
 
     @AppStorage("dynamicColors", store: LCUtils.appGroupUserDefault) private var dynamicColors = true
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) private var darkModeIcon = false
-    private let sharedModel = DataManager.shared.model
 
     init(appModel: LCAppModel, delegate: LCAppBannerDelegate) {
         _model = ObservedObject(wrappedValue: appModel)
         self.delegate = delegate
     }
 
+    private func currentUpdateAndDownload() -> (LCAppUpdateCandidate?, LCDownloadTaskItem?) {
+        let candidate = sourcesVM.updateCandidate(for: model)
+        let dl = (model.appInfo.relativeBundlePath.flatMap { downloadManager.activeTask(forBundleId: $0) })
+            ?? downloadManager.activeTask(forBundleId: model.bundleIdentifier)
+        return (candidate, dl)
+    }
+
     func makeUIViewController(context: Context) -> UIViewController {
-        let viewController = LCAppBannerViewController(delegate: delegate, config: LCAppBannerConfiguration(model: model, dynamicColors: dynamicColors, darkModeIcon: darkModeIcon))
-        return viewController
+        let (candidate, dl) = currentUpdateAndDownload()
+        return LCAppBannerViewController(
+            delegate: delegate,
+            config: LCAppBannerConfiguration(
+                model: model,
+                dynamicColors: dynamicColors,
+                darkModeIcon: darkModeIcon,
+                updateCandidate: candidate,
+                activeDownload: dl
+            )
+        )
     }
 
     func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
         guard let viewController = uiViewController as? LCAppBannerViewController else {
             return
         }
+        let (candidate, dl) = currentUpdateAndDownload()
         viewController.update(
             model: model,
             dynamicColors: dynamicColors,
-            darkModeIcon: darkModeIcon
+            darkModeIcon: darkModeIcon,
+            updateCandidate: candidate,
+            activeDownload: dl
         )
     }
 
-    @available(iOS 16.0, *)
     func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: UIViewController, context: Context) -> CGSize? {
         guard let width = proposal.width else {
             return nil

@@ -7,6 +7,7 @@ typedef int	vm_prot_t;
 /*
  * Capability bits used in the definition of cpu_type.
  */
+#ifndef CPU_TYPE_ANY
 #define	CPU_ARCH_MASK				0xff000000		/* mask for architecture bits */
 #define CPU_ARCH_ABI64				0x01000000		/* 64 bit ABI */
 #define CPU_ARCH_ABI64_32 			0x02000000		
@@ -125,6 +126,7 @@ typedef int	vm_prot_t;
 #define CPU_SUBTYPE_ARM64_V8 		1
 #define CPU_SUBTYPE_ARM64E 			2
 #define CPU_SUBTYPE_ARM64_32_V8		1
+#endif
 
 
 #define FAT_MAGIC 		0xcafebabe

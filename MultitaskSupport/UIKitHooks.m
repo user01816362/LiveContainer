@@ -21,8 +21,7 @@ UIEdgeInsets LCUIEdgeInsetsRotateToOrientation(UIEdgeInsets insets, UIInterfaceO
     }
 }
 
-// Fix _UIPrototypingMenuSlider not continually updating its value on iOS 17+
-API_AVAILABLE(ios(17.0))
+// Fix _UIPrototypingMenuSlider not continually updating its value
 @implementation _UIFluidSliderInteraction(Hook)
 - (NSInteger)_state {
     return 2;
@@ -34,8 +33,6 @@ API_AVAILABLE(ios(17.0))
 @end
 
 /// Hook to fix safe area scaling and orientation. We use superview's safeAreaInsets because self one tends to bug out with certain scaling, and also allows us to customize safe area while in PiP mode later on.
-/// This hook applies across 18.0-27.0. 17.4+ is uncertain.
-API_AVAILABLE(ios(17.0))
 void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (^updateBlock)(UIMutableApplicationSceneSettings *, FBSSceneTransitionContext *)) {
     // We don't wanna mess up system extensions on iOS 26+
     if(LCHasRemoteSheetProviderSelector && self.ui_viewServiceComponent) {
@@ -54,22 +51,16 @@ void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (
             orig.top = 0;
         }
         UIEdgeInsets insets = UIEdgeInsetsMake(orig.top / transform.d, orig.left / transform.a, orig.bottom / transform.d, orig.right / transform.a);
-        if(@available(iOS 19.0, *)) {
-            settings.safeAreaEdgeInsets = insets;
-            // fix orientation
-            settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(insets, settings.interfaceOrientation);
-        } else {
-            settings.safeAreaInsetsPortrait = insets;
-        }
+        settings.safeAreaEdgeInsets = insets;
+        // fix orientation
+        settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(insets, settings.interfaceOrientation);
     };
     [self hook__performUpdateWithoutActivation:wrappedBlock];
 }
 
 void UIKitFixesInit(void) {
-    if (@available(iOS 17.0, *)) {
-        Class FBSceneClass = PrivClass(FBScene);
-        LCHasRemoteSheetProviderSelector = [FBSceneClass instancesRespondToSelector:@selector(ui_viewServiceComponent)];
-        class_addMethod(FBSceneClass, @selector(hook__performUpdateWithoutActivation:), (IMP)hook_FBScene_performUpdateWithoutActivation, "v@:@");
-        swizzle(FBSceneClass, @selector(_performUpdateWithoutActivation:), @selector(hook__performUpdateWithoutActivation:));
-    }
+    Class FBSceneClass = PrivClass(FBScene);
+    LCHasRemoteSheetProviderSelector = [FBSceneClass instancesRespondToSelector:@selector(ui_viewServiceComponent)];
+    class_addMethod(FBSceneClass, @selector(hook__performUpdateWithoutActivation:), (IMP)hook_FBScene_performUpdateWithoutActivation, "v@:@");
+    swizzle(FBSceneClass, @selector(_performUpdateWithoutActivation:), @selector(hook__performUpdateWithoutActivation:));
 }

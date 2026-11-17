@@ -52,6 +52,22 @@ extension LCAppBannerViewController {
             clonedAppInfo.spoofSDKVersion = true
             clonedAppInfo.installationDate = Date.now
             try await signClonedAppIfNeeded(clonedAppInfo)
+            if !clonedAppInfo.is32bit,
+               let bundleId = clonedAppInfo.bundleIdentifier(), !bundleId.isEmpty {
+                let folderName = UUID().uuidString
+                let initialContainer = LCContainer.makeNewContainer(
+                    folderName: folderName,
+                    name: folderName,
+                    isShared: configuration.model.uiIsShared
+                )
+                initialContainer.makeLCContainerInfoPlist(
+                    appIdentifier: bundleId,
+                    keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+                )
+                clonedAppInfo.containers = [initialContainer]
+                clonedAppInfo.dataUUID = folderName
+                clonedAppInfo.save()
+            }
             return LCAppModel(appInfo: clonedAppInfo, delegate: configuration.model.delegate)
         } catch {
             try? fm.removeItem(at: destinationBundleURL)
@@ -388,31 +404,46 @@ extension LCAppBannerViewController {
     }
 
     private func zipDirectory(sourceURL: URL, destinationURL: URL) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            let coordinator = NSFileCoordinator()
-            var coordinationError: NSError?
+        try await Task.detached(priority: .userInitiated) {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let coordinator = NSFileCoordinator()
+                var coordinationError: NSError?
+                var didResume = false
 
-            coordinator.coordinate(readingItemAt: sourceURL, options: [.forUploading], error: &coordinationError) { zippedURL in
-                do {
-                    if FileManager.default.fileExists(atPath: destinationURL.path) {
-                        try FileManager.default.removeItem(at: destinationURL)
+                coordinator.coordinate(readingItemAt: sourceURL, options: [.forUploading], error: &coordinationError) { zippedURL in
+                    do {
+                        if FileManager.default.fileExists(atPath: destinationURL.path) {
+                            try FileManager.default.removeItem(at: destinationURL)
+                        }
+                        try FileManager.default.copyItem(at: zippedURL, to: destinationURL)
+                        if !didResume {
+                            didResume = true
+                            continuation.resume()
+                        }
+                    } catch {
+                        if !didResume {
+                            didResume = true
+                            continuation.resume(throwing: error)
+                        }
                     }
-                    try FileManager.default.copyItem(at: zippedURL, to: destinationURL)
-                    continuation.resume()
-                } catch {
-                    continuation.resume(throwing: error)
+                }
+
+                if let coordinationError, !didResume {
+                    didResume = true
+                    continuation.resume(throwing: coordinationError)
                 }
             }
-
-            if let coordinationError {
-                continuation.resume(throwing: coordinationError)
-            }
-        }
+        }.value
     }
 
     @MainActor
     private func presentExportShareSheet(for fileURL: URL) {
         let activityController = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+        if let popover = activityController.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
         activityController.completionWithItemsHandler = { [weak self] _, _, _, _ in
             self?.cleanupExportArtifacts()
         }

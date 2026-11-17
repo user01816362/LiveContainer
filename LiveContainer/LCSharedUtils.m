@@ -19,12 +19,20 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     dispatch_once(&onceToken, ^{
 #if !TARGET_OS_SIMULATOR
         void* taskSelf = SecTaskCreateFromSelf(NULL);
-        CFErrorRef error = NULL;
-        CFTypeRef cfans = SecTaskCopyValueForEntitlement(taskSelf, CFSTR("com.apple.developer.team-identifier"), &error);
-        if(CFGetTypeID(cfans) == CFStringGetTypeID()) {
-            ans = (__bridge NSString*)cfans;
+        if(taskSelf) {
+            CFErrorRef error = NULL;
+            CFTypeRef cfans = SecTaskCopyValueForEntitlement(taskSelf, CFSTR("com.apple.developer.team-identifier"), &error);
+            if(cfans) {
+                if(CFGetTypeID(cfans) == CFStringGetTypeID()) {
+                    ans = [(__bridge NSString*)cfans copy];
+                }
+                CFRelease(cfans);
+            }
+            if(error) {
+                CFRelease(error);
+            }
+            CFRelease(taskSelf);
         }
-        CFRelease(taskSelf);
 #endif
         if(!ans) {
             // the above seems not to work if the device is jailbroken by Palera1n, so we use the public api one as backup
@@ -57,10 +65,12 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     static dispatch_once_t once;
     static NSString *appGroupID = @"Unknown";
     dispatch_once(&once, ^{
-        NSArray* possibleAppGroups = @[
-            [@"group.com.SideStore.SideStore." stringByAppendingString:[self teamIdentifier]],
-            [@"group.com.rileytestut.AltStore." stringByAppendingString:[self teamIdentifier]]
-        ];
+        NSString *teamId = [self teamIdentifier];
+        NSMutableArray* possibleAppGroups = [NSMutableArray array];
+        if(teamId.length > 0) {
+            [possibleAppGroups addObject:[@"group.com.SideStore.SideStore." stringByAppendingString:teamId]];
+            [possibleAppGroups addObject:[@"group.com.rileytestut.AltStore." stringByAppendingString:teamId]];
+        }
         
         // we prefer app groups with "Apps" in it, which indicate this app group is actually used by the store.
         for (NSString *group in possibleAppGroups) {
@@ -95,16 +105,25 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
         }
         CFErrorRef error = NULL;
         void* taskSelf = SecTaskCreateFromSelf(NULL);
+        if(!taskSelf) {
+            return;
+        }
         CFTypeRef value = SecTaskCopyValueForEntitlement(taskSelf, CFSTR("com.apple.security.application-groups"), &error);
+        if(error) {
+            CFRelease(error);
+        }
         CFRelease(taskSelf);
-        
+
         if(!value) {
             return;
         }
-        NSArray* appGroups = (__bridge NSArray *)value;
-        if(appGroups.count > 0) {
-            appGroupID = [appGroups firstObject];
+        if(CFGetTypeID(value) == CFArrayGetTypeID()) {
+            NSArray* appGroups = (__bridge NSArray *)value;
+            if(appGroups.count > 0) {
+                appGroupID = [appGroups.firstObject copy];
+            }
         }
+        CFRelease(value);
     });
     return appGroupID;
 }
@@ -338,12 +357,13 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 }
 
 + (NSBundle*)findBundleWithBundleId:(NSString*)bundleId isSharedAppOut:(bool*)isSharedAppOut {
-    NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+    NSString *lcHome = [self cachedLcHomePath] ?: NSHomeDirectory();
+    NSString *docPath = [lcHome stringByAppendingPathComponent:@"Documents"];
     
     NSURL *appGroupFolder = nil;
     
     NSString *bundlePath = [NSString stringWithFormat:@"%@/Applications/%@", docPath, bundleId];
-    NSBundle *appBundle;
+    NSBundle *appBundle = nil;
     if([NSFileManager.defaultManager fileExistsAtPath:bundlePath]) {
         appBundle = [[NSBundle alloc] initWithPath:bundlePath];
     }
@@ -356,10 +376,10 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
         if([NSFileManager.defaultManager fileExistsAtPath:bundlePath]) {
             appBundle = [[NSBundle alloc] initWithPath:bundlePath];
         }
-        if(appBundle) {
+        if(appBundle && isSharedAppOut) {
             *isSharedAppOut = true;
         }
-    } else {
+    } else if(isSharedAppOut) {
         *isSharedAppOut = false;
     }
     return appBundle;
@@ -429,7 +449,128 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
             [result addObject:scheme];
         }
     }
-
     return result;
+}
+
+static NSString *sLCCachedHomePath = nil;
+static NSString *sLCCachedLpHomePath = nil;
+static NSString *sLCCachedGlobalTweaksFolderPath = nil;
+
++ (void)cacheProcessEnvironmentPaths {
+    @synchronized (self) {
+        const char *lcHome = getenv("LC_HOME_PATH");
+        if (lcHome && lcHome[0] != '\0') {
+            sLCCachedHomePath = [NSString stringWithUTF8String:lcHome];
+        }
+        const char *lpHome = getenv("LP_HOME_PATH");
+        if (lpHome && lpHome[0] != '\0') {
+            sLCCachedLpHomePath = [NSString stringWithUTF8String:lpHome];
+        }
+        const char *tweaksFolder = getenv("LC_GLOBAL_TWEAKS_FOLDER");
+        if (tweaksFolder && tweaksFolder[0] != '\0') {
+            sLCCachedGlobalTweaksFolderPath = [NSString stringWithUTF8String:tweaksFolder];
+        }
+    }
+}
+
++ (NSString *)cachedLcHomePath {
+    const char *env = getenv("LC_HOME_PATH");
+    if (env && env[0] != '\0') {
+        return [NSString stringWithUTF8String:env];
+    }
+    @synchronized (self) {
+        return sLCCachedHomePath;
+    }
+}
+
++ (NSString *)cachedLpHomePath {
+    const char *env = getenv("LP_HOME_PATH");
+    if (env && env[0] != '\0') {
+        return [NSString stringWithUTF8String:env];
+    }
+    @synchronized (self) {
+        return sLCCachedLpHomePath;
+    }
+}
+
++ (NSString *)cachedGlobalTweaksFolderPath {
+    const char *env = getenv("LC_GLOBAL_TWEAKS_FOLDER");
+    if (env && env[0] != '\0') {
+        return [NSString stringWithUTF8String:env];
+    }
+    @synchronized (self) {
+        return sLCCachedGlobalTweaksFolderPath;
+    }
+}
+
++ (void)ensureContainerDirectoriesAtPath:(NSString *)containerPath {
+    if (containerPath.length == 0 || [containerPath isEqualToString:@"/"]) {
+        return;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray<NSString *> *directories = @[@"Library/Caches", @"Library/Cookies", @"Library/Preferences", @"Documents", @"SystemData", @"tmp"];
+    for (NSString *directory in directories) {
+        NSString *path = [containerPath stringByAppendingPathComponent:directory];
+        [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+}
+
++ (void)wipeStrictContainerIfNeededAtPath:(NSString *)containerPath force:(BOOL)force {
+    if (containerPath.length == 0 || [containerPath isEqualToString:@"/"]) {
+        return;
+    }
+    static NSString *const kContainerInfoFileName = @"LCContainerInfo.plist";
+    NSString *containerInfoPath = [containerPath stringByAppendingPathComponent:kContainerInfoFileName];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
+    if (![info isKindOfClass:NSDictionary.class]) {
+        return;
+    }
+    if (!force && !([info[@"strictTestMode"] boolValue] && [info[@"strictAutoWipeOnExit"] boolValue])) {
+        return;
+    }
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSError *listError = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:containerPath error:&listError];
+    if (!entries) {
+        NSLog(@"[LC][StrictMode] Failed to enumerate container for auto-wipe: %@", listError.localizedDescription);
+        return;
+    }
+
+    for (NSString *entry in entries) {
+        if ([entry isEqualToString:kContainerInfoFileName]) {
+            continue;
+        }
+        NSError *removeError = nil;
+        NSString *entryPath = [containerPath stringByAppendingPathComponent:entry];
+        if (![fm removeItemAtPath:entryPath error:&removeError] && removeError) {
+            NSLog(@"[LC][StrictMode] Failed to remove %@ in container: %@", entry, removeError.localizedDescription);
+        }
+    }
+    [self ensureContainerDirectoriesAtPath:containerPath];
+}
+
++ (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID {
+    if (dataUUID.length == 0) {
+        return;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *docURL = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
+    NSMutableArray<NSURL *> *candidateURLs = [NSMutableArray array];
+    if (docURL) {
+        [candidateURLs addObject:[docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]]];
+    }
+    NSURL *appGroupPath = [self appGroupPath];
+    if (appGroupPath) {
+        [candidateURLs addObject:[appGroupPath URLByAppendingPathComponent:[NSString stringWithFormat:@"LiveContainer/Data/Application/%@", dataUUID]]];
+    }
+
+    for (NSURL *candidateURL in candidateURLs) {
+        NSString *containerInfoPath = [candidateURL.path stringByAppendingPathComponent:@"LCContainerInfo.plist"];
+        if ([fm fileExistsAtPath:containerInfoPath]) {
+            [self wipeStrictContainerIfNeededAtPath:candidateURL.path force:NO];
+            return;
+        }
+    }
 }
 @end

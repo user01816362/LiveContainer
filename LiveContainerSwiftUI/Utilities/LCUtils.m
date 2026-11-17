@@ -70,13 +70,11 @@
     [lcUserDefaults removeObjectForKey:@"selectedContainer"];
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (@available(iOS 16.1, *)) {
-            if(UIApplication.sharedApplication.supportsMultipleScenes && [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1) {
-                [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
-                MultitaskDockManager *dock = [MultitaskDockManager shared];
-                [dock addRunningApp:displayName appUUID:dataUUID view:nil];
-                return;
-            }
+        if(UIApplication.sharedApplication.supportsMultipleScenes && [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1) {
+            [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
+            MultitaskDockManager *dock = [MultitaskDockManager shared];
+            [dock addRunningApp:displayName appUUID:dataUUID view:nil];
+            return;
         }
         
         UIViewController *rootVC = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.rootViewController;
@@ -186,16 +184,13 @@
 #pragma mark JIT
 
 + (BOOL)isTXMScriptRequired {
-    if (@available(iOS 19.0, *)) {
-        // https://github.com/opa334/Dopamine/commit/e8438b4a64ead3997d2c70a575431cb1b4070fb9
-        io_registry_entry_t memory_map = IORegistryEntryFromPath(0, "IODeviceTree:/chosen/memory-map");
-        if (memory_map == IO_OBJECT_NULL)
-            return NO;
-        NSArray *keys = (__bridge NSArray *)IORegistryEntryCreateCFProperty(memory_map, CFSTR(kIORegistryEntryPropertyKeysKey), 0, 0);
-        IOObjectRelease(memory_map);
-        return keys && [keys containsObject:@"TXM"];
-    }
-    return NO;
+    // https://github.com/opa334/Dopamine/commit/e8438b4a64ead3997d2c70a575431cb1b4070fb9
+    io_registry_entry_t memory_map = IORegistryEntryFromPath(0, "IODeviceTree:/chosen/memory-map");
+    if (memory_map == IO_OBJECT_NULL)
+        return NO;
+    NSArray *keys = CFBridgingRelease(IORegistryEntryCreateCFProperty(memory_map, CFSTR(kIORegistryEntryPropertyKeysKey), 0, 0));
+    IOObjectRelease(memory_map);
+    return keys && [keys containsObject:@"TXM"];
 }
 
 + (NSString *)base64EncodedUniversalJITScript {
@@ -461,5 +456,14 @@
     return [url bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
 }
 
++ (BOOL)isAppSchemeInstalled:(NSString *)scheme {
+    if (scheme.length == 0) return NO;
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@://", scheme]];
+    if (!url) return NO;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication.sharedApplication canOpenURL:url];
+#pragma clang diagnostic pop
+}
 
 @end

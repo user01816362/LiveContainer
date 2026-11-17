@@ -28,8 +28,9 @@ NSURL* appContainerURL = 0;
 NSString* appContainerPath = 0;
 
 void NUDGuestHooksInit(void) {
-    appContainerPath = [NSString stringWithUTF8String:getenv("HOME")];
-    appContainerURL = [NSURL URLWithString:appContainerPath];
+    const char *homeEnv = getenv("HOME");
+    appContainerPath = homeEnv ? [NSString stringWithUTF8String:homeEnv] : NSHomeDirectory();
+    appContainerURL = [NSURL fileURLWithPath:appContainerPath];
     
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundeclared-selector"
@@ -52,7 +53,7 @@ void NUDGuestHooksInit(void) {
     
     // replace _CFPrefsCurrentAppIdentifierCache so kCFPreferencesCurrentApplication refers to the guest app
     const char* coreFoundationPath = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
-    mach_header_u* coreFoundationHeader = LCGetLoadedImageHeader(2, coreFoundationPath);
+    struct mach_header_64* coreFoundationHeader = LCGetLoadedImageHeader(2, coreFoundationPath);
     
 #if !TARGET_OS_SIMULATOR
     CFStringRef* _CFPrefsCurrentAppIdentifierCache = getCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader);
@@ -61,8 +62,11 @@ void NUDGuestHooksInit(void) {
         uint64_t offset = (uint64_t)((void*)_CFPrefsCurrentAppIdentifierCache - (void*)coreFoundationHeader);
         saveCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader, offset);
     }
-    [NSUserDefaults.lcUserDefaults _setIdentifier:(__bridge NSString*)CFStringCreateCopy(nil, *_CFPrefsCurrentAppIdentifierCache)];
-    *_CFPrefsCurrentAppIdentifierCache = (__bridge CFStringRef)NSUserDefaults.lcGuestAppId;
+    if(_CFPrefsCurrentAppIdentifierCache) {
+        NSString *copiedId = CFBridgingRelease(CFStringCreateCopy(nil, *_CFPrefsCurrentAppIdentifierCache));
+        [NSUserDefaults.lcUserDefaults _setIdentifier:copiedId];
+        *_CFPrefsCurrentAppIdentifierCache = (__bridge CFStringRef)NSUserDefaults.lcGuestAppId;
+    }
 #else
     // FIXME: for now we skip overwriting _CFPrefsCurrentAppIdentifierCache on simulator, since there is no way to find private symbol
 #endif

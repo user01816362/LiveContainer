@@ -6,7 +6,6 @@
 //
 @import UIKit;
 
-API_AVAILABLE(ios(16.0))
 @interface VirtualWindowsHostView: UIView
 @property(nonatomic) BOOL shouldForwardTapAction;
 - (BOOL)handleStatusBarTapAction:(UIAction *)action;

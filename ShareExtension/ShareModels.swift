@@ -27,15 +27,33 @@ final class SharePayload: ObservableObject {
 
         let providers = items.flatMap { $0.attachments ?? [] }
         for provider in providers {
+            if provider.canLoadObject(ofClass: URL.self) {
+                let loadedURL: URL? = try await withCheckedThrowingContinuation { continuation in
+                    _ = provider.loadObject(ofClass: URL.self) { url, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(returning: url)
+                        }
+                    }
+                }
+                if let loadedURL {
+                    return loadedURL.isFileURL ? .file(loadedURL) : .url(loadedURL)
+                }
+            }
             if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
-                let item = try await provider.loadItem(forTypeIdentifier: UTType.url.identifier)
-                if let url = item as? URL {
-                    return url.isFileURL ? .file(url) : .url(url)
+                let rawData: Data? = try await withCheckedThrowingContinuation { continuation in
+                    _ = provider.loadDataRepresentation(for: .url) { data, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(returning: data)
+                        }
+                    }
                 }
-                if let data = item as? Data, let string = String(data: data, encoding: .utf8), let url = URL(string: string) {
-                    return url.isFileURL ? .file(url) : .url(url)
-                }
-                if let string = item as? String, let url = URL(string: string) {
+                if let rawData,
+                   let string = String(data: rawData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   let url = URL(string: string) {
                     return url.isFileURL ? .file(url) : .url(url)
                 }
             }

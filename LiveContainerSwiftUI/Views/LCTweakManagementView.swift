@@ -74,6 +74,7 @@ private struct LCManagedTweakFolderView: View {
 
     @StateObject private var newFolderInput = InputHelper()
     @StateObject private var renameFileInput = InputHelper()
+    @StateObject private var downloadUrlInput = InputHelper()
 
     init(baseURL: URL, isRoot: Bool, destinationMode: LCTweakDestinationMode? = nil) {
         _baseURL = State(initialValue: baseURL)
@@ -140,6 +141,12 @@ private struct LCManagedTweakFolderView: View {
                             }
 
                             Button {
+                                Task { await downloadTweakFromURL() }
+                            } label: {
+                                Label("Download from URL", systemImage: "link.badge.plus")
+                            }
+
+                            Button {
                                 Task { await createNewFolder() }
                             } label: {
                                 Label("lc.tweakView.newFolder".loc, systemImage: "folder.badge.plus")
@@ -182,9 +189,21 @@ private struct LCManagedTweakFolderView: View {
                 renameFileInput.close(result: "")
             }
         )
+        .textFieldAlert(
+            isPresented: $downloadUrlInput.show,
+            title: "Download Tweak (.dylib / .deb / .zip)",
+            text: $downloadUrlInput.initVal,
+            placeholder: "https://",
+            action: { newText in
+                downloadUrlInput.close(result: newText)
+            },
+            actionCancel: { _ in
+                downloadUrlInput.close(result: "")
+            }
+        )
         .betterFileImporter(
             isPresented: $choosingTweak,
-            types: [.dylib, .lcFramework],
+            types: [.dylib, .lcFramework, .zipArchive, .deb],
             multiple: true,
             callback: { urls in
                 Task { await installTweaks(urls) }
@@ -289,7 +308,7 @@ private struct LCManagedTweakFolderView: View {
     }
 
     private func dropDraggedItem(into tweakItem: LCManagedTweakItem) -> Bool {
-        guard tweakItem.isFolder || tweakItem.isFramework,
+        guard tweakItem.isFolder && !tweakItem.isFramework,
               let sourceURL = managementContext.draggingItemURL else {
             return false
         }
@@ -365,6 +384,16 @@ private struct LCManagedTweakFolderView: View {
         }
     }
 
+    private func downloadTweakFromURL() async {
+        guard let urlStr = await downloadUrlInput.open(),
+              !urlStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let url = URL(string: urlStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") else {
+            return
+        }
+        LCDownloadManager.shared.enqueueTweakDownload(url: url, destinationFolder: baseURL)
+    }
+
     private func createNewFolder() async {
         guard let name = await newFolderInput.open(), !name.isEmpty else {
             return
@@ -384,21 +413,34 @@ private struct LCManagedTweakFolderView: View {
     }
 
     private func installTweaks(_ urls: [URL]) async {
+        let fm = FileManager.default
+        let stagingDir = fm.temporaryDirectory.appendingPathComponent("LCTweakImport-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: stagingDir) }
+
         do {
-            let fm = FileManager.default
+            try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+            var extractedPayloadCount = 0
+
             for url in urls {
                 guard url.isFileURL else {
                     throw "lc.tweakView.notFileError %@".localizeWithFormat(url.lastPathComponent)
                 }
-                let destinationURL = baseURL.appendingPathComponent(url.lastPathComponent)
-                try fm.moveItem(at: url, to: destinationURL)
-                if destinationURL.pathExtension.lowercased() == "dylib" {
-                    LCParseMachO((destinationURL.path as NSString).utf8String, false) { path, header, _, _ in
-                        LCPatchAddRPath(path, header)
-                    }
+                let ext = url.pathExtension.lowercased()
+                if ext == "zip" || ext == "deb" {
+                    let archiveWorkDir = stagingDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    try fm.createDirectory(at: archiveWorkDir, withIntermediateDirectories: true)
+                    try await LCTweakPackageInstaller.extractArchiveAndInstallPayloads(from: url, ext: ext, workDir: archiveWorkDir, into: baseURL, copiedCount: &extractedPayloadCount)
+                } else {
+                    try LCTweakPackageInstaller.copyOrMovePayload(from: url, into: baseURL, move: true)
+                    extractedPayloadCount += 1
                 }
             }
+
+            if extractedPayloadCount > 0 {
+                try? await LCUtils.signTweaks(tweakFolderUrl: baseURL, force: false) { _ in }
+            }
             reloadTweakItems()
+            syncRootTweakFoldersIfNeeded()
             postChange()
         } catch {
             show(error)
@@ -550,7 +592,7 @@ private struct LCTweakDestinationView: View {
     @StateObject private var managementContext = LCTweakManagementContext()
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             LCManagedTweakFolderView(
                 baseURL: LCPath.tweakPath,
                 isRoot: true,
@@ -558,7 +600,6 @@ private struct LCTweakDestinationView: View {
             )
             .environmentObject(managementContext)
         }
-        .navigationViewStyle(.stack)
     }
 }
 

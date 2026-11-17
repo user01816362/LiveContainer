@@ -9,7 +9,7 @@ protocol LCAppModelDelegate {
     func showRunWhenMultitaskAlert() async -> Bool?
 }
 
-class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
+class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable {
 
     @Published var appInfo : LCAppInfo
 
@@ -135,6 +135,18 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
         }
     }
 
+    @Published var uiDebugModeEnabled: Bool {
+        didSet {
+            appInfo.debugModeEnabled = uiDebugModeEnabled
+        }
+    }
+
+    @Published var uiExportTweakSymbolsGlobally: Bool {
+        didSet {
+            appInfo.exportTweakSymbolsGlobally = uiExportTweakSymbolsGlobally
+        }
+    }
+
     @Published var uiIsMultitaskModeSpecificed : MultitaskSpecified {
         didSet {
             appInfo.multitaskSpecified = uiIsMultitaskModeSpecificed;
@@ -161,12 +173,8 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
 
     public var shouldLaunchInMultitaskMode : Bool {
         get {
-            if #available(iOS 16.0, *) {
-                return uiIsMultitaskModeSpecificed == .yes ||
-                (uiIsMultitaskModeSpecificed == .default && UserDefaults.standard.bool(forKey: "LCLaunchInMultitaskMode"))
-            } else {
-                return false
-            }
+            return uiIsMultitaskModeSpecificed == .yes ||
+            (uiIsMultitaskModeSpecificed == .default && UserDefaults.standard.bool(forKey: "LCLaunchInMultitaskMode"))
         }
     }
 
@@ -209,6 +217,8 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
         self.uiSpoofSDKVersion = appInfo.spoofSDKVersion
         self.uiRemark = appInfo.remark ?? ""
         self.uiAutoCleanCacheOnLaunch = appInfo.autoCleanCacheOnLaunch
+        self.uiDebugModeEnabled = appInfo.debugModeEnabled
+        self.uiExportTweakSymbolsGlobally = appInfo.exportTweakSymbolsGlobally
         self.uiIs32bit = appInfo.is32bit
         self.uiIs32bitEmulator = appInfo.is32bitEmulator
         for container in uiContainers {
@@ -235,7 +245,7 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
 
         if uiContainers.isEmpty {
             let newName = NSUUID().uuidString
-            let newContainer = LCContainer(folderName: newName, name: newName, isShared: uiIsShared)
+            let newContainer = LCContainer.makeNewContainer(folderName: newName, name: newName, isShared: uiIsShared)
             uiContainers.append(newContainer)
             if uiSelectedContainer == nil {
                 uiSelectedContainer = newContainer;
@@ -281,8 +291,7 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
                     URLQueryItem(name: "url", value: Data(urlStr.utf8).base64EncodedString())
                 ]
             }
-            if await UIApplication.shared.canOpenURL(openURLComp.url!) {
-                await UIApplication.shared.open(openURLComp.url!)
+            if let targetURL = openURLComp.url, await UIApplication.shared.open(targetURL) {
                 return
             }
         }
@@ -358,9 +367,9 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
         jitNeeded = false
 #endif
         if jitNeeded {
-            if multitask, #available(iOS 17.4, *) {
+            if multitask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    LCUtils.launchMultitaskGuestApp(appInfo.displayName()) { pidNumber, error in
+                    LCUtils.launchMultitaskGuestApp(appInfo.displayName()) { [weak self] pidNumber, error in
                         if let error {
                             continuation.resume(throwing: error)
                             return
@@ -391,10 +400,10 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
                     await delegate?.jitLaunch(appName: self.appInfo.displayName(), classicMode: classicMode)
                 }
             }
-        } else if multitask, #available(iOS 16.0, *) {
+        } else if multitask {
             try await LCUtils.launchMultitaskGuestApp(appInfo.displayName())
         } else {
-            if #available(iOS 26.0, *), FileManager.default.fileExists(atPath: "\(appInfo.bundlePath()!)/Frameworks/MetalANGLE.framework/MetalANGLE") {
+            if FileManager.default.fileExists(atPath: "\(appInfo.bundlePath()!)/Frameworks/MetalANGLE.framework/MetalANGLE") {
                 let fileContents = "\(appInfo.bundlePath()!)/Frameworks/MetalANGLE.framework/MetalANGLE".data(using: .utf8)
                 let fileURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("preloadLibraries.txt")
                 try fileContents?.write(to: fileURL)
@@ -540,19 +549,15 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
     }
 
     private func bringExistingMultitaskWindowIfNeeded(dataUUID: String, urlScheme: String?) async -> Bool {
-        guard #available(iOS 16.0, *) else { return false }
         return await MainActor.run {
             if let urlScheme {
                 UserDefaults.standard.setValue(urlScheme, forKey: "launchAppUrlScheme")
             }
-            var found = false
-            if #available(iOS 16.1, *) {
-                found = MultitaskWindowManager.openExistingAppWindow(dataUUID: dataUUID)
-            }
+            var found = MultitaskWindowManager.openExistingAppWindow(dataUUID: dataUUID)
             if !found {
                 found = MultitaskDockManager.shared.bringMultitaskViewToFront(uuid: dataUUID)
             }
-            if let _ = urlScheme, !found  {
+            if urlScheme != nil, !found {
                 UserDefaults.standard.removeObject(forKey: "launchAppUrlScheme")
             }
             return found
@@ -560,7 +565,7 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
     }
     
     static func copy(fromApp: LCAppModel, toAppInfo: LCAppInfo) {
-        // copy previous configration to new app
+        // copy previous configuration to new app
         toAppInfo.autoSaveDisabled = true
         toAppInfo.isLocked = fromApp.appInfo.isLocked
         toAppInfo.isHidden = fromApp.appInfo.isHidden
@@ -579,6 +584,7 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
         toAppInfo.dontInjectTweakLoader = fromApp.appInfo.dontInjectTweakLoader
         toAppInfo.hideLiveContainer = fromApp.appInfo.hideLiveContainer
         toAppInfo.dontLoadTweakLoader = fromApp.appInfo.dontLoadTweakLoader
+        toAppInfo.dontSign = fromApp.appInfo.dontSign
         toAppInfo.doUseLCBundleId = fromApp.appInfo.doUseLCBundleId
         toAppInfo.fixFilePickerNew = fromApp.appInfo.fixFilePickerNew
         toAppInfo.fixLocalNotification = fromApp.appInfo.fixLocalNotification
@@ -590,6 +596,15 @@ class LCAppModel: ObservableObject, Hashable, @unchecked Sendable {
         
         toAppInfo.multitaskSpecified = fromApp.appInfo.multitaskSpecified
         toAppInfo.classicMode = fromApp.appInfo.classicMode
+        toAppInfo.selected32BitEmulator = fromApp.appInfo.selected32BitEmulator
+        toAppInfo.remark = fromApp.appInfo.remark
+        toAppInfo.autoCleanCacheOnLaunch = fromApp.appInfo.autoCleanCacheOnLaunch
+        toAppInfo.lastAutoCleanDate = fromApp.appInfo.lastAutoCleanDate
+        toAppInfo.autoCleanTotalBytesSaved = fromApp.appInfo.autoCleanTotalBytesSaved
+        toAppInfo.debugModeEnabled = fromApp.appInfo.debugModeEnabled
+        toAppInfo.exportTweakSymbolsGlobally = fromApp.appInfo.exportTweakSymbolsGlobally
+        toAppInfo.sourceURL = fromApp.appInfo.sourceURL
+        toAppInfo.ignoredUpdateVersion = fromApp.appInfo.ignoredUpdateVersion
         
         toAppInfo.lastLaunched = fromApp.appInfo.lastLaunched
         
