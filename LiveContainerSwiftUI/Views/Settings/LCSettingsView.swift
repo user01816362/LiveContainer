@@ -9,7 +9,7 @@ import Foundation
 import SwiftUI
 import UserNotifications
 
-enum JITEnablerType : Int, CaseIterable, Identifiable {
+enum JITEnablerType : Int, CaseIterable, Identifiable, Sendable {
     var id: Int { rawValue }
     case SideJITServer = 0
     case StikJIT = 1
@@ -405,7 +405,7 @@ struct LCSettingsView: View {
                     }
                 }
             }
-            .navigationBarTitle("lc.tabView.settings".loc)
+            .navigationTitle("lc.tabView.settings".loc)
             .alert("lc.common.error".loc, isPresented: $errorShow){
             } message: {
                 Text(errorInfo)

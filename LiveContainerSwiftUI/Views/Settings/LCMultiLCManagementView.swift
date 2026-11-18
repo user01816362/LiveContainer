@@ -7,13 +7,14 @@
 
 import SwiftUI
 
+@MainActor
 protocol InstallAnotherLCButtonDelegate {
     func installAnotherLC(name: String) async
 }
 
 private let multiLCLaunchPriorityKey = "LCMultiLaunchPriority"
 
-private struct LaunchPriorityLC: Identifiable, Hashable {
+private struct LaunchPriorityLC: Identifiable, Hashable, Sendable {
     let scheme: String
     let displayName: String
 

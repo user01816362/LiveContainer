@@ -52,6 +52,7 @@ struct LCPath {
     }
 }
 
+@MainActor
 class SharedModel: ObservableObject {
     @Published var selectedTab: LCTabIdentifier = .apps
     @Published var deepLink: URL?
@@ -72,7 +73,7 @@ class SharedModel: ObservableObject {
     @Published var arm32EmuApps : [LCAppModel] = []
     @Published var hiddenApps : [LCAppModel] = []
     
-    @Published var pidCallback : ((NSNumber, Error?) -> Void)? = nil
+    @Published var pidCallback : (@Sendable (NSNumber, Error?) -> Void)? = nil
     @Published var activeDebugApp : LCAppModel? = nil
     var appModelDelegate : LCAppModelDelegate? = nil
     
@@ -104,44 +105,43 @@ class SharedModel: ObservableObject {
     }
 }
 
+@MainActor
 class DataManager {
     static let shared = DataManager()
     let model = SharedModel()
-    @MainActor var sourcesViewModel: AltStoreSourcesViewModel {
+    var sourcesViewModel: AltStoreSourcesViewModel {
         AltStoreSourcesViewModel.shared
     }
 }
 
-class AlertHelper<T> : ObservableObject {
+@MainActor
+class AlertHelper<T: Sendable> : ObservableObject {
     @Published var show = false
-    private var result : T?
-    private var c : UnsafeContinuation<Void, Never>? = nil
+    private var continuation : CheckedContinuation<T?, Never>? = nil
     
     func open() async -> T? {
-        await withUnsafeContinuation { c in
-            self.c = c
-            Task { await MainActor.run {
-                self.show = true
-            }}
+        if let existing = continuation {
+            self.continuation = nil
+            existing.resume(returning: nil)
         }
-        return self.result
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            self.show = true
+        }
     }
     
     func close(result: T?) {
-        if let c {
-            self.result = result
-            c.resume()
-            self.c = nil
+        self.show = false
+        if let continuation {
+            self.continuation = nil
+            continuation.resume(returning: result)
         }
-        DispatchQueue.main.async {
-            self.show = false
-        }
-
     }
 }
 
 typealias YesNoHelper = AlertHelper<Bool>
 
+@MainActor
 class InputHelper : AlertHelper<String> {
     @Published var initVal = ""
     
@@ -160,11 +160,8 @@ extension String: @retroactive Error {}
 extension String: @retroactive LocalizedError {
     public var errorDescription: String? { return self }
         
-    private static var enBundle : Bundle? = {
-        let language = "en"
-        let path = Bundle.main.path(forResource:language, ofType: "lproj")
-        let bundle = Bundle(path: path!)
-        return bundle
+    private static let enBundle : Bundle? = {
+        Bundle.main.path(forResource: "en", ofType: "lproj").flatMap(Bundle.init(path:))
     }()
     
     var loc: String {
@@ -235,82 +232,84 @@ extension Color {
     }
 }
 
-struct ImageDocument: FileDocument {
-    var data: Data
-    
-    static var readableContentTypes: [UTType] {
-        [UTType.image] // Specify that the document supports image files
-    }
-    
-    // Initialize with data
-    init(uiImage: UIImage) {
-        self.data = uiImage.pngData()!
-    }
-    
-    // Function to read the data from the file
-    init(configuration: ReadConfiguration) throws {
-        guard let data = configuration.file.regularFileContents else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        self.data = data
-    }
-    
-    // Write data to the file
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        return FileWrapper(regularFileWithContents: data)
-    }
-}
-
-
-struct SiteAssociationDetailItem : Codable {
+struct SiteAssociationDetailItem : Decodable, Sendable {
     var appID: String?
     var appIDs: [String]?
     
     func getBundleIds() -> [String] {
         var ans : [String] = []
-        // get rid of developer id
-        if let appID = appID, appID.count > 11 {
-            let index = appID.index(appID.startIndex, offsetBy: 11)
-            let modifiedString = String(appID[index...])
-            ans.append(modifiedString)
+        if let appID {
+            let bundleID = Self.extractBundleID(from: appID)
+            if !bundleID.isEmpty {
+                ans.append(bundleID)
+            }
         }
-        if let appIDs = appIDs {
+        if let appIDs {
             for appID in appIDs {
-                if appID.count > 11 {
-                    let index = appID.index(appID.startIndex, offsetBy: 11)
-                    let modifiedString = String(appID[index...])
-                    ans.append(modifiedString)
+                let bundleID = Self.extractBundleID(from: appID)
+                if !bundleID.isEmpty {
+                    ans.append(bundleID)
                 }
             }
         }
         return ans
     }
+
+    private static func extractBundleID(from appID: String) -> String {
+        guard let dot = appID.firstIndex(of: ".") else {
+            return ""
+        }
+        return String(appID[appID.index(after: dot)...])
+    }
 }
 
-struct AppLinks : Codable {
+struct AppLinks : Decodable, Sendable {
     var details : [SiteAssociationDetailItem]?
+
+    enum CodingKeys: String, CodingKey {
+        case details
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let array = try? container.decode([SiteAssociationDetailItem].self, forKey: .details) {
+            details = array
+            return
+        }
+        if let dictionary = try? container.decode([String: SiteAssociationDetailItem].self, forKey: .details) {
+            details = dictionary.map { appID, item in
+                var item = item
+                if item.appID == nil {
+                    item.appID = appID
+                }
+                return item
+            }
+            return
+        }
+        details = nil
+    }
 }
 
-struct SiteAssociation : Codable {
+struct SiteAssociation : Decodable, Sendable {
     var applinks: AppLinks?
 }
 
 
-struct JITStreamerEBLaunchAppResponse : Codable {
+struct JITStreamerEBLaunchAppResponse : Codable, Sendable {
     let ok: Bool
     let launching: Bool
     let position: Int?
     let error: String?
 }
 
-struct JITStreamerEBStatusResponse : Codable {
+struct JITStreamerEBStatusResponse : Codable, Sendable {
     let ok: Bool
     let done: Bool
     let position: Int?
     let error: String?
 }
 
-struct JITStreamerEBMountResponse : Codable {
+struct JITStreamerEBMountResponse : Codable, Sendable {
     let ok: Bool
     let mounting: Bool
     let error: String?
@@ -322,7 +321,7 @@ extension NSNotification {
     static let InstallAppNotification = Notification.Name.init("InstallAppNotification")
 }
 
-public enum LCTabIdentifier: Hashable {
+public enum LCTabIdentifier: Hashable, Sendable {
     case sources
     case apps
     case tweaks
@@ -330,7 +329,7 @@ public enum LCTabIdentifier: Hashable {
 }
 
 
-enum BatchMoveError: LocalizedError {
+enum BatchMoveError: LocalizedError, Sendable {
     case emptySource(URL)
     case sourceDoesNotExist(URL)
     case sourceIsNotReachable(URL, underlying: Error)

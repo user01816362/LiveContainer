@@ -6,7 +6,7 @@
 //
 
 final class BuiltInSideStoreAppInfo : LCAppInfo {
-    static let shared = BuiltInSideStoreAppInfo()
+    @MainActor static let shared = BuiltInSideStoreAppInfo()
 
     private override init() {
         super.init(bundlePath: Bundle.main.bundleURL.appendingPathComponent("Frameworks/SideStoreApp.framework").path)

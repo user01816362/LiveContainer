@@ -1,5 +1,6 @@
 import Foundation
 
+@MainActor
 protocol LCAppModelDelegate {
     func closeNavigationView()
     func changeAppVisibility(app : LCAppModel)
@@ -9,7 +10,8 @@ protocol LCAppModelDelegate {
     func showRunWhenMultitaskAlert() async -> Bool?
 }
 
-class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable {
+@MainActor
+final class LCAppModel: ObservableObject, Identifiable, Hashable {
 
     @Published var appInfo : LCAppInfo
 
@@ -229,11 +231,11 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
         }
     }
 
-    static func == (lhs: LCAppModel, rhs: LCAppModel) -> Bool {
+    nonisolated static func == (lhs: LCAppModel, rhs: LCAppModel) -> Bool {
         return lhs === rhs
     }
 
-    func hash(into hasher: inout Hasher) {
+    nonisolated func hash(into hasher: inout Hasher) {
         hasher.combine(ObjectIdentifier(self))
     }
 
@@ -339,13 +341,9 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
             }
         }
 
-        await MainActor.run {
-            isAppRunning = true
-        }
+        isAppRunning = true
         defer {
-            Task { await MainActor.run {
-                isAppRunning = false
-            }}
+            isAppRunning = false
         }
         try await signApp(force: false)
 
@@ -368,25 +366,25 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
 #endif
         if jitNeeded {
             if multitask {
+                let displayName = appInfo.displayName() ?? ""
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    LCUtils.launchMultitaskGuestApp(appInfo.displayName()) { [weak self] pidNumber, error in
+                    LCUtils.launchMultitaskGuestApp(displayName) { [weak self] pidNumber, error in
                         if let error {
                             continuation.resume(throwing: error)
                             return
                         }
-                        guard let pidNumber = pidNumber else {
+                        guard let pidNumber else {
                             continuation.resume(throwing: "Failed to obtain PID from LiveProcess")
                             return
                         }
                         Task { @MainActor [weak self] in
-                            guard let self else {
-                                continuation.resume()
-                                return
-                            }
-                            if let scriptData = self.jitLaunchScriptJs, !scriptData.isEmpty {
-                                await self.delegate?.jitLaunch(withPID: pidNumber.intValue, withScript: scriptData, appName: self.appInfo.displayName())
-                            } else {
-                                await self.delegate?.jitLaunch(withPID: pidNumber.intValue, withScript: nil, appName: self.appInfo.displayName())
+                            if let self {
+                                let name = self.appInfo.displayName() ?? ""
+                                if let scriptData = self.jitLaunchScriptJs, !scriptData.isEmpty {
+                                    await self.delegate?.jitLaunch(withPID: pidNumber.intValue, withScript: scriptData, appName: name)
+                                } else {
+                                    await self.delegate?.jitLaunch(withPID: pidNumber.intValue, withScript: nil, appName: name)
+                                }
                             }
                             continuation.resume()
                         }
@@ -413,10 +411,6 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
 
         // Record the launch time
         appInfo.lastLaunched = Date()
-
-        await MainActor.run {
-            isAppRunning = false
-        }
     }
 
     func forceResign() async throws {
@@ -425,44 +419,38 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
         }
         isAppRunning = true
         defer {
-            Task{ await MainActor.run {
-                self.isAppRunning = false
-            }}
-
+            isAppRunning = false
         }
         try await signApp(force: true)
     }
 
     func signApp(force: Bool = false) async throws {
-        var signError : String? = nil
-        var signSuccess = false
         defer {
-            Task{ await MainActor.run {
-                self.isSigningInProgress = false
-            }}
+            self.observer?.invalidate()
+            self.observer = nil
+            self.isSigningInProgress = false
         }
 
-        await withUnsafeContinuation({ c in
+        let (signSuccess, signError): (Bool, String?) = await withCheckedContinuation { continuation in
             appInfo.patchExecAndSignIfNeed(completionHandler: { success, error in
-                signError = error;
-                signSuccess = success;
-                c.resume()
-            }, progressHandler: { signProgress in
-                guard let signProgress else {
-                    return
-                }
-                self.isSigningInProgress = true
-                self.observer = signProgress.observe(\.fractionCompleted) { p, v in
-                    DispatchQueue.main.async {
-                        self.signProgress = signProgress.fractionCompleted
+                continuation.resume(returning: (success, error))
+            }, progressHandler: { [weak self] signProgress in
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        return
+                    }
+                    self.isSigningInProgress = true
+                    self.observer = signProgress.observe(\.fractionCompleted, options: [.initial, .new]) { [weak self] p, _ in
+                        let fraction = p.fractionCompleted
+                        Task { @MainActor [weak self] in
+                            self?.signProgress = fraction
+                        }
                     }
                 }
             }, forceSign: force)
-        })
-        if let signError {
-            if !signSuccess {
-                throw signError.loc
-            }
+        }
+        if let signError, !signSuccess {
+            throw signError.loc
         }
 
         // sign its tweak
@@ -476,17 +464,17 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
         } else {
             tweakFolderUrl = LCPath.tweakPath.appendingPathComponent(tweakFolder)
         }
-        try await LCUtils.signTweaks(tweakFolderUrl: tweakFolderUrl, force: force) { p in
-            Task{ await MainActor.run {
-                self.isSigningInProgress = true
-            }}
+        try await LCUtils.signTweaks(tweakFolderUrl: tweakFolderUrl, force: force) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSigningInProgress = true
+            }
         }
 
         // sign global tweak
-        try await LCUtils.signTweaks(tweakFolderUrl: LCPath.tweakPath, force: force) { p in
-            Task{ await MainActor.run {
-                self.isSigningInProgress = true
-            }}
+        try await LCUtils.signTweaks(tweakFolderUrl: LCPath.tweakPath, force: force) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSigningInProgress = true
+            }
         }
     }
 
@@ -549,19 +537,17 @@ class LCAppModel: ObservableObject, Identifiable, Hashable, @unchecked Sendable 
     }
 
     private func bringExistingMultitaskWindowIfNeeded(dataUUID: String, urlScheme: String?) async -> Bool {
-        return await MainActor.run {
-            if let urlScheme {
-                UserDefaults.standard.setValue(urlScheme, forKey: "launchAppUrlScheme")
-            }
-            var found = MultitaskWindowManager.openExistingAppWindow(dataUUID: dataUUID)
-            if !found {
-                found = MultitaskDockManager.shared.bringMultitaskViewToFront(uuid: dataUUID)
-            }
-            if urlScheme != nil, !found {
-                UserDefaults.standard.removeObject(forKey: "launchAppUrlScheme")
-            }
-            return found
+        if let urlScheme {
+            UserDefaults.standard.setValue(urlScheme, forKey: "launchAppUrlScheme")
         }
+        var found = MultitaskWindowManager.openExistingAppWindow(dataUUID: dataUUID)
+        if !found {
+            found = MultitaskDockManager.shared.bringMultitaskViewToFront(uuid: dataUUID)
+        }
+        if urlScheme != nil, !found {
+            UserDefaults.standard.removeObject(forKey: "launchAppUrlScheme")
+        }
+        return found
     }
     
     static func copy(fromApp: LCAppModel, toAppInfo: LCAppInfo) {

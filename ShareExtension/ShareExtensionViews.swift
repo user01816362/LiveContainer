@@ -215,24 +215,58 @@ private struct ShareInstallGridEntry: View {
     }
 }
 
+@MainActor
+private final class ShareIconCache {
+    static let shared = ShareIconCache()
+    private let cache = NSCache<NSURL, UIImage>()
+
+    func cachedImage(for url: URL) -> UIImage? {
+        cache.object(forKey: url as NSURL)
+    }
+
+    func store(_ image: UIImage, for url: URL) {
+        cache.setObject(image, forKey: url as NSURL)
+    }
+}
+
 private struct ShareAppIconView: View {
     let iconURL: URL?
+    @State private var loadedImage: UIImage?
 
     var body: some View {
         GeometryReader { geometry in
-            if let iconURL, let image = UIImage(contentsOfFile: iconURL.path) {
+            let cornerRadius = geometry.size.width * 0.2667
+            if let image = loadedImage ?? iconURL.flatMap({ ShareIconCache.shared.cachedImage(for: $0) }) {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: geometry.size.width * 0.2667, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             } else {
                 Image(systemName: "app")
                     .font(.system(size: geometry.size.width * 0.56))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .foregroundStyle(.secondary)
                     .background { Color(.secondarySystemBackground) }
-                    .clipShape(RoundedRectangle(cornerRadius: geometry.size.width * 0.2667, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             }
+        }
+        .task(id: iconURL) {
+            guard let iconURL else {
+                loadedImage = nil
+                return
+            }
+            if let cached = ShareIconCache.shared.cachedImage(for: iconURL) {
+                loadedImage = cached
+                return
+            }
+            let image = await Task.detached(priority: .utility) {
+                UIImage(contentsOfFile: iconURL.path)
+            }.value
+            guard !Task.isCancelled else { return }
+            if let image {
+                ShareIconCache.shared.store(image, for: iconURL)
+            }
+            loadedImage = image
         }
     }
 }

@@ -207,7 +207,6 @@ static NSString *const kLCDebugHandledProperty = @"LCDebugURLProtocolHandled";
 
 @interface LCDebugURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSURLSessionDataTask *proxyTask;
-@property (nonatomic, strong) NSMutableData *capturedResponseData;
 @property (nonatomic, strong) NSURLResponse *capturedResponse;
 @property (nonatomic, assign) CFAbsoluteTime startTime;
 @end
@@ -274,7 +273,6 @@ static NSString *LCBuildCurlCommand(NSURLRequest *req) {
 
 - (void)startLoading {
     self.startTime = CFAbsoluteTimeGetCurrent();
-    self.capturedResponseData = [NSMutableData data];
 
     NSMutableURLRequest *mutableReq = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:kLCDebugHandledProperty inRequest:mutableReq];
@@ -529,13 +527,14 @@ static NSString *LCDebugWebConsoleHTML(void) {
     "<script>"
     "let logs=[],nets=[];"
     "function showTab(id,el){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');el.classList.add('active');}"
-    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT OFF';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);if(s.selectedView){let b=document.getElementById('tapbanner');b.style.display='block';b.innerHTML='<strong>Inspected View:</strong> <code>'+s.selectedView.class+'</code> | VC: <code>'+(s.selectedView.viewController||'-')+'</code> | '+s.selectedView.frame;}}"
+    "function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
+    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT OFF';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);if(s.selectedView){let b=document.getElementById('tapbanner');b.style.display='block';b.innerHTML='<strong>Inspected View:</strong> <code>'+esc(s.selectedView.class)+'</code> | VC: <code>'+esc(s.selectedView.viewController||'-')+'</code> | '+esc(s.selectedView.frame);}}"
     "function renderLogs(){let q=document.getElementById('logFilter').value.toLowerCase();let el=document.getElementById('logbox');el.textContent=logs.filter(l=>!q||(l.text||'').toLowerCase().includes(q)).map(l=>'['+l.stream+'] '+l.text).join('\\n');el.scrollTop=el.scrollHeight;}"
-    "function renderNets(){let el=document.getElementById('netlist');el.innerHTML=nets.map((n,i)=>'<div class=\"row\"><div><strong>'+n.method+'</strong> ['+n.statusCode+'] '+n.durationMs+'ms · '+n.bytes+'B · <code>'+n.url+'</code></div><details style=\"margin-top:6px\"><summary>Details & cURL</summary><pre>'+((n.curl||'')+'\\n\\nResponse Preview:\\n'+(n.responseBodyPreview||'')).replace(/</g,'&lt;')+'</pre></details></div>').join('');}"
+    "function renderNets(){let el=document.getElementById('netlist');el.innerHTML=nets.map((n,i)=>'<div class=\"row\"><div><strong>'+esc(n.method)+'</strong> ['+esc(n.statusCode)+'] '+esc(n.durationMs)+'ms · '+esc(n.bytes)+'B · <code>'+esc(n.url)+'</code></div><details style=\"margin-top:6px\"><summary>Details & cURL</summary><pre>'+esc((n.curl||'')+'\\n\\nResponse Preview:\\n'+(n.responseBodyPreview||''))+'</pre></details></div>').join('');}"
     "async function act(name){await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:name})});if(name==='clear_logs'){logs=[];renderLogs();}}"
     "async function loadHierarchy(){let r=await fetch('/api/hierarchy');document.getElementById('hierbox').textContent=JSON.stringify(await r.json(),null,2);}"
-    "async function loadDylibs(){let r=await fetch('/api/dylibs');let d=await r.json();document.getElementById('dylibbox').innerHTML='<h4>Loaded Images ('+d.length+')</h4><div class=\"logbox\" style=\"max-height:220px\">'+d.map(x=>x.base+'  '+x.path).join('\\n')+'</div>';}"
-    "async function searchClasses(){let q=document.getElementById('clsQ').value;let r=await fetch('/api/classes?q='+encodeURIComponent(q));let d=await r.json();document.getElementById('clsbox').innerHTML='<h4>ObjC Classes ('+d.length+')</h4><div class=\"logbox\" style=\"max-height:220px\">'+d.join('\\n')+'</div>';}"
+    "async function loadDylibs(){let r=await fetch('/api/dylibs');let d=await r.json();document.getElementById('dylibbox').innerHTML='<h4>Loaded Images ('+d.length+')</h4><div class=\"logbox\" style=\"max-height:220px\">'+d.map(x=>esc(x.base)+'  '+esc(x.path)).join('\\n')+'</div>';}"
+    "async function searchClasses(){let q=document.getElementById('clsQ').value;let r=await fetch('/api/classes?q='+encodeURIComponent(q));let d=await r.json();document.getElementById('clsbox').innerHTML='<h4>ObjC Classes ('+d.length+')</h4><div class=\"logbox\" style=\"max-height:220px\">'+d.map(esc).join('\\n')+'</div>';}"
     "async function loadSandbox(){let r=await fetch('/api/sandbox');document.getElementById('sbox').textContent=JSON.stringify(await r.json(),null,2);}"
     "async function loadFrida(){let r=await fetch('/api/frida');document.getElementById('fbox').textContent=JSON.stringify(await r.json(),null,2);}"
     "async function boot(){"
@@ -579,19 +578,47 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, assign) NSUInteger frameCounter;
 @property (nonatomic, assign) CFTimeInterval lastFPSTimestamp;
-@property (nonatomic, assign) NSInteger currentFPS;
-@property (nonatomic, assign) double lastCPUPercent;
-@property (nonatomic, assign) double lastMemoryMB;
-@property (nonatomic, assign) NSUInteger lastThreadCount;
-@property (nonatomic, assign) BOOL lastJITState;
+@property (atomic, assign) NSInteger currentFPS;
+@property (atomic, assign) double lastCPUPercent;
+@property (atomic, assign) double lastMemoryMB;
+@property (atomic, assign) NSUInteger lastThreadCount;
+@property (atomic, assign) BOOL lastJITState;
 
-@property (nonatomic, assign) BOOL xrayEnabled;
+@property (atomic, assign) BOOL xrayEnabled;
 @property (nonatomic, assign) BOOL tapInspectEnabled;
-@property (nonatomic, assign) BOOL lanEnabled;
+@property (atomic, assign) BOOL lanEnabled;
+@property (nonatomic, copy) NSString *authToken;
 @property (nonatomic, strong) NSDictionary *selectedViewInfo;
 @property (nonatomic, strong) LCDebugInspectOverlayView *inspectOverlay;
 @property (nonatomic, strong) LCDebugClassicPillWindow *classicPillWindow;
 @end
+
+static NSString *LCDebugGenerateRandomToken(void) {
+    uint8_t bytes[16] = {0};
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(bytes), bytes) != errSecSuccess) {
+        arc4random_buf(bytes, sizeof(bytes));
+    }
+    NSMutableString *hex = [NSMutableString stringWithCapacity:sizeof(bytes) * 2];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        [hex appendFormat:@"%02x", bytes[i]];
+    }
+    return [hex copy];
+}
+
+static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
+    if (!a || !b) return NO;
+    const char *ca = a.UTF8String;
+    const char *cb = b.UTF8String;
+    if (!ca || !cb) return NO;
+    size_t la = strlen(ca);
+    size_t lb = strlen(cb);
+    if (la != lb || la == 0) return NO;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < la; i++) {
+        diff |= (uint8_t)ca[i] ^ (uint8_t)cb[i];
+    }
+    return diff == 0;
+}
 
 @implementation LCDebugServer
 
@@ -616,6 +643,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
         _savedStdoutFD = -1;
         _savedStderrFD = -1;
         _bonjourRef = NULL;
+        _authToken = LCDebugGenerateRandomToken();
     }
     return self;
 }
@@ -857,6 +885,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
         @"lanPort": @(self.lanPort),
         @"lanEnabled": @(self.lanEnabled),
         @"lanIP": lanIP,
+        @"authToken": self.authToken ?: @"",
         @"updatedAt": @(CFAbsoluteTimeGetCurrent())
     };
     [[NSUserDefaults lcSharedDefaults] setObject:session forKey:@"LCDebugActiveSession"];
@@ -981,7 +1010,8 @@ static NSString *LCDebugWebConsoleHTML(void) {
             if (clientFD < 0) break;
             int yes = 1;
             setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-            [weakSelf handleClientSocket:clientFD];
+            BOOL isLoopback = (clientAddr.sin_family == AF_INET && ntohl(clientAddr.sin_addr.s_addr) == INADDR_LOOPBACK);
+            [weakSelf handleClientSocket:clientFD isLoopback:isLoopback];
         }
     });
     dispatch_source_set_cancel_handler(src, ^{
@@ -991,7 +1021,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
     return src;
 }
 
-- (void)handleClientSocket:(int)clientFD {
+- (void)handleClientSocket:(int)clientFD isLoopback:(BOOL)isLoopback {
     // Read HTTP request on an async concurrent queue so blocking clients never stall accept loop.
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1025,10 +1055,30 @@ static NSString *LCDebugWebConsoleHTML(void) {
         NSString *fullPath = reqParts[1];
 
         NSInteger contentLength = 0;
+        NSString *bearerToken = nil;
+        NSString *cookieToken = nil;
         for (NSString *line in lines) {
-            if ([line.lowercaseString hasPrefix:@"content-length:"]) {
+            NSString *lower = line.lowercaseString;
+            if ([lower hasPrefix:@"content-length:"]) {
                 contentLength = [[line substringFromIndex:15] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].integerValue;
+            } else if ([lower hasPrefix:@"authorization:"]) {
+                NSString *val = [[line substringFromIndex:14] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if ([val.lowercaseString hasPrefix:@"bearer "]) {
+                    bearerToken = [[val substringFromIndex:7] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                }
+            } else if ([lower hasPrefix:@"cookie:"]) {
+                NSString *cookieVal = [line substringFromIndex:7];
+                for (NSString *part in [cookieVal componentsSeparatedByString:@";"]) {
+                    NSString *trimmed = [part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                    if ([trimmed hasPrefix:@"lc_dbg_token="]) {
+                        cookieToken = [trimmed substringFromIndex:13];
+                    }
+                }
             }
+        }
+        if (contentLength > (1024 * 1024)) {
+            close(clientFD);
+            return;
         }
         NSUInteger bodyStart = NSMaxRange(headerEnd);
         while (contentLength > 0 && (NSInteger)(raw.length - bodyStart) < contentLength) {
@@ -1043,21 +1093,51 @@ static NSString *LCDebugWebConsoleHTML(void) {
             close(clientFD);
             return;
         }
-        [strongSelf routeMethod:method target:fullPath body:bodyData clientFD:clientFD];
+
+        NSString *queryToken = nil;
+        NSURLComponents *comp = [NSURLComponents componentsWithString:fullPath];
+        for (NSURLQueryItem *q in comp.queryItems) {
+            if ([q.name isEqualToString:@"token"]) {
+                queryToken = q.value;
+                break;
+            }
+        }
+
+        NSString *setCookieToken = nil;
+        if (!isLoopback) {
+            BOOL ok = LCDebugConstantTimeEquals(queryToken, strongSelf.authToken) ||
+                      LCDebugConstantTimeEquals(bearerToken, strongSelf.authToken) ||
+                      LCDebugConstantTimeEquals(cookieToken, strongSelf.authToken);
+            if (!ok) {
+                [strongSelf writeResponseFD:clientFD status:401 contentType:"application/json" setCookieToken:nil data:LCJSONDataFromObject(@{ @"error": @"Unauthorized: provide ?token= shown in Debug HUD" })];
+                return;
+            }
+            if (queryToken.length > 0 && cookieToken.length == 0) {
+                setCookieToken = strongSelf.authToken;
+            }
+        }
+
+        [strongSelf routeMethod:method target:fullPath body:bodyData clientFD:clientFD setCookieToken:setCookieToken];
     });
 }
 
 - (void)writeResponseFD:(int)fd status:(int)status contentType:(const char *)ctype data:(NSData *)body {
-    NSString *statusText = status == 200 ? @"OK" : (status == 404 ? @"Not Found" : @"Bad Request");
+    [self writeResponseFD:fd status:status contentType:ctype setCookieToken:nil data:body];
+}
+
+- (void)writeResponseFD:(int)fd status:(int)status contentType:(const char *)ctype setCookieToken:(NSString *)cookieToken data:(NSData *)body {
+    NSString *statusText = status == 200 ? @"OK" : (status == 401 ? @"Unauthorized" : (status == 404 ? @"Not Found" : @"Bad Request"));
+    NSString *cookieHeader = cookieToken.length > 0
+        ? [NSString stringWithFormat:@"Set-Cookie: lc_dbg_token=%@; Path=/; HttpOnly; SameSite=Strict\r\n", cookieToken]
+        : @"";
     NSString *hdr = [NSString stringWithFormat:
         @"HTTP/1.1 %d %@\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %lu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "%@"
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n",
-        status, statusText, ctype, (unsigned long)body.length];
+        status, statusText, ctype, (unsigned long)body.length, cookieHeader];
     NSData *hdrData = [hdr dataUsingEncoding:NSUTF8StringEncoding];
     send(fd, hdrData.bytes, hdrData.length, 0);
     if (body.length > 0) {
@@ -1091,12 +1171,12 @@ static NSString *LCDebugWebConsoleHTML(void) {
     }
 }
 
-- (void)routeMethod:(NSString *)method target:(NSString *)target body:(NSData *)body clientFD:(int)clientFD {
+- (void)routeMethod:(NSString *)method target:(NSString *)target body:(NSData *)body clientFD:(int)clientFD setCookieToken:(NSString *)cookieToken {
     NSURLComponents *comp = [NSURLComponents componentsWithString:target];
     NSString *path = comp.path ?: target;
 
     if ([method isEqualToString:@"OPTIONS"]) {
-        [self writeResponseFD:clientFD status:200 contentType:"text/plain" data:[NSData data]];
+        [self writeResponseFD:clientFD status:200 contentType:"text/plain" setCookieToken:cookieToken data:[NSData data]];
         return;
     }
 
@@ -1105,7 +1185,6 @@ static NSString *LCDebugWebConsoleHTML(void) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "Connection: keep-alive\r\n\r\n";
         if (send(clientFD, sseHeader, strlen(sseHeader), 0) <= 0) {
             close(clientFD);
@@ -1123,7 +1202,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
 
     if ([path isEqualToString:@"/"]) {
         NSData *html = [LCDebugWebConsoleHTML() dataUsingEncoding:NSUTF8StringEncoding];
-        [self writeResponseFD:clientFD status:200 contentType:"text/html; charset=utf-8" data:html];
+        [self writeResponseFD:clientFD status:200 contentType:"text/html; charset=utf-8" setCookieToken:cookieToken data:html];
         return;
     }
 
@@ -1254,7 +1333,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
 
 - (void)setTapInspectEnabled:(BOOL)enabled {
     dispatch_async(self.serverQueue, ^{
-        self.tapInspectEnabled = enabled;
+        self->_tapInspectEnabled = enabled;
         [self broadcastSSEEvent:"telemetry" payload:[self currentStatusDictionaryUnsafe]];
     });
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1535,8 +1614,11 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
 
 - (void)handleClassicPillTap {
     NSDictionary *st = [self currentStatusDictionary];
-    NSString *msg = [NSString stringWithFormat:@"PID: %@\nLocal Port: %@\nLAN Enabled: %@ (%@:%@)",
-                     st[@"pid"], st[@"localPort"], st[@"lanEnabled"], st[@"lanIP"], st[@"lanPort"]];
+    NSString *msg = self.lanEnabled
+        ? [NSString stringWithFormat:@"PID: %@\nLocal Port: %@\nLAN: %@:%@\nLAN Token: %@",
+           st[@"pid"], st[@"localPort"], st[@"lanIP"], st[@"lanPort"], self.authToken ?: @""]
+        : [NSString stringWithFormat:@"PID: %@\nLocal Port: %@\nLAN Console: Off",
+           st[@"pid"], st[@"localPort"]];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"LiveContainer Debug" message:msg preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:self.xrayEnabled ? @"Disable UI X-Ray" : @"Enable UI X-Ray" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1589,9 +1671,12 @@ void LCDebugAgentInitIfNeeded(void) {
             return;
         }
 
-        g_orig_dyld_image_count = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "orig_dyld_image_count");
-        g_orig_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "orig_dyld_get_image_name");
-        g_orig_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "orig_dyld_get_image_header");
+        uint32_t (**pCount)(void) = (uint32_t (**)(void))dlsym(RTLD_DEFAULT, "orig_dyld_image_count");
+        const char *(**pName)(uint32_t) = (const char *(**)(uint32_t))dlsym(RTLD_DEFAULT, "orig_dyld_get_image_name");
+        const struct mach_header *(**pHdr)(uint32_t) = (const struct mach_header *(**)(uint32_t))dlsym(RTLD_DEFAULT, "orig_dyld_get_image_header");
+        if (pCount && *pCount) g_orig_dyld_image_count = *pCount;
+        if (pName && *pName) g_orig_dyld_get_image_name = *pName;
+        if (pHdr && *pHdr) g_orig_dyld_get_image_header = *pHdr;
 
         [LCDebugServer.shared start];
     });

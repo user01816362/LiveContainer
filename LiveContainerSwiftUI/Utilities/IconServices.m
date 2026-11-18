@@ -105,7 +105,6 @@
 -(id)suggestedRecipe;
 -(void)setSuggestedRecipe:(id)suggestedRecipe;
 -(void)setResourceType:(NSUInteger)type;
--(void)setIconShape:(NSUInteger)type; // below ios 17
 @end
 
 @interface ISBundleResourceProvider : NSObject
@@ -218,8 +217,6 @@ NSMutableSet<ISBundleIcon*>* iconsNeedToGenerateOriginalIcon;
 @end
 
 BOOL saveCGImage(CGImageRef image, NSURL *url) {
-    // 1. Define the file type (PNG is lossless)
-    // For older systems, use kUTTypePNG
     CFStringRef type = (__bridge CFStringRef)(UTTypePNG.identifier);
 
     // 2. Create the image destination

@@ -10,6 +10,7 @@
 #import "FoundationPrivate.h"
 #import "AppSceneViewController.h"
 
+NS_SWIFT_UI_ACTOR
 @interface PiPManager : NSObject<AVPictureInPictureControllerDelegate>
 @property (class, nonatomic, readonly) PiPManager *shared;
 @property (nonatomic, readonly) bool isPiP;

@@ -10,6 +10,7 @@ import Metal
 import SwiftUI
 
 /// Delegate bridging container persistence and app-level metadata into ``LCContainerView``.
+@MainActor
 protocol LCContainerViewDelegate {
     func unbindContainer(container: LCContainer)
     func setDefaultContainer(container: LCContainer)
@@ -36,7 +37,7 @@ struct LCContainerView: View {
     @EnvironmentObject private var sharedModel: SharedModel
 
     @State private var typingContainerName: String
-    @State private var typingIDFV: String = ""
+    @State private var typingIDFV: String
     @State private var typingSpoofDeviceName: String
     @State private var typingSpoofDeviceModel: String
     @State private var typingSpoofSystemName: String
@@ -833,7 +834,17 @@ struct LCContainerView: View {
             labeledTextRow("WebGL Vendor", placeholder: "Apple Inc.", text: $container.spoofWebGLVendor)
             labeledTextRow("WebGL Renderer", placeholder: "Apple GPU", text: $container.spoofWebGLRenderer)
             featureToggle("Override Canvas Output", "web.canvas")
-            labeledTextRow("Canvas Data URL", placeholder: "data:image/png;base64,...", text: $container.spoofWebCanvasDataURL)
+            HStack {
+                labeledTextRow("Canvas & Audio Farbling Seed", placeholder: "0xA53F91C2", text: $container.spoofWebCanvasSeed)
+                Button {
+                    container.spoofWebCanvasSeed = String(format: "0x%08X", UInt32.random(in: 1...UInt32.max))
+                    _ = saveSpoofProfile()
+                } label: {
+                    Image(systemName: "die.face.5")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Randomize Canvas Farbling Seed")
+            }
             Stepper("Color Depth: \(container.spoofWebColorDepth)", value: $container.spoofWebColorDepth, in: 1...64)
                 .onChange(of: container.spoofWebColorDepth) { _, _ in _ = saveSpoofProfile() }
             Button("Save WebView") { _ = saveSpoofProfile() }
@@ -1401,9 +1412,9 @@ struct LCContainerView: View {
     func currentSysctlString(_ name: String) -> String {
         var size = 0
         guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "" }
-        var value = [CChar](repeating: 0, count: size)
+        var value = [UInt8](repeating: 0, count: size)
         guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return "" }
-        return String(cString: value)
+        return String(decoding: value.prefix(while: { $0 != 0 }), as: UTF8.self)
     }
 
     func currentSysctlInt64(_ name: String) -> Int64 {

@@ -50,7 +50,9 @@ void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (
             // apps with glass has an extra top safe area space, so clear it (will it cause inconsistencies?)
             orig.top = 0;
         }
-        UIEdgeInsets insets = UIEdgeInsetsMake(orig.top / transform.d, orig.left / transform.a, orig.bottom / transform.d, orig.right / transform.a);
+        CGFloat scaleX = fabs(transform.a) > 1e-6 ? transform.a : 1.0;
+        CGFloat scaleY = fabs(transform.d) > 1e-6 ? transform.d : 1.0;
+        UIEdgeInsets insets = UIEdgeInsetsMake(orig.top / scaleY, orig.left / scaleX, orig.bottom / scaleY, orig.right / scaleX);
         settings.safeAreaEdgeInsets = insets;
         // fix orientation
         settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(insets, settings.interfaceOrientation);

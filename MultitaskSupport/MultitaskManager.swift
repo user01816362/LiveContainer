@@ -5,38 +5,36 @@
 //  Created by s s on 2026/3/20.
 //
 
-enum MultitaskMode : Int {
+import Foundation
+import os
+
+enum MultitaskMode : Int, Sendable {
     case virtualWindow = 0
     case nativeWindow = 1
 }
 
-@objc class MultitaskManager : NSObject {
-    static private let lock = NSLock()
-    static private var usingMultitaskContainers : [String] = []
+@objc final class MultitaskManager : NSObject {
+    private static let usingContainers = OSAllocatedUnfairLock(initialState: [String]())
     
     @objc class func registerMultitaskContainer(container: String) {
-        lock.withLock {
-            if !usingMultitaskContainers.contains(container) {
-                usingMultitaskContainers.append(container)
+        usingContainers.withLock { list in
+            if !list.contains(container) {
+                list.append(container)
             }
         }
     }
     
     @objc class func unregisterMultitaskContainer(container: String) {
-        lock.withLock {
-            usingMultitaskContainers.removeAll(where: { $0 == container })
+        usingContainers.withLock { list in
+            list.removeAll(where: { $0 == container })
         }
     }
     
     @objc class func isUsing(container: String) -> Bool {
-        lock.withLock {
-            usingMultitaskContainers.contains(container)
-        }
+        usingContainers.withLock { $0.contains(container) }
     }
     
     @objc class func isMultitasking() -> Bool {
-        lock.withLock {
-            !usingMultitaskContainers.isEmpty
-        }
+        usingContainers.withLock { !$0.isEmpty }
     }
 }

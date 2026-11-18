@@ -119,25 +119,31 @@ static UIScreen *LCFallbackActiveScreen(void) {
     
     __weak typeof(self) weakSelf = self;
     [_extension setRequestCancellationBlock:^(NSUUID *uuid, NSError *error) {
-        [weakSelf appTerminationCleanUp];
-        [weakSelf.delegate appSceneVC:weakSelf didInitializeWithError:error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf appTerminationCleanUp];
+            [strongSelf.delegate appSceneVC:strongSelf didInitializeWithError:error];
+        });
     }];
     [_extension setRequestInterruptionBlock:^(NSUUID *uuid) {
-        [weakSelf appTerminationCleanUp];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf appTerminationCleanUp];
+        });
     }];
     [_extension beginExtensionRequestWithInputItems:@[item] completion:^(NSUUID *identifier) {
-        if(identifier) {
-            [MultitaskManager registerMultitaskContainerWithContainer:self.dataUUID];
-            self.identifier = identifier;
-            self.pid = [self.extension pidForRequestIdentifier:self.identifier];
-            [delegate appSceneVC:self didInitializeWithError:nil];
-            dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if(identifier) {
+                [MultitaskManager registerMultitaskContainerWithContainer:self.dataUUID];
+                self.identifier = identifier;
+                self.pid = [self.extension pidForRequestIdentifier:self.identifier];
+                [delegate appSceneVC:self didInitializeWithError:nil];
                 [self setUpAppPresenter];
-            });
-        } else {
-            NSError* error = [NSError errorWithDomain:@"LiveProcess" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to start app. Child process has unexpectedly crashed"}];
-            [delegate appSceneVC:self didInitializeWithError:error];
-        }
+            } else {
+                NSError* error = [NSError errorWithDomain:@"LiveProcess" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to start app. Child process has unexpectedly crashed"}];
+                [delegate appSceneVC:self didInitializeWithError:error];
+            }
+        });
     }];
     
     return self;
@@ -171,11 +177,11 @@ static UIScreen *LCFallbackActiveScreen(void) {
         clientSettings.statusBarStyle = 0;
     };
 
-    // Use _UISceneHostingController (iOS 27+)
+    // Use _UISceneHostingController (iOS 26/27+)
     _UISceneHostingControllerAdvancedConfiguration *config = [[_UISceneHostingControllerAdvancedConfiguration alloc] initWithProcessIdentity:processHandle.identity];
     config.sceneSpecification = specification;
     self.hostingController = [[_UISceneHostingController alloc] initWithAdvancedConfiguration:config];
-    /// !! do NOT use self.hostingController.sceneView here as it breaks keyboard focus on iOS 26 below. Maybe sceneView didn't initialize its ViewController properly?
+    // Use sceneViewController.view rather than sceneView so the child VC owns its responder chain cleanly
     self.contentView = self.hostingController.sceneViewController.view;
     self.contentView.clipsToBounds = NO;
     @try {
@@ -272,10 +278,6 @@ static UIScreen *LCFallbackActiveScreen(void) {
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
             settings.interfaceOrientation = self.view.window.windowScene.effectiveGeometry.interfaceOrientation;
             CGRect frame = self.view.frame;
-            if(!self.usesHostingControllerAPI) {
-                frame.size.width /= self.scaleRatio;
-                frame.size.height /= self.scaleRatio;
-            }
             if(UIInterfaceOrientationIsLandscape(settings.interfaceOrientation)) {
                 CGSize size = frame.size;
                 frame.size.width = size.height;
@@ -301,14 +303,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
         return;
     }
     
-    if(!_hostingController && self.contentView) {
-        // Legacy path
-        [self.presenter.scene updateSettingsWithBlock:updateSettingsBlock];
-        return;
-    }
-    
-    /// iOS 18.0 path, most are automatically handled by setting values to _UISceneHostingViewController
-    /// This is also reachable on legacy path when contentView is nil during early setup
+    // Properties are applied through _UISceneHostingViewController (or pre-scene setup before contentView exists)
     UIMutableApplicationSceneSettings *tempSettings = [self.presenter.scene.settings mutableCopy];
     if(!tempSettings) {
         tempSettings = [UIMutableApplicationSceneSettings new];
@@ -342,17 +337,14 @@ static UIScreen *LCFallbackActiveScreen(void) {
         if(self.sceneID) {
             [[PrivClass(FBSceneManager) sharedInstance] destroyScene:self.sceneID withTransitionContext:nil];
         }
-        if(self.usesHostingControllerAPI) {
+        if(self.hostingController) {
             [self.hostingController invalidate];
             [self.hostingController.sceneViewController willMoveToParentViewController:nil];
             [self.hostingController.sceneViewController.view removeFromSuperview];
             [self.hostingController.sceneViewController removeFromParentViewController];
             self.hostingController = nil;
-        } else if(self.presenter){
-            [self.presenter deactivate];
-            [self.presenter invalidate];
-            self.presenter = nil;
         }
+        self.presenter = nil;
 
         [LCSharedUtils wipeStrictContainerForDataUUIDIfNeeded:self.dataUUID];
         
@@ -362,25 +354,12 @@ static UIScreen *LCFallbackActiveScreen(void) {
 }
 
 - (void)setBackgroundNotificationEnabled:(bool)enabled {
-    if(self.usesHostingControllerAPI) {
-        /// Issue with new API: FBSSceneObserver takes priority over to send UIApplicationWillResignActiveNotification regressed #942,
-        /// so here we make it foreground (UIApplicationDidBecomeActiveNotification) again.
-        [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-            settings.foreground = YES;
-            settings.deactivationReasons = 0;
-        }];
-        return;
-    }
-    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
-    if(enabled) {
-        // Re-add UIApplicationDidEnterBackgroundNotification
-        [center addObserver:self.extension selector:@selector(_hostDidEnterBackgroundNote:) name:UIApplicationDidEnterBackgroundNotification object:UIApp];
-        [center addObserver:self.extension selector:@selector(_hostWillResignActiveNote:) name:UIApplicationWillResignActiveNotification object:UIApp];
-    } else {
-        // Remove UIApplicationDidEnterBackgroundNotification so apps like YouTube can continue playing video
-        [center removeObserver:self.extension name:UIApplicationDidEnterBackgroundNotification object:UIApp];
-        [center removeObserver:self.extension name:UIApplicationWillResignActiveNotification object:UIApp];
-    }
+    (void)enabled;
+    // Keep the hosted scene foregrounded so FBSSceneObserver does not push unwanted resign-active transitions
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        settings.foreground = YES;
+        settings.deactivationReasons = 0;
+    }];
 }
 
 - (void)viewDidMoveToWindow:(UIWindow *)newWindow shouldAppearOrDisappear:(BOOL)appear {
@@ -417,10 +396,6 @@ static UIScreen *LCFallbackActiveScreen(void) {
         context.actions = [NSSet setWithObject:action];
         return context;
     }];
-}
-
-- (BOOL)usesHostingControllerAPI {
-    return _hostingController != nil;
 }
 
 @end

@@ -9,6 +9,7 @@
 #import "LCSharedUtils.h"
 #import "utils.h"
 #import <dlfcn.h>
+#import <os/lock.h>
 #import <signal.h>
 
 @interface LCLivePlugIn ()
@@ -20,6 +21,7 @@
 @property(nonatomic) BOOL finished;
 @end
 
+static os_unfair_lock launchesLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSUUID *, LCLivePlugIn *> *launches;
 static NSMutableDictionary<NSNumber *, xpc_connection_t> *pendingConnections;
 static NSMutableDictionary<NSNumber *, xpc_object_t> *pendingRequests;
@@ -34,19 +36,25 @@ static NSError *LCProcessError(NSString *description) {
 
 @implementation LCLivePlugIn
 
++ (void)removeLaunch:(NSUUID *)identifier {
+    if (!identifier) return;
+    os_unfair_lock_lock(&launchesLock);
+    [launches removeObjectForKey:identifier];
+    os_unfair_lock_unlock(&launchesLock);
+}
+
 + (LCLivePlugIn *)processWithPID:(pid_t)pid {
     if (pid <= 0) return nil;
-    for (LCLivePlugIn *process in launches.allValues) {
+    os_unfair_lock_lock(&launchesLock);
+    NSArray<LCLivePlugIn *> *snapshot = launches.allValues;
+    os_unfair_lock_unlock(&launchesLock);
+    for (LCLivePlugIn *process in snapshot) {
         if (process.pid == pid) return process;
     }
     return nil;
 }
 
 + (void)resolvePendingRequests {
-    BOOL isSpawning = NO;
-    for (LCLivePlugIn *process in launches.allValues) {
-        if (!process.pid) isSpawning = YES;
-    }
     for (NSNumber *pid in pendingRequests.allKeys) {
         LCLivePlugIn *process = [self processWithPID:pid.intValue];
         xpc_connection_t peer = pendingConnections[pid];
@@ -67,7 +75,11 @@ static NSError *LCProcessError(NSString *description) {
 + (void)startServer {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        launches = [NSMutableDictionary new];
+        os_unfair_lock_lock(&launchesLock);
+        if (!launches) {
+            launches = [NSMutableDictionary new];
+        }
+        os_unfair_lock_unlock(&launchesLock);
         pendingConnections = [NSMutableDictionary new];
         pendingRequests = [NSMutableDictionary new];
         NSString *appGroup = LCSharedUtils.appGroupID;
@@ -99,7 +111,11 @@ static NSError *LCProcessError(NSString *description) {
                 for (xpc_connection_t connection in pendingConnections.allValues) xpc_connection_cancel(connection);
                 [pendingConnections removeAllObjects];
                 [pendingRequests removeAllObjects];
-                for (LCLivePlugIn *process in launches.allValues) {
+                os_unfair_lock_lock(&launchesLock);
+                NSArray<LCLivePlugIn *> *snapshot = launches.allValues;
+                [launches removeAllObjects];
+                os_unfair_lock_unlock(&launchesLock);
+                for (LCLivePlugIn *process in snapshot) {
                     [process failWithError:listenerError];
                 }
                 return;
@@ -117,7 +133,10 @@ static NSError *LCProcessError(NSString *description) {
                         [pendingConnections removeObjectForKey:pid];
                         [pendingRequests removeObjectForKey:pid];
                     }
-
+                    if (process && process.connection == peer) {
+                        process.finished = YES;
+                        [LCLivePlugIn removeLaunch:process.identifier];
+                    }
                     return;
                 }
                 if (xpc_get_type(event) != XPC_TYPE_DICTIONARY) return;
@@ -188,7 +207,14 @@ static NSError *LCProcessError(NSString *description) {
     _configurationData = [NSKeyedArchiver archivedDataWithRootObject:configuration requiringSecureCoding:NO error:&error];
     _finished = NO;
     
-    launches[self.identifier] = self;
+    os_unfair_lock_lock(&launchesLock);
+    if (!launches) {
+        launches = [NSMutableDictionary new];
+    }
+    if (self.identifier) {
+        launches[self.identifier] = self;
+    }
+    os_unfair_lock_unlock(&launchesLock);
 
     return self;
 }
@@ -215,6 +241,8 @@ static NSError *LCProcessError(NSString *description) {
 }
 
 - (void)failWithError:(NSError *)error {
+    self.finished = YES;
+    [LCLivePlugIn removeLaunch:self.identifier];
     [NSUserDefaults.lcUserDefaults setObject:[NSString stringWithFormat:@"LivePlugIn encountered an error: %@", error.localizedDescription] forKey:@"error"];
 }
 

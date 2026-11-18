@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import UIKit
 
+@MainActor
 protocol LCAppBannerDelegate {
     func removeApp(app: LCAppModel)
     func installMdm(data: Data)

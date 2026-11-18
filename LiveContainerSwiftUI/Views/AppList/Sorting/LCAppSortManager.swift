@@ -9,7 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 
-enum AppSortType: String, CaseIterable {
+enum AppSortType: String, CaseIterable, Sendable {
     case defaultOrder = "default"
     case alphabetical = "alphabetical"
     case reverseAlphabetical = "reverse_alphabetical"
@@ -53,9 +53,10 @@ enum AppSortType: String, CaseIterable {
 }
 
 /// Manages the state and logic for sorting the list of applications.
+@MainActor
 class LCAppSortManager: ObservableObject {
     
-    static var shared: LCAppSortManager = LCAppSortManager()
+    static let shared: LCAppSortManager = LCAppSortManager()
     
     @AppStorage("LCAppSortType", store: LCUtils.appGroupUserDefault) var appSortType: AppSortType = .defaultOrder {
         didSet {

@@ -183,17 +183,37 @@ int checkCert(NSData *key,
             int ouIndex = X509_NAME_get_index_by_NID(subject_name, NID_organizationalUnitName, -1);
             if(ouIndex >= 0) {
                 X509_NAME_ENTRY* ext = X509_NAME_get_entry(subject_name, ouIndex);
-                ASN1_STRING* ouAsn1Str = X509_NAME_ENTRY_get_data(ext);
-                organizationalUnitName = @((const char*)ASN1_STRING_get0_data(ouAsn1Str));
+                ASN1_STRING* ouAsn1Str = ext ? X509_NAME_ENTRY_get_data(ext) : NULL;
+                const unsigned char *ouBytes = ouAsn1Str ? ASN1_STRING_get0_data(ouAsn1Str) : NULL;
+                int ouLen = ouAsn1Str ? ASN1_STRING_length(ouAsn1Str) : 0;
+                if (ouBytes && ouLen > 0) {
+                    organizationalUnitName = [[NSString alloc] initWithBytes:ouBytes length:(NSUInteger)ouLen encoding:NSUTF8StringEncoding];
+                }
             }
             NSLog(@"organizationalUnitName = %@", organizationalUnitName);
-            NSString *fullDateString = [NSString stringWithFormat:@"20%s", expirationDateAsn1->data];
+            NSString *fullDateString = nil;
+            if (expirationDateAsn1) {
+                const unsigned char *dateBytes = ASN1_STRING_get0_data(expirationDateAsn1);
+                int dateLen = ASN1_STRING_length(expirationDateAsn1);
+                NSString *rawDate = (dateBytes && dateLen > 0)
+                    ? [[NSString alloc] initWithBytes:dateBytes length:(NSUInteger)dateLen encoding:NSASCIIStringEncoding]
+                    : nil;
+                if (rawDate.length >= 2) {
+                    if (ASN1_STRING_type(expirationDateAsn1) == V_ASN1_GENERALIZEDTIME) {
+                        fullDateString = rawDate;
+                    } else if (ASN1_STRING_type(expirationDateAsn1) == V_ASN1_UTCTIME) {
+                        NSInteger twoDigitYear = [[rawDate substringToIndex:2] integerValue];
+                        NSString *century = (twoDigitYear >= 50) ? @"19" : @"20";
+                        fullDateString = [century stringByAppendingString:rawDate];
+                    }
+                }
+            }
 
             NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
             formatter.dateFormat = @"yyyyMMddHHmmss'Z'";
-            formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-            formatter.locale = NSLocale.currentLocale;
-            NSDate *expirationDate = [formatter dateFromString:fullDateString];
+            formatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+            formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+            NSDate *expirationDate = fullDateString ? [formatter dateFromString:fullDateString] : nil;
 
             int status = 2, reason = 0;
             if (basic && OCSP_resp_find_status(basic, cert_id, &status, &reason, NULL, NULL, NULL)) {

@@ -15,7 +15,7 @@ import UIKit
 /// ``LCDeviceProfileCatalog.h`` (`LCDeviceHardwareSpec`).
 struct LCDeviceModelSpec: Identifiable, Hashable, Sendable {
     /// UI grouping categories for the hardware picker.
-    enum GroupKind: String, CaseIterable, Identifiable {
+    enum GroupKind: String, CaseIterable, Identifiable, Sendable {
         case iPhone18AndDuo = "iPhone 18 & Duo (2026–2027)"
         case iPhone17AndAir = "iPhone 17 & Air"
         case iPhone16AndEarlier = "iPhone 16 / 15 / 14"
@@ -141,7 +141,7 @@ struct LCDeviceModelSpec: Identifiable, Hashable, Sendable {
 }
 
 /// Global policy controlling how newly created app containers receive spoof profiles.
-enum LCGlobalDefaultProfileMode: String, Codable, CaseIterable, Identifiable {
+enum LCGlobalDefaultProfileMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case off
     case randomCoherentPhone
     case preset
@@ -169,8 +169,8 @@ enum LCGlobalDefaultProfileMode: String, Codable, CaseIterable, Identifiable {
 }
 
 /// Complete, serializable container profile preset supporting built-in 2026/2027 templates and user presets.
-struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
-    struct Payload: Codable, Equatable, Hashable {
+struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable, Sendable {
+    struct Payload: Codable, Equatable, Hashable, Sendable {
         var strictTestMode: Bool = false
         var strictAutoWipeOnExit: Bool = false
         var isolateAppGroup: Bool = false
@@ -257,7 +257,7 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
         var customUserAgent: String = ""
         var webGLVendor: String = "Apple Inc."
         var webGLRenderer: String = "Apple GPU"
-        var webCanvasDataURL: String = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        var webCanvasSeed: String? = "0xA53F91C2"
         var webColorDepth: Int = 24
         var featureOverrides: [String: Bool] = [:]
     }
@@ -271,6 +271,7 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
     var payload: Payload
 
     /// Builds a preset capturing all settings from an existing ``LCContainer``.
+    @MainActor
     static func from(
         container: LCContainer,
         id: String = "custom.\(UUID().uuidString)",
@@ -363,7 +364,7 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
             customUserAgent: container.spoofCustomUserAgent,
             webGLVendor: container.spoofWebGLVendor,
             webGLRenderer: container.spoofWebGLRenderer,
-            webCanvasDataURL: container.spoofWebCanvasDataURL,
+            webCanvasSeed: container.spoofWebCanvasSeed,
             webColorDepth: container.spoofWebColorDepth,
             featureOverrides: container.spoofFeatureOverrides
         )
@@ -381,6 +382,7 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
 
     /// Applies this preset onto `container`, generating fresh unique per-container identifiers
     /// (IDFV, Volume UUID, Subscriber ID, Carrier Token, Boot Time) so separate containers never link.
+    @MainActor
     func apply(to container: LCContainer) {
         let p = payload
         container.isolateAppGroup = p.isolateAppGroup || p.strictTestMode
@@ -480,7 +482,11 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
         container.spoofCustomUserAgent = p.customUserAgent
         container.spoofWebGLVendor = p.webGLVendor
         container.spoofWebGLRenderer = p.webGLRenderer
-        container.spoofWebCanvasDataURL = p.webCanvasDataURL
+        if let customSeed = p.webCanvasSeed, !customSeed.isEmpty, customSeed != "0xA53F91C2" {
+            container.spoofWebCanvasSeed = customSeed
+        } else {
+            container.spoofWebCanvasSeed = String(format: "0x%08X", UInt32.random(in: 1...UInt32.max))
+        }
         container.spoofWebColorDepth = p.webColorDepth
         container.spoofFeatureOverrides = p.featureOverrides
     }
@@ -649,6 +655,7 @@ struct LCProfilePreset: Codable, Identifiable, Equatable, Hashable {
 }
 
 /// Manages custom user presets and the global default new-container policy in App Group defaults.
+@MainActor
 final class LCProfilePresetStore: ObservableObject {
     static let shared = LCProfilePresetStore()
 

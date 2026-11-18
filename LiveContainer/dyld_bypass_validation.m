@@ -14,9 +14,22 @@
 #include <mach/mach.h>
 #include <sys/syscall.h>
 
+#include <mach-o/getsect.h>
 #include "dyld_bypass_validation.h"
 #include "litehook.h"
 #include "utils.h"
+
+int (*orig_dyld_fcntl)(int fildes, int cmd, void *param) = NULL;
+void *(*orig_dyld_mmap)(void *addr, size_t len, int prot, int flags, int fd, off_t offset) = NULL;
+
+static size_t getDyldTextScanLimit(const char *dyldBase) {
+    unsigned long textSize = 0;
+    uint8_t *textPtr = getsegmentdata((const struct mach_header_64 *)dyldBase, SEG_TEXT, &textSize);
+    if (textPtr != NULL && textSize >= sizeof(uint32_t)) {
+        return (size_t)textSize;
+    }
+    return 0x100000;
+}
 
 static int (*orig_fcntl)(int fildes, int cmd, void *param) = 0;
 
@@ -93,9 +106,14 @@ static int hooked___fcntl(int fildes, int cmd, void *param) {
 }
 
 char *searchDyldFunction(char *base, const char *signature, int length) {
+    if (!base || !signature || length <= 0) {
+        return NULL;
+    }
+    size_t limit = getDyldTextScanLimit(base);
+    size_t sigLen = (size_t)length;
     char *patchAddr = NULL;
-    for(int i=0; i < 0x80000; i+=4) {
-        if (base[i] == signature[0] && memcmp(base+i, signature, length) == 0) {
+    for (size_t i = 0; i + sigLen <= limit; i += 4) {
+        if (base[i] == signature[0] && memcmp(base + i, signature, sigLen) == 0) {
             patchAddr = base + i;
             break;
         }
@@ -135,15 +153,18 @@ void searchDyldFunctions(void) {
     if(orig_dyld_fcntl && orig_dyld_mmap) return;
     
     // TODO: cache offset and litehook_find_dsc_symbol
-    char *dyldBase = (char *)_alt_dyld_get_all_image_infos()->dyldImageLoadAddress;
+    const struct dyld_all_image_infos *infos = _alt_dyld_get_all_image_infos();
+    char *dyldBase = infos ? (char *)infos->dyldImageLoadAddress : NULL;
+    if (!dyldBase) return;
     orig_dyld_fcntl = (void *)searchDyldFunction(dyldBase, fcntlSig, sizeof(fcntlSig));
     orig_dyld_mmap = (void *)searchDyldFunction(dyldBase, mmapSig, sizeof(mmapSig));
     
     // dopamine already hooked it, try to find its hook instead
     if(!orig_dyld_fcntl) {
         char* fcntlAddr = 0;
+        size_t dyldTextLimit = getDyldTextScanLimit(dyldBase);
         // search all syscalls and see if the the instruction before it is a branch instruction
-        for(int i=0; i < 0x80000; i+=4) {
+        for(size_t i=4; i + sizeof(syscallSig) <= dyldTextLimit; i+=4) {
             if (dyldBase[i] == syscallSig[0] && memcmp(dyldBase+i, syscallSig, 4) == 0) {
                 char* syscallAddr = dyldBase + i;
                 uint32_t* prev = (uint32_t*)(syscallAddr - 4);

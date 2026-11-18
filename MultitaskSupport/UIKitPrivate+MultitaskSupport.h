@@ -287,7 +287,7 @@ extern const UIApplication *UIApp;
 - (void)viewDidMoveToWindow:(UIWindow *)window shouldAppearOrDisappear:(BOOL)appear;
 @end
 
-/// The following private API is used to properly configure keyboard focus for iOS 17.4+
+/// _UISceneHostingController & keyboard focus configuration APIs for iOS 26/27+
 @interface _UISceneHostingControllerAdvancedConfiguration : NSObject
 @property(retain, nonatomic) UIApplicationSceneSpecification *sceneSpecification;
 @property(retain, nonatomic) NSOrderedSet *additionalExtensions;
@@ -309,7 +309,7 @@ extern const UIApplication *UIApp;
 - (void)invalidate;
 @end
 
-// iOS 17.0-26.x the class was named _UISceneHostingEventDeferringHostComponent
+// Event deferring host component used with _UISceneHostingController
 @interface _UISceneEventDeferringHostComponent : NSObject
 @property(nonatomic) NSInteger grantBehavior;
 @property(nonatomic) NSInteger selectionRequestBehavior;

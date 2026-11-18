@@ -115,6 +115,7 @@ public struct DocModifier: ViewModifier {
         docController = nil
     }
 
+    @MainActor
     class Coordinator: NSObject, UIDocumentPickerDelegate {
         var callback: ([URL]) -> ()
         private let onDismiss: () -> Void
@@ -310,20 +311,6 @@ extension UIApplication {
 }
 
 extension FileManager {
-    func calculateDirectorySize(at url: URL) -> UInt64 {
-        var totalSize: UInt64 = 0
-        let keys: [URLResourceKey] = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileSizeKey]
-        guard let enumerator = enumerator(at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else {
-            return 0
-        }
-        for case let fileURL as URL in enumerator {
-            guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
-                  values.isRegularFile == true else { continue }
-            totalSize += UInt64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
-        }
-        return totalSize
-    }
-
     func nextAvailableCopyURL(for url: URL, isDirectory: Bool) -> URL {
         let dir = url.deletingLastPathComponent()
         let baseName = isDirectory ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
@@ -358,17 +345,6 @@ struct ActivityViewController: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: UIViewControllerRepresentableContext<ActivityViewController>) {}
 }
 
-private class SizedHostingController<Content: View>: UIHostingController<Content> {
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-
-        let size = sizeThatFits(in: UIView.layoutFittingCompressedSize)
-        if preferredContentSize != size {
-            preferredContentSize = size
-        }
-    }
-}
-
 struct IconImageView: View {
     var icon: UIImage
 
@@ -394,7 +370,7 @@ extension UIViewController {
             return nil
         }
 
-        return await withUnsafeContinuation { continuation in
+        return await withCheckedContinuation { continuation in
             let finishConfirmation =  { (result: Bool?, alert: UIAlertController?) in
                 alert?.dismiss(animated: true) {
                     continuation.resume(returning: result)

@@ -10,14 +10,14 @@ import Foundation
 import SwiftUI
 import Combine
 
-struct LCDebugLogEntry: Identifiable, Decodable, Hashable {
+struct LCDebugLogEntry: Identifiable, Decodable, Hashable, Sendable {
     let id: String
     let timestamp: Double?
     let stream: String
     let text: String
 }
 
-struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable {
+struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable, Sendable {
     let id: String
     let timestamp: Double?
     let method: String
@@ -34,7 +34,7 @@ struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable {
     let error: String
 }
 
-struct LCDebugSelectedView: Decodable, Hashable {
+struct LCDebugSelectedView: Decodable, Hashable, Sendable {
     let viewClass: String
     let viewController: String
     let frame: String
@@ -62,7 +62,7 @@ struct LCDebugSelectedView: Decodable, Hashable {
     }
 }
 
-struct LCDebugStatusSnapshot: Decodable {
+struct LCDebugStatusSnapshot: Decodable, Sendable {
     let pid: Int?
     let bundleId: String?
     let localPort: Int?
@@ -79,7 +79,7 @@ struct LCDebugStatusSnapshot: Decodable {
     let selectedView: LCDebugSelectedView?
 }
 
-struct LCDebugDylibEntry: Identifiable, Decodable, Hashable {
+struct LCDebugDylibEntry: Identifiable, Decodable, Hashable, Sendable {
     var id: String { "\(index)-\(base)" }
     let index: Int
     let base: String
@@ -88,7 +88,7 @@ struct LCDebugDylibEntry: Identifiable, Decodable, Hashable {
     let isSystem: Bool
 }
 
-struct LCDebugClassDetail: Decodable, Hashable {
+struct LCDebugClassDetail: Decodable, Hashable, Sendable {
     let className: String
     let superclassName: String
     let image: String
@@ -106,21 +106,21 @@ struct LCDebugClassDetail: Decodable, Hashable {
     }
 }
 
-struct LCDebugSandboxFile: Identifiable, Decodable, Hashable {
+struct LCDebugSandboxFile: Identifiable, Decodable, Hashable, Sendable {
     var id: String { path }
     let path: String
     let size: Int64
     let type: String
 }
 
-struct LCDebugKeychainItem: Identifiable, Decodable, Hashable {
+struct LCDebugKeychainItem: Identifiable, Decodable, Hashable, Sendable {
     var id: String { "\(service)-\(account)-\(accessGroup)" }
     let account: String
     let service: String
     let accessGroup: String
 }
 
-struct LCDebugSandboxSummary: Decodable {
+struct LCDebugSandboxSummary: Decodable, Sendable {
     let home: String
     let files: [LCDebugSandboxFile]
     let userDefaults: [String: String]
@@ -149,7 +149,7 @@ struct LCDebugSandboxSummary: Decodable {
     }
 }
 
-private enum LCDebugAnyCodable: Decodable {
+private enum LCDebugAnyCodable: Decodable, Sendable {
     case string(String)
     case number(Double)
     case bool(Bool)
@@ -182,7 +182,7 @@ private enum LCDebugAnyCodable: Decodable {
     }
 }
 
-struct LCDebugFridaInfo: Decodable {
+struct LCDebugFridaInfo: Decodable, Sendable {
     let pid: Int
     let bundleId: String
     let executablePath: String
@@ -195,7 +195,7 @@ struct LCDebugFridaInfo: Decodable {
     let lldbCmd: String
 }
 
-enum LCDebugInspectorTab: String, CaseIterable, Identifiable {
+enum LCDebugInspectorTab: String, CaseIterable, Identifiable, Sendable {
     case console = "Console"
     case network = "Network"
     case hierarchy = "Hierarchy"
@@ -226,6 +226,7 @@ final class LCDebugStudioManager: ObservableObject {
     @Published var lanPort: Int = 0
     @Published var isMacLANEnabled = false
     @Published var lanIP: String = ""
+    @Published var authToken: String = ""
     @Published var cpuPercent: Double = 0
     @Published var memoryMB: Double = 0
     @Published var fps: Int = 0
@@ -259,12 +260,19 @@ final class LCDebugStudioManager: ObservableObject {
 
     var macLANURLString: String? {
         guard isMacLANEnabled, !lanIP.isEmpty, lanPort > 0 else { return nil }
+        if !authToken.isEmpty {
+            return "http://\(lanIP):\(lanPort)?token=\(authToken)"
+        }
         return "http://\(lanIP):\(lanPort)"
     }
 
     private var baseURL: URL? {
         guard localPort > 0 else { return nil }
         return URL(string: "http://127.0.0.1:\(localPort)")
+    }
+
+    deinit {
+        session.invalidateAndCancel()
     }
 
     func startConnecting(expectedPID: Int32) {
@@ -284,6 +292,7 @@ final class LCDebugStudioManager: ObservableObject {
                     if expectedPID <= 0 || sessionPID == Int(expectedPID) || sessionPID > 0 {
                         self.localPort = port
                         self.pid = sessionPID
+                        self.authToken = info["authToken"] as? String ?? ""
                         await self.bootstrapConnection()
                         return
                     }
@@ -331,7 +340,7 @@ final class LCDebugStudioManager: ObservableObject {
         sseTask = Task { [weak self] in
             guard let self else { return }
             do {
-                var req = URLRequest(url: streamURL)
+                var req = authorizedRequest(url: streamURL)
                 req.timeoutInterval = 3600
                 let (bytes, _) = try await self.session.bytes(for: req)
                 var currentEvent = "message"
@@ -450,7 +459,7 @@ final class LCDebugStudioManager: ObservableObject {
     func loadHierarchy() async {
         guard let base = baseURL else { return }
         do {
-            let (data, _) = try await session.data(from: base.appendingPathComponent("api/hierarchy"))
+            let (data, _) = try await session.data(for: authorizedRequest(url: base.appendingPathComponent("api/hierarchy")))
             if let obj = try? JSONSerialization.jsonObject(with: data),
                let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
                let text = String(data: pretty, encoding: .utf8) {
@@ -513,7 +522,8 @@ final class LCDebugStudioManager: ObservableObject {
 
         if enabler == .StosDebug {
             let encoded = script.map { "&script=\($0)" } ?? ""
-            if let url = URL(string: "stosdebug://enableJIT?bundleId=\(bundleId)&appName=\(appModel.displayName)&pid=\(pid)&forcePID=true\(encoded)") {
+            let safeName = appModel.displayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? appModel.displayName
+            if let url = URL(string: "stosdebug://enableJIT?bundleId=\(bundleId)&appName=\(safeName)&pid=\(pid)&forcePID=true\(encoded)") {
                 await UIApplication.shared.open(url)
                 jitStatusBanner = "Requested JIT via StosDebug for PID \(pid)."
             }
@@ -528,15 +538,21 @@ final class LCDebugStudioManager: ObservableObject {
             return
         }
         _ = await LCUtils.askForJIT(withScript: appModel.jitLaunchScriptJs, appName: appModel.displayName, classicMode: 0) { [weak self] msg in
-            Task { @MainActor [weak self] in
-                self?.jitStatusBanner = msg
-            }
+            self?.jitStatusBanner = msg
         }
+    }
+
+    private func authorizedRequest(url: URL) -> URLRequest {
+        var req = URLRequest(url: url)
+        if !authToken.isEmpty {
+            req.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        }
+        return req
     }
 
     private func fetchJSON<T: Decodable>(url: URL) async -> T? {
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await session.data(for: authorizedRequest(url: url))
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
             return nil
@@ -545,7 +561,7 @@ final class LCDebugStudioManager: ObservableObject {
 
     private func postAction(_ body: [String: Any]) async {
         guard let base = baseURL else { return }
-        var req = URLRequest(url: base.appendingPathComponent("api/action"))
+        var req = authorizedRequest(url: base.appendingPathComponent("api/action"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)

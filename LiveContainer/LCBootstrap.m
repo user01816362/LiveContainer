@@ -17,9 +17,13 @@
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 extern char **environ;
 static int (*appMain)(int, char**, char**);
+static NSURL *sActiveContainerBookmarkURL;
 NSUserDefaults *lcUserDefaults;
 NSUserDefaults *lcSharedDefaults;
 NSString *lcAppGroupPath;
@@ -101,46 +105,93 @@ static BOOL checkJITEnabled(void) {
 #endif
 }
 
+static bool lcIsAArch64Ret(uint32_t insn) {
+    return insn == 0xd65f03c0 || insn == 0xd65f0bff || insn == 0xd65f0fff;
+}
+
 void overwriteMainCFBundle(void) {
-    // Overwrite CFBundleGetMainBundle
-    uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
+    // Ensure __mainBundle is populated before inspecting or resolving it
+    CFBundleRef currentCFMain = CFBundleGetMainBundle();
     void **mainBundleAddr = 0;
-    
+
 #if !TARGET_OS_SIMULATOR
-    // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
-    while (true) {
-        bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
-        if (isTbz) {
-            // adrp <- pc-1
-            // tbz <- pc
-            // ldr  <- addr
-            mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)(pc+1), (uint64_t)(pc-1));
-            break;
-        }
-        ++pc;
+    const char *cfPath = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+    void **dscMainBundle = (void **)litehook_find_dsc_symbol(cfPath, "___mainBundle");
+    if (!dscMainBundle) {
+        dscMainBundle = (void **)litehook_find_dsc_symbol(cfPath, "__mainBundle");
     }
-#else
-    while (true) {
-        uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
-        if (addr) {
-            // adrp <- pc-1
-            // tbnz <- pc
-            // ...
-            // ldr  <- addr
-            mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
-            break;
-        }
-        ++pc;
+    if (dscMainBundle && (!currentCFMain || *dscMainBundle == (void *)currentCFMain)) {
+        mainBundleAddr = dscMainBundle;
     }
 #endif
+
+    if (!mainBundleAddr) {
+        void *fnPtr = (void *)CFBundleGetMainBundle;
+#ifdef __PTRAUTH_INTRINSICS__
+        fnPtr = ptrauth_strip(fnPtr, ptrauth_key_function_pointer);
+#endif
+        uint32_t *basePc = (uint32_t *)fnPtr;
+        for (int i = 0; i < 160; ++i) {
+            uint32_t *pc = basePc + i;
+            if (lcIsAArch64Ret(*pc)) {
+                break;
+            }
+            uint64_t branchAddr = aarch64_get_tbz_or_tbnz_jump_address(*pc, (uint64_t)pc);
+            if (branchAddr && i > 0) {
+                uint64_t candidate = 0;
+                if (((*(pc + 1)) & 0xFFC00000) == 0xF9400000) {
+                    candidate = aarch64_emulate_adrp_ldr(*(pc - 1), *(pc + 1), (uint64_t)(pc - 1));
+                }
+                if (!candidate && (((*(uint32_t *)branchAddr) & 0xFFC00000) == 0xF9400000)) {
+                    candidate = aarch64_emulate_adrp_ldr(*(pc - 1), *(uint32_t *)branchAddr, (uint64_t)(pc - 1));
+                }
+                if (candidate && (!currentCFMain || *(void **)candidate == (void *)currentCFMain)) {
+                    mainBundleAddr = (void **)candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Fallback scan for adrp + ldr loading currentCFMain (covers CoreFoundation lock-guarded fast/slow paths)
+    if (!mainBundleAddr && currentCFMain) {
+        void *fnPtr = (void *)CFBundleGetMainBundle;
+#ifdef __PTRAUTH_INTRINSICS__
+        fnPtr = ptrauth_strip(fnPtr, ptrauth_key_function_pointer);
+#endif
+        uint32_t *basePc = (uint32_t *)fnPtr;
+        for (int i = 0; i < 160; ++i) {
+            uint32_t insn = basePc[i];
+            if (lcIsAArch64Ret(insn)) {
+                break;
+            }
+            if ((insn & 0x9F000000) == 0x90000000) {
+                for (int k = 1; k <= 6 && (i + k) < 160; ++k) {
+                    uint32_t nextInsn = basePc[i + k];
+                    uint64_t candidate = aarch64_emulate_adrp_ldr(insn, nextInsn, (uint64_t)(basePc + i));
+                    if (candidate && *(void **)candidate == (void *)currentCFMain) {
+                        mainBundleAddr = (void **)candidate;
+                        break;
+                    }
+                    if ((nextInsn & 0x1F) == (insn & 0x1F) && (nextInsn & 0x9F000000) == 0x90000000) {
+                        break;
+                    }
+                }
+                if (mainBundleAddr) {
+                    break;
+                }
+            }
+        }
+    }
+
     assert(mainBundleAddr != NULL);
-    *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
+    if (mainBundleAddr) {
+        *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
+    }
 }
 
 void overwriteMainNSBundle(NSBundle *newBundle) {
-    // Overwrite NSBundle.mainBundle
-    // iOS 16: x19 is _MergedGlobals
-    // iOS 17: x19 is _MergedGlobals+4
+    // Overwrite NSBundle.mainBundle (Clang offsets _MergedGlobals+4 on ARM64, addressed via ldur)
 
     NSString *oldPath = NSBundle.mainBundle.executablePath;
     uint32_t *mainBundleImpl = (uint32_t *)method_getImplementation(class_getClassMethod(NSBundle.class, @selector(mainBundle)));
@@ -148,7 +199,6 @@ void overwriteMainNSBundle(NSBundle *newBundle) {
         void **_MergedGlobals = (void **)aarch64_emulate_adrp_add(mainBundleImpl[i], mainBundleImpl[i+1], (uint64_t)&mainBundleImpl[i]);
         if (!_MergedGlobals) continue;
 
-        // In iOS 17, adrp+add gives _MergedGlobals+4, so it uses ldur instruction instead of ldr
         if ((mainBundleImpl[i+4] & 0xFF000000) == 0xF8000000) {
             uint64_t ptr = (uint64_t)_MergedGlobals - 4;
             _MergedGlobals = (void **)ptr;
@@ -166,11 +216,11 @@ void overwriteMainNSBundle(NSBundle *newBundle) {
 }
 
 typedef struct {
-    void *gap_0x0[2];                  // 0x00, 0x08
-    char *mainExecutablePath_old;      // 0x10
-    void *gap_0x18;                    // 0x18
-    char *mainExecutablePath_18_4;     // 0x20
-    size_t mainExecutablePathLen_27_0; // 0x28
+    void *gap_0x0[4];                   // 0x00..0x18
+    char *mainExecutablePath;           // 0x20
+    size_t mainExecutablePathLen;       // 0x28
+    char *mainExecutablePathUnreal;     // 0x30
+    size_t mainExecutablePathUnrealLen; // 0x38
 } DyldConfig;
 typedef struct {
     void *gap_0x0;
@@ -182,27 +232,40 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
     DyldConfig* dyldConfig = dyldApiInstancePtr->dyldConfig;
     assert(dyldConfig != 0);
     
-    char** mainExecutablePathPtr = 0;
-    // mainExecutablePath is at 0x10 for iOS 15~18.3.2, 0x20 for iOS 18.4+
-    if(dyldConfig->mainExecutablePath_old != 0 && dyldConfig->mainExecutablePath_old[0] == '/') {
-        mainExecutablePathPtr = &(dyldConfig->mainExecutablePath_old);
-    } else if (dyldConfig->mainExecutablePath_18_4 != 0 && dyldConfig->mainExecutablePath_18_4[0] == '/') {
-        mainExecutablePathPtr = &(dyldConfig->mainExecutablePath_18_4);
-    } else {
-        assert(mainExecutablePathPtr != 0);
+    if (dyldConfig->mainExecutablePath == NULL || dyldConfig->mainExecutablePath[0] != '/') {
+        assert(dyldConfig->mainExecutablePath != NULL);
+        return -1;
     }
 
+    size_t oldPathLen = strlen(dyldConfig->mainExecutablePath);
+    size_t newPathLen = strlen(newPath);
+
     kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)dyldConfig, sizeof(DyldConfig), false, PROT_READ | PROT_WRITE);
-    if(ret != KERN_SUCCESS) {
-        assert(os_tpro_is_supported());
-        os_thread_self_restrict_tpro_to_rw();
+    if (ret != KERN_SUCCESS) {
+        ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)dyldConfig, sizeof(DyldConfig), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
     }
-    *mainExecutablePathPtr = newPath;
-    
-    // Cache mainExecutablePathLen (+0x28 on iOS 27)
-    dyldConfig->mainExecutablePathLen_27_0 = strlen(newPath);
-    
-    if(ret != KERN_SUCCESS) {
+    bool usedTpro = false;
+    if (ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        if (!os_tpro_is_supported()) {
+            return -1;
+        }
+        os_thread_self_restrict_tpro_to_rw();
+        usedTpro = true;
+    }
+
+    dyldConfig->mainExecutablePath = newPath;
+    if (dyldConfig->mainExecutablePathLen == oldPathLen || dyldConfig->mainExecutablePathLen > 0) {
+        dyldConfig->mainExecutablePathLen = newPathLen;
+    }
+    if (dyldConfig->mainExecutablePathUnreal != NULL &&
+        dyldConfig->mainExecutablePathUnreal[0] == '/' &&
+        dyldConfig->mainExecutablePathUnrealLen == strlen(dyldConfig->mainExecutablePathUnreal)) {
+        dyldConfig->mainExecutablePathUnreal = newPath;
+        dyldConfig->mainExecutablePathUnrealLen = newPathLen;
+    }
+
+    if (usedTpro) {
         os_thread_self_restrict_tpro_to_ro();
     }
 
@@ -210,8 +273,7 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
 }
 
 void overwriteExecPath(const char *newExecPath) {
-    // dyld4 stores executable path in a different place (iOS 15.0 +)
-    // https://github.com/apple-oss-distributions/dyld/blob/ce1cc2088ef390df1c48a1648075bbd51c5bbc6a/dyld/DyldAPIs.cpp#L802
+    // Update dyld4 ProcessConfig mainExecutablePath in place
     int (*orig__NSGetExecutablePath)(void* dyldPtr, char* buf, uint32_t* bufsize);
     performHookDyldApi("_NSGetExecutablePath", 2, (void**)&orig__NSGetExecutablePath, hook__NSGetExecutablePath_overwriteExecPath);
     _NSGetExecutablePath((char*)newExecPath, NULL);
@@ -282,6 +344,10 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
     NSFMGuestExtensionHooksInit(request[@"parentContainerPath"]);
     NSURLSCGuestHooksInit();
     GuestExtensionHooksInit();
+    if (!isSideStore) {
+        SecItemGuestHooksInit();
+        initDead10ccFix();
+    }
 
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
@@ -290,7 +356,8 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
         if (checkJITEnabled()) init_bypassDyldLibValidation();
 #endif
     }
-    DyldHooksInit(false, true, 0);
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword != nil;
+    DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     appMainImageIndex = _dyld_image_count();
     __block void *handle = NULL;
     void (^load)(void) = ^{
@@ -476,6 +543,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                     if(!bookmarkURL || !access) {
                         return [NSString stringWithFormat:@"Bookmark resolution failed or unable to access the container. You might need to readd the data storage. %@", err.localizedDescription ?: @"unknown error"];
                     }
+                    sActiveContainerBookmarkURL = bookmarkURL;
                     [lcUserDefaults removeObjectForKey:@"error"];
                 }
                 break;

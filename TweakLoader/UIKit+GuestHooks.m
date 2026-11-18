@@ -5,6 +5,7 @@
 @import Network;
 @import CFNetwork;
 @import Accessibility;
+@import AuthenticationServices;
 #import "LCSharedUtils.h"
 #import "UIKitPrivate.h"
 #import "../LiveContainer/utils.h"
@@ -110,12 +111,46 @@ time_t spoofStorageVolumeCreationTime = 1704067200;
 NSString *spoofCustomUserAgent = nil;
 NSString *spoofWebGLVendor = @"Apple Inc.";
 NSString *spoofWebGLRenderer = @"Apple GPU";
-NSString *spoofWebCanvasDataURL = @"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+uint32_t spoofWebCanvasSeed = 0;
 NSInteger spoofWebColorDepth = 24;
 NSDictionary<NSString *, NSNumber *> *spoofFeatureOverrides = nil;
 NSString *spoofDeviceVariantId = nil;
 CGFloat spoofScreenPointWidth = 0;
 CGFloat spoofScreenPointHeight = 0;
+
+static uint32_t LCFNV1a32(const char *str, uint32_t seed) {
+    uint32_t hash = seed ? seed : 2166136261u;
+    if (!str) return hash;
+    for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
+        hash ^= *p;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static uint32_t LCParseWebCanvasSeedValue(id rawValue) {
+    if ([rawValue isKindOfClass:NSNumber.class]) {
+        return [(NSNumber *)rawValue unsignedIntValue];
+    }
+    if ([rawValue isKindOfClass:NSString.class]) {
+        NSString *trimmed = [(NSString *)rawValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (trimmed.length == 0) return 0;
+        unsigned long long parsed = strtoull(trimmed.UTF8String, NULL, 0);
+        return (uint32_t)(parsed & 0xFFFFFFFFULL);
+    }
+    return 0;
+}
+
+static uint32_t LCEffectiveWebCanvasSeed(void) {
+    if (spoofWebCanvasSeed != 0) {
+        return spoofWebCanvasSeed;
+    }
+    uint32_t h = LCFNV1a32(idForVendorUUID.UUIDString.UTF8String, 2166136261u);
+    h = LCFNV1a32(spoofHardwareModel.UTF8String, h);
+    h = LCFNV1a32(spoofDeviceName.UTF8String, h);
+    if (h == 0) h = 0x5A17C3D1u;
+    return h;
+}
 
 static NSString *sRealHostMachine = nil;
 static _Atomic uint64_t sHardwareInterceptions = 0;
@@ -404,28 +439,6 @@ static void LCReplaceClassMethod(Class cls, NSString *selectorName, IMP implemen
     if(method && metaClass) class_replaceMethod(metaClass, sel, implementation, method_getTypeEncoding(method));
 }
 
-static void LCInstallNeutralAccessibilityProfile(void) {
-    Class cls = NSClassFromString(@"UIAccessibility");
-    NSDictionary<NSString *, NSString *> *features = @{
-        @"isVoiceOverRunning": @"accessibility.voiceOver", @"isSwitchControlRunning": @"accessibility.switchControl",
-        @"isGuidedAccessEnabled": @"accessibility.guidedAccess", @"isGrayscaleEnabled": @"accessibility.grayscale",
-        @"isInvertColorsEnabled": @"accessibility.invertColors", @"isReduceMotionEnabled": @"accessibility.reduceMotion",
-        @"isAssistiveTouchRunning": @"accessibility.assistiveTouch", @"isShakeToUndoEnabled": @"accessibility.shakeToUndo",
-        @"isBoldTextEnabled": @"accessibility.boldText", @"isButtonShapesEnabled": @"accessibility.buttonShapes",
-        @"isDarkerSystemColorsEnabled": @"accessibility.darkerColors",
-        @"isReduceTransparencyEnabled": @"accessibility.reduceTransparency", @"isMonoAudioEnabled": @"accessibility.monoAudio",
-        @"isSpeakScreenEnabled": @"accessibility.speakScreen", @"isSpeakSelectionEnabled": @"accessibility.speakSelection",
-        @"isClosedCaptioningEnabled": @"accessibility.closedCaptions", @"isVideoAutoplayEnabled": @"accessibility.videoAutoplay",
-        @"shouldDifferentiateWithoutColor": @"accessibility.differentiateWithoutColor",
-        @"isOnOffSwitchLabelsEnabled": @"accessibility.onOffLabels"
-    };
-    for(NSString *selectorName in features) {
-        if(!LCFeatureEnabled(features[selectorName])) continue;
-        Method method = class_getClassMethod(cls, NSSelectorFromString(selectorName));
-        if(method) method_setImplementation(method, (IMP)LCNeutralAccessibilityFlag);
-    }
-}
-
 static void LCInstallLocalePrivacyProfile(void) {
     if(LCFeatureEnabled(@"locale.inputModes")) {
         LCReplaceClassMethod(UITextInputMode.class, @"activeInputModes", (IMP)LCEmptyArrayGetter);
@@ -452,14 +465,25 @@ static void LCInstallAudioPrivacyProfile(void) {
     }
 }
 
+static BOOL sGraphicsPrivacyProfileEnabled = NO;
+
 static void LCInstallGraphicsPrivacyProfile(void) {
+    sGraphicsPrivacyProfileEnabled = YES;
+}
+
+static id<MTLDevice> hook_MTLCreateSystemDefaultDevice(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if(!device) return;
-    Class cls = [device class];
-    if(LCFeatureEnabled(@"graphics.name")) LCReplaceInstanceMethod(cls, @"name", (IMP)LCNeutralStringGetter);
-    if(LCFeatureEnabled(@"graphics.workingSet")) LCReplaceInstanceMethod(cls, @"recommendedMaxWorkingSetSize", (IMP)LCNeutralWorkingSetGetter);
-    if(LCFeatureEnabled(@"graphics.rayTracing")) LCReplaceInstanceMethod(cls, @"supportsRaytracing", (IMP)LCConfiguredBoolGetter);
-    if(LCFeatureEnabled(@"graphics.allFamilies")) LCReplaceInstanceMethod(cls, @"supportsFamily:", (IMP)LCTrueIntegerArgumentGetter);
+    if (device && (blockDeviceInfoReads || (spoofProfileEnabled && spoofGraphicsCategoryEnabled && sGraphicsPrivacyProfileEnabled))) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            Class cls = [device class];
+            if (blockDeviceInfoReads || LCFeatureEnabled(@"graphics.name")) LCReplaceInstanceMethod(cls, @"name", (IMP)LCNeutralStringGetter);
+            if (blockDeviceInfoReads || LCFeatureEnabled(@"graphics.workingSet")) LCReplaceInstanceMethod(cls, @"recommendedMaxWorkingSetSize", (IMP)LCNeutralWorkingSetGetter);
+            if (blockDeviceInfoReads || LCFeatureEnabled(@"graphics.rayTracing")) LCReplaceInstanceMethod(cls, @"supportsRaytracing", (IMP)LCConfiguredBoolGetter);
+            if (blockDeviceInfoReads || LCFeatureEnabled(@"graphics.allFamilies")) LCReplaceInstanceMethod(cls, @"supportsFamily:", (IMP)LCTrueIntegerArgumentGetter);
+        });
+    }
+    return device;
 }
 
 static void LCInstallAppEnumerationPrivacyProfile(void) {
@@ -555,7 +579,17 @@ static NSString *LCWebViewProfileScript(void) {
     CGFloat safePointW = pointsWidth > 0 ? pointsWidth : 402.0;
     CGFloat safePointH = pointsHeight > 0 ? pointsHeight : 874.0;
     NSInteger timezoneOffset = spoofTimeZone ? -[spoofTimeZone secondsFromGMT] / 60 : 0;
-    NSMutableString *script = [@"(()=>{const d=(o,k,v)=>{try{const fn=Object.defineProperty(function(){return v},'toString',{value:()=>'function get '+k+'() { [native code] }'});Object.defineProperty(o,k,{get:fn,configurable:true})}catch(e){}};" mutableCopy];
+    uint32_t canvasSeed = LCEffectiveWebCanvasSeed();
+
+    NSMutableString *script = [@"(()=>{'use strict';"
+        "const cloakMap=new WeakMap();"
+        "const origToStr=Function.prototype.toString;"
+        "const cloakedToStr=function toString(){if(cloakMap.has(this))return cloakMap.get(this);return origToStr.call(this);};"
+        "cloakMap.set(cloakedToStr,'function toString() { [native code] }');"
+        "Function.prototype.toString=cloakedToStr;"
+        "const cloak=(fn,label)=>{cloakMap.set(fn,'function '+(label||fn.name||'')+'() { [native code] }');return fn;};"
+        "const d=(o,k,v)=>{try{if(!o)return;const g=cloak(function(){return v},'get '+k);Object.defineProperty(o,k,{get:g,configurable:true});}catch(e){}};" mutableCopy];
+
     if(LCFeatureEnabled(@"web.navigator")) {
         [script appendFormat:@"d(Navigator.prototype,'userAgent',%@);d(Navigator.prototype,'platform',%@);d(Navigator.prototype,'language',%@);d(Navigator.prototype,'languages',[%@]);d(Navigator.prototype,'hardwareConcurrency',%ld);d(Navigator.prototype,'maxTouchPoints',5);",
             LCJSONString(ua), LCJSONString(platform), LCJSONString(language), LCJSONString(language), (long)cores];
@@ -566,15 +600,60 @@ static NSString *LCWebViewProfileScript(void) {
             (long)spoofWebColorDepth, (long)spoofWebColorDepth, spoofScreenScale > 0 ? spoofScreenScale : 3.0];
     }
     if(LCFeatureEnabled(@"web.timeZone")) {
-        [script appendFormat:@"Date.prototype.getTimezoneOffset=function(){return %ld};const ir=Intl.DateTimeFormat.prototype.resolvedOptions;Intl.DateTimeFormat.prototype.resolvedOptions=function(){const r=ir.call(this);r.timeZone=%@;return r};",
+        [script appendFormat:@"Date.prototype.getTimezoneOffset=cloak(function getTimezoneOffset(){return %ld},'getTimezoneOffset');"
+            "const ir=Intl.DateTimeFormat.prototype.resolvedOptions;"
+            "Intl.DateTimeFormat.prototype.resolvedOptions=cloak(function resolvedOptions(){const r=ir.call(this);r.timeZone=%@;return r},'resolvedOptions');",
             (long)timezoneOffset, LCJSONString(spoofTimeZone.name ?: @"Etc/UTC")];
     }
+    if(LCFeatureEnabled(@"web.webGL") || LCFeatureEnabled(@"web.canvas")) {
+        [script appendFormat:
+            @"const baseSeed=(%u)>>>0;"
+            "const m32=a=>()=>{let t=a=(a+0x6D2B79F5)|0;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0);};"
+            "const farbleRGBA=(data,w,h,tag)=>{if(!data||!data.length)return;const rng=m32((baseSeed^tag^Math.imul((w|0)+1,73856093)^Math.imul((h|0)+1,19349663))>>>0);const totalPx=(data.length>>>2);if(totalPx<=0)return;const stride=Math.max(1,Math.floor(totalPx/512));let touched=0;for(let p=0;p<totalPx;p+=stride){const i=p<<2;if(data[i+3]===0)continue;const r=rng();const ch=r&3;if(ch<3){const delta=(r&8)?1:-1;const cur=data[i+ch];data[i+ch]=cur>=255?254:(cur<=0?1:cur+delta);touched=1;}}if(!touched&&data.length>=4){rng();if(data[3]>0){data[0]=data[0]>=255?254:data[0]+1;}}};",
+            (unsigned int)canvasSeed];
+    }
     if(LCFeatureEnabled(@"web.webGL")) {
-        [script appendFormat:@"const wglPatch=proto=>{const gp=proto&&proto.getParameter;if(gp)proto.getParameter=function(p){if(p===37445)return %@;if(p===37446)return %@;return gp.call(this,p)}};if(typeof WebGLRenderingContext!=='undefined')wglPatch(WebGLRenderingContext.prototype);if(typeof WebGL2RenderingContext!=='undefined')wglPatch(WebGL2RenderingContext.prototype);",
+        [script appendFormat:
+            @"const wglDebugCtx=new WeakSet();"
+            "const wglPatch=proto=>{"
+            "if(!proto)return;"
+            "const ge=proto.getExtension;"
+            "if(ge)proto.getExtension=cloak(function getExtension(n){const res=ge.call(this,n);if(n==='WEBGL_debug_renderer_info'&&res)wglDebugCtx.add(this);return res;},'getExtension');"
+            "const gp=proto.getParameter;"
+            "if(gp)proto.getParameter=cloak(function getParameter(p){const ov=gp.call(this,p);if(p===37445&&(wglDebugCtx.has(this)||ov!=null))return %@;if(p===37446&&(wglDebugCtx.has(this)||ov!=null))return %@;return ov;},'getParameter');"
+            "};"
+            "if(typeof WebGLRenderingContext!=='undefined')wglPatch(WebGLRenderingContext.prototype);"
+            "if(typeof WebGL2RenderingContext!=='undefined')wglPatch(WebGL2RenderingContext.prototype);",
             LCJSONString(spoofWebGLVendor), LCJSONString(spoofWebGLRenderer)];
     }
     if(LCFeatureEnabled(@"web.canvas")) {
-        [script appendFormat:@"const td=typeof HTMLCanvasElement!=='undefined'&&HTMLCanvasElement.prototype.toDataURL;if(td)HTMLCanvasElement.prototype.toDataURL=function(){return %@};", LCJSONString(spoofWebCanvasDataURL)];
+        [script appendString:
+            @"const orig2DGID=typeof CanvasRenderingContext2D!=='undefined'?CanvasRenderingContext2D.prototype.getImageData:null;"
+            "const origOffGID=typeof OffscreenCanvasRenderingContext2D!=='undefined'?OffscreenCanvasRenderingContext2D.prototype.getImageData:null;"
+            "if(orig2DGID){CanvasRenderingContext2D.prototype.getImageData=cloak(function getImageData(sx,sy,sw,sh){const img=orig2DGID.apply(this,arguments);farbleRGBA(img.data,img.width,img.height,0x243F6A88);return img;},'getImageData');}"
+            "if(origOffGID){OffscreenCanvasRenderingContext2D.prototype.getImageData=cloak(function getImageData(sx,sy,sw,sh){const img=origOffGID.apply(this,arguments);farbleRGBA(img.data,img.width,img.height,0x243F6A88);return img;},'getImageData');}"
+            "const makeShadow2D=(src,tag,gid)=>{try{const w=src.width|0,h=src.height|0;if(w<=0||h<=0||!gid)return null;const sh=(typeof document!=='undefined'&&document.createElement)?document.createElement('canvas'):(typeof OffscreenCanvas!=='undefined'?new OffscreenCanvas(w,h):null);if(!sh)return null;sh.width=w;sh.height=h;const ctx=sh.getContext('2d');if(!ctx)return null;ctx.drawImage(src,0,0);const img=gid.call(ctx,0,0,w,h);farbleRGBA(img.data,w,h,tag);ctx.putImageData(img,0,0);return sh;}catch(e){return null;}};"
+            "if(typeof HTMLCanvasElement!=='undefined'){"
+            "const origTD=HTMLCanvasElement.prototype.toDataURL;"
+            "if(origTD)HTMLCanvasElement.prototype.toDataURL=cloak(function toDataURL(){const sh=makeShadow2D(this,0x243F6A88,orig2DGID);return origTD.apply(sh||this,arguments);},'toDataURL');"
+            "const origTB=HTMLCanvasElement.prototype.toBlob;"
+            "if(origTB)HTMLCanvasElement.prototype.toBlob=cloak(function toBlob(){const sh=makeShadow2D(this,0x243F6A88,orig2DGID);return origTB.apply(sh||this,arguments);},'toBlob');"
+            "}"
+            "if(typeof OffscreenCanvas!=='undefined'&&typeof OffscreenCanvas.prototype.convertToBlob==='function'){"
+            "const origCTB=OffscreenCanvas.prototype.convertToBlob;"
+            "OffscreenCanvas.prototype.convertToBlob=cloak(function convertToBlob(){try{const w=this.width|0,h=this.height|0;if(w>0&&h>0&&origOffGID){const sh=new OffscreenCanvas(w,h);const ctx=sh.getContext('2d');if(ctx){ctx.drawImage(this,0,0);const img=origOffGID.call(ctx,0,0,w,h);farbleRGBA(img.data,w,h,0x243F6A88);ctx.putImageData(img,0,0);return origCTB.apply(sh,arguments);}}}catch(e){}return origCTB.apply(this,arguments);},'convertToBlob');"
+            "}"
+            "const patchWGLRead=proto=>{const rp=proto&&proto.readPixels;if(rp)proto.readPixels=cloak(function readPixels(x,y,w,h,fmt,type,px){const r=rp.apply(this,arguments);if(px&&(px instanceof Uint8Array||px instanceof Uint8ClampedArray))farbleRGBA(px,w,h,0x13198A2E);return r;},'readPixels');};"
+            "if(typeof WebGLRenderingContext!=='undefined')patchWGLRead(WebGLRenderingContext.prototype);"
+            "if(typeof WebGL2RenderingContext!=='undefined')patchWGLRead(WebGL2RenderingContext.prototype);"
+            "if(typeof AudioBuffer!=='undefined'){"
+            "const abProto=AudioBuffer.prototype;"
+            "const origGetCh=abProto.getChannelData;"
+            "const origCopyFrom=abProto.copyFromChannel;"
+            "const patchedCh=new WeakMap();"
+            "if(origGetCh){abProto.getChannelData=cloak(function getChannelData(ch){const arr=origGetCh.call(this,ch);let set=patchedCh.get(this);if(!set){set=new Set();patchedCh.set(this,set);}if(!set.has(ch)){set.add(ch);const rng=m32((baseSeed^0x85EBCA6B^Math.imul((ch|0)+1,2654435761))>>>0);const step=Math.max(1,Math.floor(arr.length/256));for(let i=0;i<arr.length;i+=step){const r=(rng()/4294967296)-0.5;arr[i]+=r*1e-6;}}return arr;},'getChannelData');}"
+            "if(origCopyFrom){abProto.copyFromChannel=cloak(function copyFromChannel(dest,ch,start){origCopyFrom.apply(this,arguments);const rng=m32((baseSeed^0x85EBCA6B^Math.imul((ch|0)+1,2654435761))>>>0);const s0=(start|0);const total=this.length||dest.length;const step=Math.max(1,Math.floor(total/256));for(let idx=0;idx<s0&&idx<total;idx+=step){rng();}for(let i=0;i<dest.length;i++){const srcIdx=s0+i;if(srcIdx>=0&&(srcIdx%step)===0){const r=(rng()/4294967296)-0.5;dest[i]+=r*1e-6;}}},'copyFromChannel');}"
+            "}"];
     }
     [script appendString:@"})();"];
     return script;
@@ -886,6 +965,42 @@ static BOOL LCInterceptSysctlByKey(const char *name, void *oldp, size_t *oldlenp
         LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
         return LCWriteSysctlBytes(&bootTime, sizeof(bootTime), oldp, oldlenp, outReturn);
     }
+    if (strcmp(name, "hw.cpufamily") == 0 &&
+        (blockDeviceInfoReads || (spoofProfileEnabled && spoofSystemCategoryEnabled && spoofHardwareModel.length > 0))) {
+        uint32_t cpuFamily =
+#ifdef CPUFAMILY_ARM_TUPAI
+            CPUFAMILY_ARM_TUPAI;
+#else
+            0x204526d0u;
+#endif
+        if ([spoofHardwareModel hasPrefix:@"iPhone19,"]) {
+#ifdef CPUFAMILY_ARM_NEVIS
+            cpuFamily = CPUFAMILY_ARM_NEVIS;
+#else
+            cpuFamily = 0x37652b0cu;
+#endif
+        } else if ([spoofHardwareModel hasPrefix:@"iPhone18,"]) {
+#ifdef CPUFAMILY_ARM_BORNEO
+            cpuFamily = CPUFAMILY_ARM_BORNEO;
+#else
+            cpuFamily = 0x7db56df1u;
+#endif
+        } else if ([spoofHardwareModel hasPrefix:@"iPhone16,"]) {
+#ifdef CPUFAMILY_ARM_COLL
+            cpuFamily = CPUFAMILY_ARM_COLL;
+#else
+            cpuFamily = 0x2876f5b5u;
+#endif
+        } else if ([spoofHardwareModel hasPrefix:@"iPhone15,"] || [spoofHardwareModel hasPrefix:@"iPhone14,"]) {
+#ifdef CPUFAMILY_ARM_EVEREST_SAWTOOTH
+            cpuFamily = CPUFAMILY_ARM_EVEREST_SAWTOOTH;
+#else
+            cpuFamily = 0x8765edeau;
+#endif
+        }
+        LCRecordProfileInterception(LCProfileTelemetryVectorHardware);
+        return LCWriteSysctlBytes(&cpuFamily, sizeof(cpuFamily), oldp, oldlenp, outReturn);
+    }
     return NO;
 }
 
@@ -898,9 +1013,48 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
 }
 
 static const char *LCSysctlNameFromMIB(const int *name, u_int namelen) {
-    if (!name || namelen < 2) {
+    if (!name || namelen < 2 || namelen > CTL_MAXNAME) {
         return NULL;
     }
+    typedef struct {
+        const char *key;
+        int mib[CTL_MAXNAME];
+        size_t len;
+    } LCSysctlMIBEntry;
+
+    static LCSysctlMIBEntry sTable[24];
+    static size_t sTableCount = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        static const char *const kKeys[] = {
+            "hw.machine", "hw.model", "hw.target",
+            "hw.ncpu", "hw.activecpu", "hw.physicalcpu", "hw.physicalcpu_max",
+            "hw.logicalcpu", "hw.logicalcpu_max",
+            "hw.cputype", "hw.cpusubtype", "hw.cpufamily",
+            "hw.memsize", "hw.physmem", "hw.usermem",
+            "kern.hostname", "kern.version", "kern.osrelease",
+            "kern.osversion", "kern.osproductversion", "kern.boottime"
+        };
+        for (size_t i = 0; i < sizeof(kKeys) / sizeof(kKeys[0]); i++) {
+            int resolved[CTL_MAXNAME];
+            size_t resolvedLen = CTL_MAXNAME;
+            if (sysctlnametomib(kKeys[i], resolved, &resolvedLen) == 0 &&
+                resolvedLen > 0 && resolvedLen <= CTL_MAXNAME &&
+                sTableCount < sizeof(sTable) / sizeof(sTable[0])) {
+                LCSysctlMIBEntry *entry = &sTable[sTableCount++];
+                entry->key = kKeys[i];
+                entry->len = resolvedLen;
+                memcpy(entry->mib, resolved, resolvedLen * sizeof(int));
+            }
+        }
+    });
+
+    for (size_t i = 0; i < sTableCount; i++) {
+        if (sTable[i].len == namelen && memcmp(sTable[i].mib, name, namelen * sizeof(int)) == 0) {
+            return sTable[i].key;
+        }
+    }
+
     if (name[0] == CTL_HW) {
         switch (name[1]) {
             case HW_MACHINE: return "hw.machine";
@@ -985,7 +1139,10 @@ static int hook_getifaddrs(struct ifaddrs **ifap) {
 
 #define LC_ACCESSIBILITY_HOOK(_name, _key) \
     static BOOL hook_##_name(void) { \
-        if(blockDeviceInfoReads || (spoofProfileEnabled && spoofAccessibilityCategoryEnabled && LCFeatureEnabled(_key))) return NO; \
+        if(blockDeviceInfoReads || (spoofProfileEnabled && spoofAccessibilityCategoryEnabled && LCFeatureEnabled(_key))) { \
+            LCRecordProfileInterception(LCProfileTelemetryVectorHardware); \
+            return NO; \
+        } \
         return _name(); \
     }
 
@@ -1080,6 +1237,7 @@ DYLD_INTERPOSE(hook_UIAccessibilityIsShakeToUndoEnabled, UIAccessibilityIsShakeT
 DYLD_INTERPOSE(hook_UIAccessibilityIsAssistiveTouchRunning, UIAccessibilityIsAssistiveTouchRunning);
 DYLD_INTERPOSE(hook_UIAccessibilityShouldDifferentiateWithoutColor, UIAccessibilityShouldDifferentiateWithoutColor);
 DYLD_INTERPOSE(hook_UIAccessibilityIsOnOffSwitchLabelsEnabled, UIAccessibilityIsOnOffSwitchLabelsEnabled);
+DYLD_INTERPOSE(hook_MTLCreateSystemDefaultDevice, MTLCreateSystemDefaultDevice);
 
 // MARK: - HTTP Header Device Identity Rewriting
 // Intercepts ALL outgoing HTTP headers to rewrite User-Agent strings containing
@@ -1476,6 +1634,9 @@ static void LCRotateSpoofProfile(void) {
     if(spoofWebViewCategoryEnabled && LCFeatureEnabled(@"web.screen")) {
         spoofWebColorDepth = arc4random_uniform(4) == 0 ? 30 : 24;
     }
+    if(spoofWebViewCategoryEnabled && LCFeatureEnabled(@"web.canvas")) {
+        spoofWebCanvasSeed = arc4random() | 1u;
+    }
 
     if(spoofLocaleCategoryEnabled) {
         if(spoofLocale) {
@@ -1527,6 +1688,8 @@ static CFAbsoluteTime LCProcessStartWallTime(void) {
     });
     return wallTimeAtLaunch;
 }
+
+static void LCInstallWebAuthSessionHooks(void);
 
 __attribute__((constructor))
 static void UIKitGuestHooksInit(void) {
@@ -1710,7 +1873,7 @@ static void UIKitGuestHooksInit(void) {
         NSString *customUserAgent = guestContainerInfo[@"spoofCustomUserAgent"];
         NSString *webGLVendor = guestContainerInfo[@"spoofWebGLVendor"];
         NSString *webGLRenderer = guestContainerInfo[@"spoofWebGLRenderer"];
-        NSString *webCanvasDataURL = guestContainerInfo[@"spoofWebCanvasDataURL"];
+        id webCanvasSeed = guestContainerInfo[@"spoofWebCanvasSeed"];
         NSNumber *webColorDepth = guestContainerInfo[@"spoofWebColorDepth"];
 
         if([deviceName isKindOfClass:NSString.class] && deviceName.length > 0) {
@@ -1852,7 +2015,8 @@ static void UIKitGuestHooksInit(void) {
         if([customUserAgent isKindOfClass:NSString.class]) spoofCustomUserAgent = customUserAgent;
         if([webGLVendor isKindOfClass:NSString.class]) spoofWebGLVendor = webGLVendor;
         if([webGLRenderer isKindOfClass:NSString.class]) spoofWebGLRenderer = webGLRenderer;
-        if([webCanvasDataURL isKindOfClass:NSString.class]) spoofWebCanvasDataURL = webCanvasDataURL;
+        uint32_t parsedSeed = LCParseWebCanvasSeedValue(webCanvasSeed);
+        if(parsedSeed != 0) spoofWebCanvasSeed = parsedSeed;
         if([webColorDepth isKindOfClass:NSNumber.class] && webColorDepth.integerValue > 0) spoofWebColorDepth = webColorDepth.integerValue;
 
         const LCDeviceHardwareSpec *matchedSpec = spoofDeviceVariantId.length > 0
@@ -1881,8 +2045,11 @@ static void UIKitGuestHooksInit(void) {
         tzset();
     }
 
+    if(!NSUserDefaults.isSideStore) {
+        LCInstallWebAuthSessionHooks();
+    }
+
     if(shouldEnableSpoofProfile && spoofAccessibilityCategoryEnabled) {
-        LCInstallNeutralAccessibilityProfile();
         LCSwizzleIfPresent(UITraitCollection.class, @selector(accessibilityContrast), @selector(hook_accessibilityContrast));
     }
     if(shouldEnableSpoofProfile && spoofLocaleCategoryEnabled) {
@@ -1891,7 +2058,7 @@ static void UIKitGuestHooksInit(void) {
     if(shouldEnableSpoofProfile && spoofAudioCategoryEnabled) {
         LCInstallAudioPrivacyProfile();
     }
-    if(shouldEnableSpoofProfile && spoofGraphicsCategoryEnabled) {
+    if(blockDeviceInfoReads || (shouldEnableSpoofProfile && spoofGraphicsCategoryEnabled)) {
         LCInstallGraphicsPrivacyProfile();
     }
     if(shouldEnableSpoofProfile && spoofAppPrivacyCategoryEnabled) {
@@ -2384,6 +2551,8 @@ static NSString* LCDecodedURLStringFromControlURL(NSURL *url) {
     return [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
 }
 
+static NSURL *sLaunchExtensionBookmarkedURL = nil;
+
 static void resolveLaunchExtensionFileBookmark(void) {
     NSData* bookmarkData = [NSUserDefaults.lcSharedDefaults dataForKey:@"LCLaunchExtensionFileBookmark"];
     if(!bookmarkData) {
@@ -2398,6 +2567,9 @@ static void resolveLaunchExtensionFileBookmark(void) {
                                                      error:&error];
     if(!resolvedURL) {
         NSLog(@"[LC] Failed to resolve shared file bookmark: %@", error.localizedDescription);
+    } else {
+        [resolvedURL startAccessingSecurityScopedResource];
+        sLaunchExtensionBookmarkedURL = resolvedURL;
     }
     [NSUserDefaults.lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionFileBookmark"];
 
@@ -2635,9 +2807,12 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 - (void)hook_setDelegate:(id<UIApplicationDelegate>)delegate {
     if(![delegate respondsToSelector:@selector(application:configurationForConnectingSceneSession:options:)]) {
         // Fix old apps black screen when UIApplicationSupportsMultipleScenes is YES
-        swizzle(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_makeKeyAndVisible));
-        swizzle(UIWindow.class, @selector(makeKeyWindow), @selector(hook_makeKeyWindow));
-        swizzle(UIWindow.class, @selector(setHidden:), @selector(hook_setHidden:));
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            swizzle(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_makeKeyAndVisible));
+            swizzle(UIWindow.class, @selector(makeKeyWindow), @selector(hook_makeKeyWindow));
+            swizzle(UIWindow.class, @selector(setHidden:), @selector(hook_setHidden:));
+        });
     }
     [self hook_setDelegate:delegate];
 }
@@ -2846,12 +3021,13 @@ static const char kLCWebUserContentConfiguredKey = 0;
     NSString *effectiveUA = customUserAgent;
     if(spoofProfileEnabled && spoofWebViewCategoryEnabled && LCFeatureEnabled(@"web.navigator")) {
         LCRecordProfileInterception(LCProfileTelemetryVectorWebKit);
+        NSString *builtUA = LCBuildWebKitUserAgent();
         if(spoofCustomUserAgent.length > 0) {
             effectiveUA = spoofCustomUserAgent;
-        } else if(effectiveUA.length > 0) {
+        } else if(effectiveUA.length > 0 && ![effectiveUA isEqualToString:builtUA]) {
             effectiveUA = LCRewriteUserAgent(effectiveUA);
         } else {
-            effectiveUA = LCBuildWebKitUserAgent();
+            effectiveUA = builtUA;
         }
     }
     [self hook_setCustomUserAgent:effectiveUA];
@@ -3438,3 +3614,313 @@ static const char kLCWebUserContentConfiguredKey = 0;
 }
 
 @end
+
+// MARK: - In-Process ASWebAuthenticationSession / SFAuthenticationSession OAuth Controller (#162, #242, #986)
+
+static const char kLCAuthURLKey = 0;
+static const char kLCAuthCallbackSchemeKey = 0;
+static const char kLCAuthCallbackObjKey = 0;
+static const char kLCAuthCompletionKey = 0;
+static const char kLCAuthActiveVCKey = 0;
+static const char kLCAuthInProcessCancelledKey = 0;
+
+static BOOL LCIsSchemeRegisteredInHostBundle(NSString *scheme) {
+    if (scheme.length == 0) return NO;
+    NSBundle *hostBundle = [NSUserDefaults lcMainBundle];
+    if (!hostBundle) return NO;
+    NSArray *urlTypes = hostBundle.infoDictionary[@"CFBundleURLTypes"];
+    NSString *lower = scheme.lowercaseString;
+    for (NSDictionary *entry in urlTypes) {
+        if (![entry isKindOfClass:NSDictionary.class]) continue;
+        NSArray *schemes = entry[@"CFBundleURLSchemes"];
+        if (![schemes isKindOfClass:NSArray.class]) continue;
+        for (id item in schemes) {
+            if ([item isKindOfClass:NSString.class] && [((NSString *)item).lowercaseString isEqualToString:lower]) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL LCShouldInterceptAuthSession(NSURL *authURL, NSString *callbackScheme, ASWebAuthenticationSessionCallback *callbackObj) {
+    if (!authURL) return NO;
+    if (callbackScheme.length > 0) {
+        NSString *lower = callbackScheme.lowercaseString;
+        if ([lower isEqualToString:@"http"] || [lower isEqualToString:@"https"]) {
+            return NO;
+        }
+        return !LCIsSchemeRegisteredInHostBundle(callbackScheme);
+    }
+    if (callbackObj && [callbackObj respondsToSelector:@selector(matchesURL:)]) {
+        NSArray *guestURLTypes = NSBundle.mainBundle.infoDictionary[@"CFBundleURLTypes"];
+        for (NSDictionary *entry in guestURLTypes) {
+            if (![entry isKindOfClass:NSDictionary.class]) continue;
+            for (id item in entry[@"CFBundleURLSchemes"]) {
+                if (![item isKindOfClass:NSString.class]) continue;
+                NSString *s = (NSString *)item;
+                NSURL *probe = [NSURL URLWithString:[NSString stringWithFormat:@"%@://oauth-callback", s]];
+                if (probe && [callbackObj matchesURL:probe] && !LCIsSchemeRegisteredInHostBundle(s)) {
+                    return YES;
+                }
+            }
+        }
+        NSURLComponents *comp = [NSURLComponents componentsWithURL:authURL resolvingAgainstBaseURL:NO];
+        for (NSURLQueryItem *q in comp.queryItems) {
+            NSString *n = q.name.lowercaseString;
+            if ([n isEqualToString:@"redirect_uri"] || [n isEqualToString:@"redirect_url"] || [n isEqualToString:@"callback"]) {
+                NSURL *redir = q.value.length > 0 ? [NSURL URLWithString:q.value] : nil;
+                NSString *rs = redir.scheme.lowercaseString;
+                if (rs.length > 0 && ![rs isEqualToString:@"http"] && ![rs isEqualToString:@"https"] &&
+                    [callbackObj matchesURL:redir] && !LCIsSchemeRegisteredInHostBundle(rs)) {
+                    return YES;
+                }
+            }
+        }
+    }
+    return NO;
+}
+
+@interface LCWebAuthSessionViewController : UIViewController <WKNavigationDelegate, UIAdaptivePresentationControllerDelegate>
+@property (nonatomic, strong) NSURL *initialURL;
+@property (nonatomic, copy) NSString *callbackScheme;
+@property (nonatomic, strong) ASWebAuthenticationSessionCallback *callbackObj;
+@property (nonatomic, assign) BOOL prefersEphemeral;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *additionalHeaders;
+@property (nonatomic, copy) void (^completionBlock)(NSURL * _Nullable callbackURL, NSError * _Nullable error);
+@property (nonatomic, strong) WKWebView *webView;
+@property (nonatomic, strong) UIActivityIndicatorView *spinner;
+@property (nonatomic, assign) BOOL didComplete;
+@property (nonatomic, weak) id ownerSession;
+@end
+
+@implementation LCWebAuthSessionViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+                                                                                           target:self
+                                                                                           action:@selector(onCancelTapped)];
+    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:self.spinner];
+    self.navigationItem.title = self.initialURL.host ?: @"Sign In";
+
+    WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+    cfg.websiteDataStore = self.prefersEphemeral ? [WKWebsiteDataStore nonPersistentDataStore] : [WKWebsiteDataStore defaultDataStore];
+    self.webView = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:cfg];
+    self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.webView.navigationDelegate = self;
+    [self.view addSubview:self.webView];
+
+    if (self.initialURL) {
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:self.initialURL];
+        [self.additionalHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+            if ([k isKindOfClass:NSString.class] && [v isKindOfClass:NSString.class]) {
+                [req setValue:v forHTTPHeaderField:k];
+            }
+        }];
+        [self.webView loadRequest:req];
+    }
+}
+
+- (void)finishWithURL:(NSURL *)url error:(NSError *)error {
+    if (self.didComplete) return;
+    self.didComplete = YES;
+    void (^completion)(NSURL * _Nullable, NSError * _Nullable) = self.completionBlock;
+    self.completionBlock = nil;
+    id owner = self.ownerSession;
+    self.ownerSession = nil;
+    if (owner) {
+        objc_setAssociatedObject(owner, &kLCAuthActiveVCKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    UIViewController *toDismiss = self.navigationController ?: self;
+    if (toDismiss.presentingViewController) {
+        [toDismiss dismissViewControllerAnimated:YES completion:^{
+            if (completion) completion(url, error);
+        }];
+    } else {
+        if (completion) completion(url, error);
+    }
+}
+
+- (void)cancelSessionExternally {
+    NSError *err = [NSError errorWithDomain:ASWebAuthenticationSessionErrorDomain
+                                       code:ASWebAuthenticationSessionErrorCodeCanceledLogin
+                                   userInfo:nil];
+    [self finishWithURL:nil error:err];
+}
+
+- (void)onCancelTapped {
+    [self cancelSessionExternally];
+}
+
+- (void)presentationControllerDidDismiss:(UIPresentationController *)presentationController {
+    [self cancelSessionExternally];
+}
+
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+    [self.spinner startAnimating];
+    if (webView.URL.host.length > 0) {
+        self.navigationItem.title = webView.URL.host;
+    }
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    [self.spinner stopAnimating];
+    if (webView.title.length > 0) {
+        self.navigationItem.title = webView.title;
+    } else if (webView.URL.host.length > 0) {
+        self.navigationItem.title = webView.URL.host;
+    }
+}
+
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self.spinner stopAnimating];
+}
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    NSURL *url = navigationAction.request.URL;
+    BOOL matched = NO;
+    if (url) {
+        if (self.callbackObj && [self.callbackObj respondsToSelector:@selector(matchesURL:)]) {
+            matched = [self.callbackObj matchesURL:url];
+        } else if (self.callbackScheme.length > 0 && url.scheme.length > 0) {
+            matched = ([url.scheme caseInsensitiveCompare:self.callbackScheme] == NSOrderedSame);
+        }
+    }
+    if (matched) {
+        decisionHandler(WKNavigationActionPolicyCancel);
+        [self finishWithURL:url error:nil];
+        return;
+    }
+    decisionHandler(WKNavigationActionPolicyAllow);
+}
+
+@end
+
+@implementation ASWebAuthenticationSession (LCAuthHook)
+
+- (instancetype)hook_lc_initWithURL:(NSURL *)URL callbackURLScheme:(NSString *)callbackURLScheme completionHandler:(ASWebAuthenticationSessionCompletionHandler)completionHandler {
+    id inst = [self hook_lc_initWithURL:URL callbackURLScheme:callbackURLScheme completionHandler:completionHandler];
+    if (inst) {
+        objc_setAssociatedObject(inst, &kLCAuthURLKey, URL, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(inst, &kLCAuthCallbackSchemeKey, callbackURLScheme, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(inst, &kLCAuthCompletionKey, completionHandler, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    return inst;
+}
+
+- (instancetype)hook_lc_initWithURL:(NSURL *)URL callback:(ASWebAuthenticationSessionCallback *)callback completionHandler:(ASWebAuthenticationSessionCompletionHandler)completionHandler {
+    id inst = [self hook_lc_initWithURL:URL callback:callback completionHandler:completionHandler];
+    if (inst) {
+        objc_setAssociatedObject(inst, &kLCAuthURLKey, URL, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(inst, &kLCAuthCallbackObjKey, callback, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(inst, &kLCAuthCompletionKey, completionHandler, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    return inst;
+}
+
+- (BOOL)hook_lc_start {
+    NSURL *authURL = objc_getAssociatedObject(self, &kLCAuthURLKey);
+    NSString *scheme = objc_getAssociatedObject(self, &kLCAuthCallbackSchemeKey);
+    ASWebAuthenticationSessionCallback *cbObj = objc_getAssociatedObject(self, &kLCAuthCallbackObjKey);
+    ASWebAuthenticationSessionCompletionHandler completion = objc_getAssociatedObject(self, &kLCAuthCompletionKey);
+
+    if (completion && LCShouldInterceptAuthSession(authURL, scheme, cbObj)) {
+        BOOL cancelledBeforeStart = [objc_getAssociatedObject(self, &kLCAuthInProcessCancelledKey) boolValue];
+        if (cancelledBeforeStart) {
+            return NO;
+        }
+        BOOL ephemeral = [self respondsToSelector:@selector(prefersEphemeralWebBrowserSession)] ? self.prefersEphemeralWebBrowserSession : NO;
+        NSDictionary<NSString *, NSString *> *extraHeaders = [self respondsToSelector:@selector(additionalHeaderFields)] ? self.additionalHeaderFields : nil;
+        UIWindow *anchor = nil;
+        id<ASWebAuthenticationPresentationContextProviding> provider = [self respondsToSelector:@selector(presentationContextProvider)] ? self.presentationContextProvider : nil;
+        if (provider && [provider respondsToSelector:@selector(presentationAnchorForWebAuthenticationSession:)]) {
+            anchor = [provider presentationAnchorForWebAuthenticationSession:self];
+        }
+
+        void (^presentBlock)(void) = ^{
+            UIWindow *targetWindow = anchor ?: LCKeyWindowForScene(LCForegroundWindowScene());
+            UIViewController *presenter = targetWindow.rootViewController;
+            while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed) {
+                presenter = presenter.presentedViewController;
+            }
+            if (!presenter) {
+                NSError *err = [NSError errorWithDomain:ASWebAuthenticationSessionErrorDomain
+                                                   code:ASWebAuthenticationSessionErrorCodePresentationContextNotProvided
+                                               userInfo:nil];
+                completion(nil, err);
+                return;
+            }
+            LCWebAuthSessionViewController *authVC = [[LCWebAuthSessionViewController alloc] init];
+            authVC.initialURL = authURL;
+            authVC.callbackScheme = scheme;
+            authVC.callbackObj = cbObj;
+            authVC.prefersEphemeral = ephemeral;
+            authVC.additionalHeaders = extraHeaders;
+            authVC.completionBlock = completion;
+            authVC.ownerSession = self;
+
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:authVC];
+            nav.modalPresentationStyle = UIModalPresentationPageSheet;
+            nav.presentationController.delegate = authVC;
+            objc_setAssociatedObject(self, &kLCAuthActiveVCKey, authVC, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [presenter presentViewController:nav animated:YES completion:nil];
+        };
+        if (NSThread.isMainThread) {
+            presentBlock();
+        } else {
+            dispatch_async(dispatch_get_main_queue(), presentBlock);
+        }
+        return YES;
+    }
+
+    return [self hook_lc_start];
+}
+
+- (void)hook_lc_cancel {
+    objc_setAssociatedObject(self, &kLCAuthInProcessCancelledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    LCWebAuthSessionViewController *activeVC = objc_getAssociatedObject(self, &kLCAuthActiveVCKey);
+    if (activeVC) {
+        if (NSThread.isMainThread) {
+            [activeVC cancelSessionExternally];
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [activeVC cancelSessionExternally];
+            });
+        }
+        return;
+    }
+    [self hook_lc_cancel];
+}
+
+@end
+
+static void LCInstallWebAuthSessionHooks(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class asClass = ASWebAuthenticationSession.class;
+        if (asClass) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            LCSwizzleIfPresent(asClass, @selector(initWithURL:callbackURLScheme:completionHandler:), @selector(hook_lc_initWithURL:callbackURLScheme:completionHandler:));
+#pragma clang diagnostic pop
+            LCSwizzleIfPresent(asClass, @selector(initWithURL:callback:completionHandler:), @selector(hook_lc_initWithURL:callback:completionHandler:));
+            LCSwizzleIfPresent(asClass, @selector(start), @selector(hook_lc_start));
+            LCSwizzleIfPresent(asClass, @selector(cancel), @selector(hook_lc_cancel));
+        }
+        Class sfClass = objc_lookUpClass("SFAuthenticationSession");
+        if (sfClass && ![sfClass isSubclassOfClass:asClass]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            SEL initSel = @selector(initWithURL:callbackURLScheme:completionHandler:);
+            SEL hookInitSel = @selector(hook_lc_initWithURL:callbackURLScheme:completionHandler:);
+#pragma clang diagnostic pop
+            LCSwizzleIfPresentWithSourceClass(sfClass, asClass, initSel, hookInitSel);
+            LCSwizzleIfPresentWithSourceClass(sfClass, asClass, @selector(start), @selector(hook_lc_start));
+            LCSwizzleIfPresentWithSourceClass(sfClass, asClass, @selector(cancel), @selector(hook_lc_cancel));
+        }
+    });
+}

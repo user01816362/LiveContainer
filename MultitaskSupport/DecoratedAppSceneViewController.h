@@ -2,20 +2,20 @@
 #import "AppSceneViewController.h"
 
 @interface DecoratedAppSceneViewController : UIViewController<AppSceneViewControllerDelegate>
-@property(nonatomic) AppSceneViewController* appSceneVC;
-@property(nonatomic) UIStackView *view;
-@property(nonatomic) UINavigationBar *navigationBar;
-@property(nonatomic) UINavigationItem *navigationItem;
-@property(nonatomic) UIView *resizeHandle;
-@property(nonatomic) UIView* contentView;
+@property(nonatomic, null_unspecified) AppSceneViewController* appSceneVC;
+@property(nonatomic, null_unspecified) UIStackView *view;
+@property(nonatomic, null_unspecified) UINavigationBar *navigationBar;
+@property(nonatomic, null_unspecified) UINavigationItem *navigationItem;
+@property(nonatomic, null_unspecified) UIView *resizeHandle;
+@property(nonatomic, null_unspecified) UIView* contentView;
 
 @property(nonatomic) BOOL isMaximized;
 @property(nonatomic) CGFloat scaleRatio;
-- (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC;
+- (instancetype _Null_unspecified)initWindowName:(NSString * _Null_unspecified)windowName bundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID rootVC:(UIViewController * _Null_unspecified)rootVC;
 - (void)minimizeWindow;
 - (void)minimizeWindowPiP;
 - (void)unminimizeWindowPiP;
 - (void)updateVerticalConstraints;
-@property(nonatomic, copy) void (^pidAvailableHandler)(NSNumber *pid, NSError *error);
+@property(nonatomic, copy, nullable) void (^ NS_SWIFT_SENDABLE pidAvailableHandler)(NSNumber * _Nullable pid, NSError * _Nullable error);
 @end
 

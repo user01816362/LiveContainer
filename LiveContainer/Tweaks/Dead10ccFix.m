@@ -86,28 +86,23 @@ void initDead10ccFix(void) {
         return nil;
     }
 
-    NSMutableSet *openFilePaths = [NSMutableSet set];
+    NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *openFileFds = [NSMutableDictionary dictionary];
 
-    if (pidinfo_size >= 8) {
-        uint64_t count = pidinfo_size / sizeof(struct proc_fdinfo);
+    if (pidinfo_size >= (int)sizeof(struct proc_fdinfo)) {
+        uint64_t count = (uint64_t)pidinfo_size / sizeof(struct proc_fdinfo);
         struct proc_fdinfo *fdinfo = (struct proc_fdinfo *)pidinfo;
-        
-        while (count--) {
-            if (fdinfo->proc_fdtype == PROX_FDTYPE_VNODE) {
-                struct vnode_fdinfowithpath vnodeinfo;
-                //memset(&vnodeinfo, 0, 0x200); // TODO: Why not sizeof(vnodeinfo)?
-                int vnodeinfo_size = proc_pidfdinfo(pid, fdinfo->proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeinfo, sizeof(vnodeinfo));
-                if (vnodeinfo_size == 0) {
-                    // _rbs_process_log with %{public}@ proc_pidfdinfo failed for fd %d with errno %d
-                    continue;
-                } else if (vnodeinfo_size < sizeof(vnodeinfo)) {
-                    // _rbs_process_log with %{public}@ Weird size (%d != %lu) for fd %d
+
+        for (uint64_t i = 0; i < count; i++) {
+            struct proc_fdinfo *entry = &fdinfo[i];
+            if (entry->proc_fdtype == PROX_FDTYPE_VNODE) {
+                struct vnode_fdinfowithpath vnodeinfo = {0};
+                int vnodeinfo_size = proc_pidfdinfo(pid, entry->proc_fd, PROC_PIDFDVNODEPATHINFO, &vnodeinfo, sizeof(vnodeinfo));
+                if (vnodeinfo_size <= 0 || vnodeinfo_size < (int)sizeof(vnodeinfo)) {
                     continue;
                 }
 
-                int64_t pathlen = strlen(vnodeinfo.pvip.vip_path);
-                if (pathlen == 0) {
-                    // _rbs_process_log with%{public}@ nodeFDInfo.pvip.vip_path is empty for one fd
+                size_t pathlen = strnlen(vnodeinfo.pvip.vip_path, sizeof(vnodeinfo.pvip.vip_path));
+                if (pathlen == 0 || pathlen == sizeof(vnodeinfo.pvip.vip_path)) {
                     continue;
                 }
 
@@ -117,50 +112,50 @@ void initDead10ccFix(void) {
                 }
 
                 path = [path stringByStandardizingPath];
-                [openFilePaths addObject:path];
+                NSMutableArray<NSNumber *> *fds = openFileFds[path];
+                if (!fds) {
+                    fds = [NSMutableArray array];
+                    openFileFds[path] = fds;
+                }
+                [fds addObject:@(entry->proc_fd)];
             }
-            fdinfo++;
         }
     }
     free(pidinfo);
 
     NSMutableSet *lockedFilePaths = [NSMutableSet set];
 
-    for (NSString *path in openFilePaths) {
+    for (NSString *path in openFileFds) {
         char *path_c = (char *)[path UTF8String];
         struct stat statbuf;
         if (stat(path_c, &statbuf) != 0) {
-            // _rbs_process_log with %{public}@ Could not stat %{public}@: %{public}s
             NSLog(@"Could not stat %@: %s", path, strerror(errno));
             continue;
         }
 
         if ((statbuf.st_mode & S_IFMT) != S_IFREG) {
-            // _rbs_process_log with %{public}@ Not checking lock on special file: %{public}@
-//            NSLog(@"Not checking lock on special file: %@", path);
             continue;
         }
 
+        BOOL shouldIgnore = NO;
         for (NSString *ignoringPath in ignoring) {
             if ([path hasPrefix:ignoringPath]) {
-                // _rbs_process_log with %{public}@: Ignoring file %{public}@ because it is in an allowed path:  %{public}@
-//                NSLog(@"Ignoring file %@ because it is in an allowed path: %@", path, ignoringPath);
-                continue;
+                shouldIgnore = YES;
+                break;
             }
+        }
+        if (shouldIgnore) {
+            continue;
         }
 
         if ([path hasSuffix:@"-shm"] || [path hasSuffix:@"-wal"] || [path hasSuffix:@"-journal"]) {
-            // _rbs_process_log with %{public}@ Ignoring SQLite journal file: %{public}@
-//            NSLog(@"Ignoring SQLite journal file: %@", path);
             continue;
         }
 
         if (getxattr(path_c, "com.apple.runningboard.can-suspend-locked", NULL, 0, 0, 0) == 1) {
-            char value;
+            char value = 0;
             getxattr(path_c, "com.apple.runningboard.can-suspend-locked", &value, sizeof(value), 0, 0);
             if (value != 0) {
-                // _rbs_process_log with %{public}@ Ignoring file with can-suspend-locked: %{public}@
-//                NSLog(@"Ignoring file with can-suspend-locked: %@", path);
                 continue;
             }
         }
@@ -171,37 +166,24 @@ void initDead10ccFix(void) {
         });
         int sqlite_lock = sqlite3LockStateFn ? sqlite3LockStateFn(path_c, pid) : -1;
         if (sqlite_lock == 0) {
-            // _rbs_process_log with %{public}@ Ignoring unlocked SQLite database: %{public}@
-//            NSLog(@"Ignoring unlocked SQLite database: %@", path);
             continue;
         }
 
         if (sqlite_lock == 1) {
-            // _rbs_process_log with %{public}@ Found locked SQLite database: %{public}@
-//            NSLog(@"Found locked SQLite database: %@", path);
             [lockedFilePaths addObject:path];
-            
         } else {
-            int fd = open(path_c, O_RDONLY | O_NOCTTY);
-            if (fd < 0) {
-                continue;
-            }
+            // Query lock status using existing open FDs rather than open()+close(), which drops POSIX fcntl locks process-wide
+            for (NSNumber *fdNum in openFileFds[path]) {
+                struct flock fl;
+                memset(&fl, 0, sizeof(fl));
+                fl.l_type = F_WRLCK;
+                fl.l_pid = pid;
 
-            struct flock fl;
-            memset(&fl, 0, sizeof(fl));
-            fl.l_type = F_WRLCK;
-            fl.l_pid = pid;
-
-            int lock = fcntl(fd, F_GETLKPID, &fl);
-            close(fd);
-            if (lock == -1) {
-                continue;
-            }
-
-            if ((fl.l_type &~ F_UNLCK) == 1) {
-                // _rbs_process_log with %{public}@ Found locked file lock: %{public}@
-//                NSLog(@"Found locked file lock: %@", path);
-                [lockedFilePaths addObject:path];
+                int lock = fcntl(fdNum.intValue, F_GETLKPID, &fl);
+                if (lock != -1 && (fl.l_type == F_RDLCK || fl.l_type == F_WRLCK)) {
+                    [lockedFilePaths addObject:path];
+                    break;
+                }
             }
         }
     }
@@ -210,21 +192,28 @@ void initDead10ccFix(void) {
 }
 
 - (void)handleAppDidEnterBackground:(NSNotification *)notification {
-    if(!_methodInited) {
-        _methodInited = YES;
-        // hack: steal -[UIApplication _handleTaskCompletionAndTerminate:]
-        Class class = NSClassFromString(@"UIApplication");
-        SEL sel = @selector(_handleTaskCompletionAndTerminate:);
-        Method method = class_getInstanceMethod(class, sel);
-        if(method) {
-            class_addMethod(Dead10ccFix.class, sel, method_getImplementation(method), method_getTypeEncoding(method));
+    dispatch_block_t handleBlock = ^{
+        if(!self->_methodInited) {
+            self->_methodInited = YES;
+            // hack: steal -[UIApplication _handleTaskCompletionAndTerminate:]
+            Class class = NSClassFromString(@"UIApplication");
+            SEL sel = @selector(_handleTaskCompletionAndTerminate:);
+            Method method = class_getInstanceMethod(class, sel);
+            if(method) {
+                class_addMethod(Dead10ccFix.class, sel, method_getImplementation(method), method_getTypeEncoding(method));
+            }
         }
-    }
-    // this will call _UIApplicationCallWhenBackgroundTaskCountReachesZero which calls _terminateWithStatus: when no background tasks are left
-    if ([self respondsToSelector:@selector(_handleTaskCompletionAndTerminate:)]) {
-        [self _handleTaskCompletionAndTerminate:self];
+        // this will call _UIApplicationCallWhenBackgroundTaskCountReachesZero which calls _terminateWithStatus: when no background tasks are left
+        if ([self respondsToSelector:@selector(_handleTaskCompletionAndTerminate:)]) {
+            [self _handleTaskCompletionAndTerminate:self];
+        } else {
+            [self handleAppDidEnterBackgroundReal];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        handleBlock();
     } else {
-        [self handleAppDidEnterBackgroundReal];
+        dispatch_async(dispatch_get_main_queue(), handleBlock);
     }
 }
 

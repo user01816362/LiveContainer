@@ -55,31 +55,96 @@ static uint32_t get_chained_fixups_seg_count(void *macho, struct linkedit_data_c
 }
 
 
-static void insertDylibCommand(uint32_t cmd, const char *path, struct mach_header_64 *header) {
-    const char *name = cmd==LC_ID_DYLIB ? basename((char *)path) : path;
+static uint32_t lcMinHeaderDataOffset(struct mach_header_64 *header) {
+    uint32_t minOffset = UINT32_MAX;
+    uint8_t *cmdPtr = (uint8_t *)header + sizeof(struct mach_header_64);
+    uint8_t *cmdEnd = cmdPtr + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && cmdPtr + sizeof(struct load_command) <= cmdEnd; i++) {
+        struct load_command *cmd = (struct load_command *)cmdPtr;
+        if (cmd->cmdsize < sizeof(struct load_command) || cmdPtr + cmd->cmdsize > cmdEnd) {
+            break;
+        }
+        if (cmd->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
+            if (seg->cmdsize >= sizeof(struct segment_command_64) + (size_t)seg->nsects * sizeof(struct section_64)) {
+                struct section_64 *sects = (struct section_64 *)(seg + 1);
+                for (uint32_t j = 0; j < seg->nsects; j++) {
+                    if (sects[j].offset > 0 && sects[j].offset < minOffset) {
+                        minOffset = sects[j].offset;
+                    }
+                }
+            }
+            if (seg->fileoff > 0 && seg->filesize > 0 && seg->fileoff < minOffset) {
+                minOffset = (uint32_t)seg->fileoff;
+            }
+        } else if (cmd->cmd == LC_ENCRYPTION_INFO_64 || cmd->cmd == LC_ENCRYPTION_INFO) {
+            struct encryption_info_command *enc = (struct encryption_info_command *)cmd;
+            if (enc->cryptoff > 0 && enc->cryptoff < minOffset) {
+                minOffset = enc->cryptoff;
+            }
+        }
+        cmdPtr += cmd->cmdsize;
+    }
+    return minOffset;
+}
+
+static bool lcHasRPathCommand(struct mach_header_64 *header, const char *path) {
+    uint8_t *cmdPtr = (uint8_t *)header + sizeof(struct mach_header_64);
+    uint8_t *cmdEnd = cmdPtr + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && cmdPtr + sizeof(struct load_command) <= cmdEnd; i++) {
+        struct load_command *cmd = (struct load_command *)cmdPtr;
+        if (cmd->cmdsize < sizeof(struct load_command) || cmdPtr + cmd->cmdsize > cmdEnd) {
+            break;
+        }
+        if (cmd->cmd == LC_RPATH && cmd->cmdsize > sizeof(struct rpath_command)) {
+            struct rpath_command *rpath = (struct rpath_command *)cmd;
+            uint32_t off = rpath->path.offset;
+            if (off >= sizeof(struct rpath_command) && off < cmd->cmdsize) {
+                size_t maxLen = cmd->cmdsize - off;
+                const char *existing = (const char *)cmd + off;
+                if (strnlen(existing, maxLen) < maxLen && strcmp(existing, path) == 0) {
+                    return true;
+                }
+            }
+        }
+        cmdPtr += cmd->cmdsize;
+    }
+    return false;
+}
+
+static uint32_t insertDylibCommandWithMinSize(uint32_t cmd, const char *path, struct mach_header_64 *header, size_t minCmdSize) {
+    const char *name = cmd == LC_ID_DYLIB ? basename((char *)path) : path;
     struct dylib_command *dylib;
-    size_t cmdsize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(name) + 1, 8);
+    size_t naturalSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(name) + 1, 8);
+    size_t cmdsize = naturalSize > minCmdSize ? naturalSize : minCmdSize;
     if (cmd == LC_ID_DYLIB) {
         // Make this the first load command on the list (like dylibify does), or some UE3 games may break
         dylib = (struct dylib_command *)(sizeof(struct mach_header_64) + (uintptr_t)header);
         memmove((void *)((uintptr_t)dylib + cmdsize), (void *)dylib, header->sizeofcmds);
-        bzero(dylib, cmdsize);
     } else {
-        dylib = (struct dylib_command *)(sizeof(struct mach_header_64) + (void *)header+header->sizeofcmds);
+        dylib = (struct dylib_command *)(sizeof(struct mach_header_64) + (uintptr_t)header + header->sizeofcmds);
     }
+    bzero(dylib, cmdsize);
     dylib->cmd = cmd;
     dylib->cmdsize = (uint32_t)cmdsize;
     dylib->dylib.name.offset = sizeof(struct dylib_command);
     dylib->dylib.compatibility_version = 0x10000;
     dylib->dylib.current_version = 0x10000;
     dylib->dylib.timestamp = 2;
-    strncpy((void *)dylib + dylib->dylib.name.offset, name, strlen(name));
+    strlcpy((char *)dylib + dylib->dylib.name.offset, name, cmdsize - dylib->dylib.name.offset);
     header->ncmds++;
     header->sizeofcmds += dylib->cmdsize;
+    return dylib->cmdsize;
 }
 
 static void replaceDylinkerWithIDDylibCommand(struct dylinker_command* dylinkerCommand, const char *path) {
+    if (!dylinkerCommand || !path) {
+        return;
+    }
     uint32_t size = dylinkerCommand->cmdsize;
+    if (size <= sizeof(struct dylib_command)) {
+        return;
+    }
     struct dylib_command* newDylibCommand = (struct dylib_command*)dylinkerCommand;
     newDylibCommand->cmd = LC_ID_DYLIB;
 
@@ -88,18 +153,30 @@ static void replaceDylinkerWithIDDylibCommand(struct dylinker_command* dylinkerC
     newDylibCommand->dylib.current_version = 0x10000;
     newDylibCommand->dylib.timestamp = 2;
     uint32_t nameSize = size - sizeof(struct dylib_command);
-    // we only have 8 bytes to use
     const char* name = basename((char *)path);
-    strncpy((void *)newDylibCommand + newDylibCommand->dylib.name.offset, name, nameSize);
-    *((char *)newDylibCommand + newDylibCommand->dylib.name.offset + nameSize - 1) = 0;
+    bzero((void *)newDylibCommand + newDylibCommand->dylib.name.offset, nameSize);
+    strlcpy((char *)newDylibCommand + newDylibCommand->dylib.name.offset, name, nameSize);
 }
 
 static void insertRPathCommand(const char *path, struct mach_header_64 *header) {
-    struct rpath_command *rpath = (struct rpath_command *)(sizeof(struct mach_header_64) + (void *)header+header->sizeofcmds);
+    if (!path || !header || header->magic != MH_MAGIC_64) {
+        return;
+    }
+    if (lcHasRPathCommand(header, path)) {
+        return;
+    }
+    size_t cmdsize = sizeof(struct rpath_command) + rnd32((uint32_t)strlen(path) + 1, 8);
+    uint32_t minDataOffset = lcMinHeaderDataOffset(header);
+    size_t currentEnd = sizeof(struct mach_header_64) + header->sizeofcmds;
+    if (minDataOffset == UINT32_MAX || currentEnd > minDataOffset || (minDataOffset - currentEnd) < cmdsize) {
+        return;
+    }
+    struct rpath_command *rpath = (struct rpath_command *)((uintptr_t)header + currentEnd);
+    bzero(rpath, cmdsize);
     rpath->cmd = LC_RPATH;
-    rpath->cmdsize = sizeof(struct rpath_command) + rnd32((uint32_t)strlen(path) + 1, 8);
+    rpath->cmdsize = (uint32_t)cmdsize;
     rpath->path.offset = sizeof(struct rpath_command);
-    strncpy((void *)rpath + rpath->path.offset, path, strlen(path));
+    strlcpy((char *)rpath + rpath->path.offset, path, cmdsize - rpath->path.offset);
     header->ncmds++;
     header->sizeofcmds += rpath->cmdsize;
 }
@@ -110,133 +187,169 @@ void LCPatchAddRPath(const char *path, struct mach_header_64 *header) {
 }
 
 int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInject) {
-    uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     int ans = 0;
+    if (!path || !header || header->magic != MH_MAGIC_64) {
+        return ans;
+    }
+    uint8_t *imageHeaderPtr = (uint8_t *)header + sizeof(struct mach_header_64);
     // Literally convert an executable to a dylib
-    if (header->magic == MH_MAGIC_64) {
-        //assert(header->flags & MH_PIE);
-        header->filetype = MH_DYLIB;
-        header->flags |= MH_NO_REEXPORTED_DYLIBS;
-        header->flags &= ~MH_PIE;
-    }
-
-    // Patch __PAGEZERO to map just a single zero page, fixing "out of address space"
-    struct segment_command_64 *seg = (struct segment_command_64 *)imageHeaderPtr;
-    assert(seg->cmd == LC_SEGMENT_64 || seg->cmd == LC_ID_DYLIB);
-    if (seg->cmd == LC_SEGMENT_64 && seg->vmaddr == 0) {
-        seg->vmaddr = 0x100000000 - 0x4000;
-        seg->vmsize = 0x4000;
-    }
+    header->filetype = MH_DYLIB;
+    header->flags |= MH_NO_REEXPORTED_DYLIBS;
+    header->flags &= ~MH_PIE;
 
     BOOL hasDylibCommand = NO;
-    struct dylib_command * dylibLoaderCommand = 0;
+    struct dylib_command *dylibLoaderCommand = NULL;
     const char *tweakLoaderPath = "@loader_path/../../Tweaks/TweakLoader.dylib";
     const char *libCppPath = "/usr/lib/libc++.1.dylib";
-    int textSectionOffest = 0;
     struct load_command *command = (struct load_command *)imageHeaderPtr;
-    struct dylinker_command* dylinkerCommand = 0;
+    uint8_t *cmdEnd = imageHeaderPtr + header->sizeofcmds;
+    struct dylinker_command *dylinkerCommand = NULL;
     bool codeSignatureCommandFound = false;
     uint32_t loadCommandSegCount = 0;
-    for(int i = 0; i < header->ncmds; i++) {
-        if(command->cmd == LC_ID_DYLIB) {
+    for (uint32_t i = 0; i < header->ncmds && (uint8_t *)command + sizeof(struct load_command) <= cmdEnd; i++) {
+        if (command->cmdsize < sizeof(struct load_command) || (uint8_t *)command + command->cmdsize > cmdEnd) {
+            break;
+        }
+        if (command->cmd == LC_ID_DYLIB) {
             hasDylibCommand = YES;
-        } else if(command->cmd == LC_LOAD_DYLIB) {
+        } else if (command->cmd == LC_LOAD_DYLIB) {
             struct dylib_command *dylib = (struct dylib_command *)command;
-            char *dylibName = (void *)dylib + dylib->dylib.name.offset;
-            if (!strncmp(dylibName, tweakLoaderPath, strlen(tweakLoaderPath))) {
-                dylibLoaderCommand = dylib;
-            }
-        } else if(command->cmd == 0x114514) {
-            dylibLoaderCommand = (struct dylib_command *)command;
-        } else if(command->cmd == LC_SEGMENT_64) {
-            struct segment_command_64* seglc = (struct segment_command_64*)command;
-            loadCommandSegCount++;
-            if (strcmp("__TEXT", seglc->segname) == 0) {
-                for (uint32_t j = 0; j < seglc->nsects; j++) {
-                    struct section_64* sect = (struct section_64*)(((void*)command + sizeof(struct segment_command_64) + sizeof(struct section_64) * j));
-                    if (0 == strcmp("__text", sect->sectname)) {
-                        textSectionOffest = sect->offset;
-                    }
+            if (dylib->dylib.name.offset >= sizeof(struct dylib_command) && dylib->dylib.name.offset < dylib->cmdsize) {
+                char *dylibName = (char *)dylib + dylib->dylib.name.offset;
+                if (!strncmp(dylibName, tweakLoaderPath, dylib->cmdsize - dylib->dylib.name.offset)) {
+                    dylibLoaderCommand = dylib;
                 }
+            }
+        } else if (command->cmd == 0x114514) {
+            dylibLoaderCommand = (struct dylib_command *)command;
+        } else if (command->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seglc = (struct segment_command_64 *)command;
+            loadCommandSegCount++;
+            // Patch __PAGEZERO to map just a single zero page, fixing "out of address space"
+            if (seglc->vmaddr == 0 && strcmp(SEG_PAGEZERO, seglc->segname) == 0) {
+                seglc->vmaddr = 0x100000000 - 0x4000;
+                seglc->vmsize = 0x4000;
             }
         } else if (command->cmd == LC_CODE_SIGNATURE) {
             codeSignatureCommandFound = true;
         } else if (command->cmd == LC_LOAD_DYLINKER) {
-            dylinkerCommand = (struct dylinker_command*)command;
+            dylinkerCommand = (struct dylinker_command *)command;
         } else if (command->cmd == LC_DYLD_CHAINED_FIXUPS) {
-            if(loadCommandSegCount != get_chained_fixups_seg_count((void*)header, (struct linkedit_data_command *)command)) {
+            if (loadCommandSegCount != get_chained_fixups_seg_count((void *)header, (struct linkedit_data_command *)command)) {
                 ans |= PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH;
             }
         }
-        
-        command = (struct load_command *)((void *)command + command->cmdsize);
+
+        command = (struct load_command *)((uint8_t *)command + command->cmdsize);
     }
-    long freeLoadCommandCountLeft = (void*)header + textSectionOffest - (void*)command;
-    int tweakLoaderLoadDylibCmdSize = 0x48;
-    
+
+    uint32_t minDataOffset = lcMinHeaderDataOffset(header);
+    long freeLoadCommandCountLeft = 0;
+    size_t currentCmdEndOffset = sizeof(struct mach_header_64) + header->sizeofcmds;
+    if (minDataOffset != UINT32_MAX && minDataOffset >= currentCmdEndOffset) {
+        freeLoadCommandCountLeft = (long)(minDataOffset - currentCmdEndOffset);
+    }
+    size_t tweakLoaderLoadDylibCmdSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(tweakLoaderPath) + 1, 8);
+    if (tweakLoaderLoadDylibCmdSize < 0x48) {
+        tweakLoaderLoadDylibCmdSize = 0x48;
+    }
+
     // Insert command priority: LC_CODE_SIGNATURE > LC_ID_DYLIB > LC_LOAD_DYLIB
-    if(!codeSignatureCommandFound) {
+    if (!codeSignatureCommandFound) {
         freeLoadCommandCountLeft -= 0x10;
     }
-    
-    int idDylibCommandSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(basename((char*)path)) + 1, 8);
-    if(!hasDylibCommand) {
-        if (freeLoadCommandCountLeft >= idDylibCommandSize) {
-            freeLoadCommandCountLeft -= idDylibCommandSize;
-            insertDylibCommand(LC_ID_DYLIB, path, header);
+
+    size_t idDylibCommandSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(basename((char *)path)) + 1, 8);
+    if (!hasDylibCommand) {
+        if (freeLoadCommandCountLeft >= (long)idDylibCommandSize) {
+            freeLoadCommandCountLeft -= (long)idDylibCommandSize;
+            uint32_t insertedBytes = insertDylibCommandWithMinSize(LC_ID_DYLIB, path, header, 0);
+            // Shifting load commands forward invalidates any earlier load-command pointer
+            if (dylibLoaderCommand) {
+                dylibLoaderCommand = (struct dylib_command *)((uintptr_t)dylibLoaderCommand + insertedBytes);
+            }
         } else if (dylinkerCommand) {
-            // #1042 fix: if there's not enough space for LC_ID_DYLIB we resue LC_LOAD_DYLINKER's space for LC_ID_DYLIB
+            // #1042 fix: if there's not enough space for LC_ID_DYLIB we reuse LC_LOAD_DYLINKER's space for LC_ID_DYLIB
             replaceDylinkerWithIDDylibCommand(dylinkerCommand, path);
         }
     }
 
+    const char *targetLoaderPath = doInject ? tweakLoaderPath : libCppPath;
+    size_t targetLoaderPathLen = strlen(targetLoaderPath) + 1;
+    bool handledLoaderCommand = false;
     if (dylibLoaderCommand) {
-        dylibLoaderCommand->cmd = doInject ? LC_LOAD_DYLIB : 0x114514;
-        strcpy((void *)dylibLoaderCommand + dylibLoaderCommand->dylib.name.offset, doInject ? tweakLoaderPath : libCppPath);
-    } else  {
-        if (freeLoadCommandCountLeft >= tweakLoaderLoadDylibCmdSize) {
-            freeLoadCommandCountLeft -= tweakLoaderLoadDylibCmdSize;
-            insertDylibCommand(doInject ? LC_LOAD_DYLIB : 0x114514, doInject ? tweakLoaderPath : libCppPath, header);
+        uint32_t nameOffset = dylibLoaderCommand->dylib.name.offset;
+        if (nameOffset >= sizeof(struct dylib_command) &&
+            nameOffset < dylibLoaderCommand->cmdsize &&
+            (dylibLoaderCommand->cmdsize - nameOffset) >= targetLoaderPathLen) {
+            dylibLoaderCommand->cmd = doInject ? LC_LOAD_DYLIB : 0x114514;
+            size_t nameBufSize = dylibLoaderCommand->cmdsize - nameOffset;
+            bzero((void *)dylibLoaderCommand + nameOffset, nameBufSize);
+            strlcpy((char *)dylibLoaderCommand + nameOffset, targetLoaderPath, nameBufSize);
+            handledLoaderCommand = true;
+        }
+    }
+    if (!handledLoaderCommand) {
+        // Reserve full TweakLoader command size even when initially disabled so toggling injection later never overflows
+        if (freeLoadCommandCountLeft >= (long)tweakLoaderLoadDylibCmdSize) {
+            freeLoadCommandCountLeft -= (long)tweakLoaderLoadDylibCmdSize;
+            insertDylibCommandWithMinSize(doInject ? LC_LOAD_DYLIB : 0x114514, targetLoaderPath, header, tweakLoaderLoadDylibCmdSize);
         } else {
-            // Not enough free space of injection tweak loader!
+            // Not enough free space for injecting tweak loader!
             ans |= PATCH_EXEC_RESULT_NO_SPACE_FOR_TWEAKLOADER;
         }
     }
-    
-    // Ensure No duplicated dylibs, often caused by incorrect tweak injection
+
+    // Ensure no duplicated dylibs, often caused by incorrect tweak injection
     // https://github.com/LiveContainer/LiveContainer/issues/582
     // https://github.com/apple-oss-distributions/dyld/blob/93bd81f9d7fcf004fcebcb66ec78983882b41e71/mach_o/Header.cpp#L678
     struct load_command *command2 = (struct load_command *)imageHeaderPtr;
-    __block int   depCount = 0;
-    const char**  depPaths = malloc(header->ncmds * sizeof(char*));
-    for(int i = 0; i < header->ncmds; i++) {
-        switch ( command2->cmd ) {
-            case LC_LOAD_DYLIB:
-            case LC_LOAD_WEAK_DYLIB:
-            case LC_REEXPORT_DYLIB:
-            case LC_LOAD_UPWARD_DYLIB: {
-                char* loadPath =  (void *)command2 + ((struct dylib_command*)command2)->dylib.name.offset;
-                for ( int i = 0; i < depCount; ++i ) {
-                    if ( strcmp(loadPath, depPaths[i]) == 0 ) {
-                        // replace this duplicated dylib command with an invalid command number
-                        command2->cmd = 0x114515;
-                        continue;
-                    }
-                }
-                depPaths[depCount] = loadPath;
-                ++depCount;
+    uint8_t *cmdEnd2 = imageHeaderPtr + header->sizeofcmds;
+    int depCount = 0;
+    const char **depPaths = header->ncmds > 0 ? calloc(header->ncmds, sizeof(char *)) : NULL;
+    if (depPaths) {
+        for (uint32_t i = 0; i < header->ncmds && (uint8_t *)command2 + sizeof(struct load_command) <= cmdEnd2; i++) {
+            if (command2->cmdsize < sizeof(struct load_command) || (uint8_t *)command2 + command2->cmdsize > cmdEnd2) {
+                break;
             }
+            switch (command2->cmd) {
+                case LC_LOAD_DYLIB:
+                case LC_LOAD_WEAK_DYLIB:
+                case LC_REEXPORT_DYLIB:
+                case LC_LOAD_UPWARD_DYLIB: {
+                    struct dylib_command *dylibCmd = (struct dylib_command *)command2;
+                    uint32_t nameOff = dylibCmd->dylib.name.offset;
+                    if (nameOff >= sizeof(struct dylib_command) && nameOff < dylibCmd->cmdsize) {
+                        char *loadPath = (char *)command2 + nameOff;
+                        bool isDuplicate = false;
+                        for (int k = 0; k < depCount; ++k) {
+                            if (strcmp(loadPath, depPaths[k]) == 0) {
+                                // Replace this duplicated dylib command with an invalid command number
+                                command2->cmd = 0x114515;
+                                isDuplicate = true;
+                                break;
+                            }
+                        }
+                        if (!isDuplicate) {
+                            depPaths[depCount++] = loadPath;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+            command2 = (struct load_command *)((uint8_t *)command2 + command2->cmdsize);
         }
-        command2 = (struct load_command *)((void *)command2 + command2->cmdsize);
+        free(depPaths);
     }
-    free(depPaths);
-    
+
     return ans;
 }
 
 NSString *LCParseMachO(const char *path, bool readOnly, LCParseMachOCallback callback) {
     NSString *error = nil;
-    int fd = open(path, readOnly ? O_RDONLY : O_RDWR, (mode_t)readOnly ? 0400 : 0600);
+    int fd = open(path, readOnly ? O_RDONLY : O_RDWR, readOnly ? 0400 : 0600);
     if (fd < 0) {
         return [NSString stringWithFormat:@"Failed to open %s: %s", path, strerror(errno)];
     }
@@ -247,42 +360,61 @@ NSString *LCParseMachO(const char *path, bool readOnly, LCParseMachOCallback cal
         goto cleanup_fd;
     }
 
-    if (s.st_size < sizeof(uint32_t)) {
+    if (s.st_size < (off_t)sizeof(uint32_t)) {
         error = @"Not a Mach-O file";
         goto cleanup_fd;
     }
 
-    void *map = mmap(NULL, s.st_size, readOnly ? PROT_READ : (PROT_READ | PROT_WRITE), readOnly ? MAP_PRIVATE : MAP_SHARED, fd, 0);
+    void *map = mmap(NULL, (size_t)s.st_size, readOnly ? PROT_READ : (PROT_READ | PROT_WRITE), readOnly ? MAP_PRIVATE : MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         error = [NSString stringWithFormat:@"Failed to map %s: %s", path, strerror(errno)];
         goto cleanup_fd;
     }
 
+    uint64_t fileSize = (uint64_t)s.st_size;
     uint32_t magic = *(uint32_t *)map;
     if (magic == FAT_CIGAM) {
-        // Find compatible slice
-        struct fat_header *header = (struct fat_header *)map;
-        struct fat_arch *arch = (struct fat_arch *)(map + sizeof(struct fat_header));
-        for (int i = 0; i < OSSwapInt32(header->nfat_arch); i++) {
-            int cputype = OSSwapInt32(arch->cputype);
-            if (cputype == CPU_TYPE_ARM64 || cputype == CPU_TYPE_ARM) {
-                callback(path, (struct mach_header_64 *)(map + OSSwapInt32(arch->offset)), fd, map);
-            }
-            arch = (struct fat_arch *)((void *)arch + sizeof(struct fat_arch));
+        if (fileSize < sizeof(struct fat_header)) {
+            error = @"Not a valid FAT Mach-O file";
+            goto cleanup_map;
         }
-    } else if (magic == MH_MAGIC_64 || magic == MH_MAGIC) {
+        // Find compatible slices within mapped bounds
+        struct fat_header *header = (struct fat_header *)map;
+        uint32_t nfat = OSSwapInt32(header->nfat_arch);
+        uint64_t maxArchs = (fileSize - sizeof(struct fat_header)) / sizeof(struct fat_arch);
+        if (nfat > maxArchs) {
+            error = @"Invalid FAT slice table";
+            goto cleanup_map;
+        }
+        struct fat_arch *arch = (struct fat_arch *)((uint8_t *)map + sizeof(struct fat_header));
+        for (uint32_t i = 0; i < nfat; i++) {
+            uint64_t sliceOff = OSSwapInt32(arch[i].offset);
+            uint64_t sliceSize = OSSwapInt32(arch[i].size);
+            int cputype = OSSwapInt32(arch[i].cputype);
+            if (sliceOff >= sizeof(struct fat_header) &&
+                sliceOff <= fileSize &&
+                sliceSize <= fileSize - sliceOff &&
+                sliceSize >= sizeof(struct mach_header) &&
+                (cputype != CPU_TYPE_ARM64 || sliceSize >= sizeof(struct mach_header_64))) {
+                if (cputype == CPU_TYPE_ARM64 || cputype == CPU_TYPE_ARM) {
+                    callback(path, (struct mach_header_64 *)((uint8_t *)map + sliceOff), fd, map);
+                }
+            }
+        }
+    } else if ((magic == MH_MAGIC_64 && fileSize >= sizeof(struct mach_header_64)) ||
+               (magic == MH_MAGIC && fileSize >= sizeof(struct mach_header))) {
         callback(path, (struct mach_header_64 *)map, fd, map);
     } else {
         error = @"Not a Mach-O file";
         goto cleanup_map;
     }
 
-    if (!readOnly && msync(map, s.st_size, MS_SYNC) != 0) {
+    if (!readOnly && msync(map, (size_t)s.st_size, MS_SYNC) != 0) {
         error = [NSString stringWithFormat:@"Failed to sync %s: %s", path, strerror(errno)];
     }
 
 cleanup_map:
-    munmap(map, s.st_size);
+    munmap(map, (size_t)s.st_size);
 cleanup_fd:
     close(fd);
     return error;
@@ -290,7 +422,7 @@ cleanup_fd:
 
 NSString *LCPatchMachOFixupARM64eSlice(const char *path) {
     int fd = open(path, O_RDWR, 0600);
-    if(fd < 0) {
+    if (fd < 0) {
         return [NSString stringWithFormat:@"Failed to open %s: %s", path, strerror(errno)];
     }
     struct stat s = {0};
@@ -298,34 +430,55 @@ NSString *LCPatchMachOFixupARM64eSlice(const char *path) {
         close(fd);
         return [NSString stringWithFormat:@"Failed to stat %s: %s", path, strerror(errno)];
     }
-    void *map = mmap(NULL, s.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if(map == MAP_FAILED) {
+    if (s.st_size < (off_t)sizeof(uint32_t)) {
+        close(fd);
+        return nil;
+    }
+    void *map = mmap(NULL, (size_t)s.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
         close(fd);
         return [NSString stringWithFormat:@"Failed to map %s: %s", path, strerror(errno)];
     }
 
+    uint64_t fileSize = (uint64_t)s.st_size;
     uint32_t magic = *(uint32_t *)map;
-    if(magic == FAT_CIGAM) {
+    if (magic == FAT_CIGAM && fileSize >= sizeof(struct fat_header)) {
         // Find arm64e slice without CPU_SUBTYPE_LIB64
-        struct fat_header *header = (struct fat_header *)map;
-        struct fat_arch *arch = (struct fat_arch *)(map + sizeof(struct fat_header));
-        for(int i = 0; i < OSSwapInt32(header->nfat_arch); i++) {
-            if(OSSwapInt32(arch->cputype) == CPU_TYPE_ARM64 && OSSwapInt32(arch->cpusubtype) == CPU_SUBTYPE_ARM64E) {
-                struct mach_header_64 *header = (struct mach_header_64 *)(map + OSSwapInt32(arch->offset));
+        struct fat_header *fatHeader = (struct fat_header *)map;
+        uint32_t nfat = OSSwapInt32(fatHeader->nfat_arch);
+        uint64_t maxArchs = (fileSize - sizeof(struct fat_header)) / sizeof(struct fat_arch);
+        uint32_t count = nfat < maxArchs ? nfat : (uint32_t)maxArchs;
+        struct fat_arch *arch = (struct fat_arch *)((uint8_t *)map + sizeof(struct fat_header));
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t cpuType = OSSwapInt32(arch[i].cputype);
+            uint32_t subType = OSSwapInt32(arch[i].cpusubtype);
+            uint64_t sliceOff = OSSwapInt32(arch[i].offset);
+            if (cpuType == CPU_TYPE_ARM64 &&
+                (subType & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
+                !(subType & CPU_SUBTYPE_LIB64) &&
+                sliceOff <= fileSize &&
+                sizeof(struct mach_header_64) <= fileSize - sliceOff) {
+                struct mach_header_64 *header = (struct mach_header_64 *)((uint8_t *)map + sliceOff);
                 header->cpusubtype |= CPU_SUBTYPE_LIB64;
-                arch->cpusubtype = htonl(header->cpusubtype);
+                arch[i].cpusubtype = OSSwapInt32(header->cpusubtype);
                 break;
             }
-            arch = (struct fat_arch *)((void *)arch + sizeof(struct fat_arch));
+        }
+    } else if (magic == MH_MAGIC_64 && fileSize >= sizeof(struct mach_header_64)) {
+        struct mach_header_64 *header = (struct mach_header_64 *)map;
+        if (header->cputype == CPU_TYPE_ARM64 &&
+            (header->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E &&
+            !(header->cpusubtype & CPU_SUBTYPE_LIB64)) {
+            header->cpusubtype |= CPU_SUBTYPE_LIB64;
         }
     }
 
-    if (msync(map, s.st_size, MS_SYNC) != 0) {
-        munmap(map, s.st_size);
+    if (msync(map, (size_t)s.st_size, MS_SYNC) != 0) {
+        munmap(map, (size_t)s.st_size);
         close(fd);
         return [NSString stringWithFormat:@"Failed to sync %s: %s", path, strerror(errno)];
     }
-    munmap(map, s.st_size);
+    munmap(map, (size_t)s.st_size);
     close(fd);
     return nil;
 }
@@ -393,6 +546,9 @@ bool LCIsMachOEncrypted(struct mach_header_64 *header) {
     return NO;
 }
 
+mach_header_u *LCGetLoadedImageHeader(int i0, const char* name);
+void *getDyldBase(void);
+
 uint64_t LCFindSymbolOffset(const char *basePath, const char *symbol) {
 #if !TARGET_OS_SIMULATOR
     const char *path = basePath;
@@ -401,11 +557,22 @@ uint64_t LCFindSymbolOffset(const char *basePath, const char *symbol) {
     const char *rootPath = getenv("DYLD_ROOT_PATH") ?: "";
     snprintf(path, sizeof(path), "%s%s", rootPath, basePath);
 #endif
+    struct mach_header_64 *loadedHeader = (strcmp(basePath, "/usr/lib/dyld") == 0)
+        ? (struct mach_header_64 *)getDyldBase()
+        : (struct mach_header_64 *)LCGetLoadedImageHeader(0, basePath);
+    const uint8_t *targetUUID = loadedHeader ? LCGetMachOUUID(loadedHeader) : NULL;
+
     __block uint64_t offset = 0;
     LCParseMachO(path, true, ^(const char *path, struct mach_header_64 *header, int fd, void *filePtr) {
-        if(header->cputype != CPU_TYPE_ARM64) return;
+        if (offset != 0 || header->cputype != CPU_TYPE_ARM64) return;
+        if (targetUUID) {
+            const uint8_t *sliceUUID = LCGetMachOUUID(header);
+            if (sliceUUID && memcmp(sliceUUID, targetUUID, 16) != 0) {
+                return;
+            }
+        }
         void *result = litehook_find_symbol_file(header, symbol);
-        if(result) {
+        if (result) {
             offset = (uint64_t)result - (uint64_t)header;
         }
     });
@@ -516,13 +683,22 @@ NSString* getEntitlementXML(struct mach_header_64* header, void** entitlementXML
     if(!codeSignCommand) {
         return @"Unable to find LC_CODE_SIGNATURE command.";
     }
+    uint32_t dataSize = codeSignCommand->datasize;
+    if (dataSize < sizeof(struct ui_CS_SuperBlob)) {
+        return @"CodeSign superblob truncated.";
+    }
     struct ui_CS_SuperBlob* blob = (void*)header + codeSignCommand->dataoff;
     if(blob->magic != OSSwapInt32(0xfade0cc0)) {
         return [NSString stringWithFormat:@"CodeSign blob magic mismatch %8x.", blob->magic];
     }
+    uint32_t blobCount = OSSwapInt32(blob->count);
+    uint32_t maxBlobs = (dataSize - (uint32_t)sizeof(struct ui_CS_SuperBlob)) / (uint32_t)sizeof(struct ui_CS_BlobIndex);
+    if (blobCount > maxBlobs) {
+        return @"CodeSign blob index count out of bounds.";
+    }
     struct ui_CS_BlobIndex* entitlementBlobIndex = 0;
     struct ui_CS_BlobIndex* nowIndex = (void*)blob + sizeof(struct ui_CS_SuperBlob);
-    for(int i = 0; i < OSSwapInt32(blob->count); i++) {
+    for(uint32_t i = 0; i < blobCount; i++) {
         if(OSSwapInt32(nowIndex->type) == 5) {
             entitlementBlobIndex = nowIndex;
             break;
@@ -532,11 +708,19 @@ NSString* getEntitlementXML(struct mach_header_64* header, void** entitlementXML
     if(entitlementBlobIndex == 0) {
         return @"[LC] entitlement blob index not found.";
     }
-    struct ui_CS_blob* entitlementBlob = (void*)blob + OSSwapInt32(entitlementBlobIndex->offset);
+    uint32_t entOffset = OSSwapInt32(entitlementBlobIndex->offset);
+    if (entOffset > dataSize || dataSize - entOffset < sizeof(struct ui_CS_blob)) {
+        return @"Entitlement blob offset out of bounds.";
+    }
+    struct ui_CS_blob* entitlementBlob = (void*)blob + entOffset;
     if(entitlementBlob->magic != OSSwapInt32(0xfade7171)) {
-        return [NSString stringWithFormat:@"EntitlementBlob magic mismatch %8x.", blob->magic];
-    };
-    int32_t xmlLength = OSSwapInt32(entitlementBlob->length) - sizeof(struct ui_CS_blob);
+        return [NSString stringWithFormat:@"EntitlementBlob magic mismatch %8x.", entitlementBlob->magic];
+    }
+    uint32_t entLength = OSSwapInt32(entitlementBlob->length);
+    if (entLength < sizeof(struct ui_CS_blob) || entLength > dataSize - entOffset) {
+        return @"Entitlement blob length out of bounds.";
+    }
+    uint32_t xmlLength = entLength - (uint32_t)sizeof(struct ui_CS_blob);
     void* xmlPtr = (void*)entitlementBlob + sizeof(struct ui_CS_blob);
     
     if(entitlementXMLPtrOut) {
@@ -544,7 +728,10 @@ NSString* getEntitlementXML(struct mach_header_64* header, void** entitlementXML
     }
 
     // entitlement xml in executable don't have \0 so we have to copy it first
-    char* xmlString = malloc(xmlLength + 1);
+    char* xmlString = malloc((size_t)xmlLength + 1);
+    if (!xmlString) {
+        return @"Out of memory allocating entitlement XML.";
+    }
     memcpy(xmlString, xmlPtr, xmlLength);
     xmlString[xmlLength] = 0;
 

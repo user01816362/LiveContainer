@@ -7,7 +7,7 @@
 
 import SwiftUI
 
-struct LCFolderPath {
+struct LCFolderPath: Sendable {
     var path : URL
     var desc : String
 }
@@ -251,18 +251,32 @@ struct LCDataManagementView : View {
         guard let result = await keyChainRemovalAlert.open(), result else {
             return
         }
-        
-        [kSecClassGenericPassword, kSecClassInternetPassword, kSecClassCertificate, kSecClassKey, kSecClassIdentity].forEach {
-          let status = SecItemDelete([
-            kSecClass: $0,
-            kSecAttrSynchronizable: kSecAttrSynchronizableAny
-          ] as CFDictionary)
-          if status != errSecSuccess && status != errSecItemNotFound {
-              //Error while removing class $0
-              errorInfo = status.description
-              errorShow = true
-          }
+
+        guard let teamId = LCSharedUtils.teamIdentifier(), !teamId.isEmpty else {
+            errorInfo = "Missing Team Identifier; unable to scope guest keychain cleanup."
+            errorShow = true
+            return
         }
+
+        let guestAccessGroups = ["\(teamId).com.kdt.livecontainer.shared"]
+            + (1..<SharedModel.keychainAccessGroupCount).map { "\(teamId).com.kdt.livecontainer.shared.\($0)" }
+
+        for group in guestAccessGroups {
+            for secClass in [kSecClassGenericPassword, kSecClassInternetPassword, kSecClassCertificate, kSecClassKey, kSecClassIdentity] {
+                let status = SecItemDelete([
+                    kSecClass: secClass,
+                    kSecAttrAccessGroup: group,
+                    kSecAttrSynchronizable: kSecAttrSynchronizableAny
+                ] as CFDictionary)
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    errorInfo = status.description
+                    errorShow = true
+                    return
+                }
+            }
+        }
+        successInfo = "lc.settings.cleanKeychainComplete".loc
+        successShow = true
     }
 
     func clearTemporaryFiles() async {

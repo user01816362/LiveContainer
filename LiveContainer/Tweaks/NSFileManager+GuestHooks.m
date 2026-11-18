@@ -4,7 +4,11 @@
 #import "Tweaks.h"
 #include "../../litehook/src/litehook.h"
 #include "../LCMachOUtils.h"
-#include <dlfcn.h>
+#import <dlfcn.h>
+#include <mach-o/getsect.h>
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 #pragma clang diagnostic ignored "-Wundeclared-selector"
 
@@ -12,6 +16,23 @@ BOOL isolateAppGroup = NO;
 BOOL strictTestMode = NO;
 static NSString *extensionParentContainerPath;
 void* webKitHeader = 0;
+static uintptr_t webKitTextStart = 0;
+static uintptr_t webKitTextEnd = 0;
+
+static void updateWebKitTextBounds(void) {
+    if (!webKitHeader) {
+        return;
+    }
+    unsigned long textSize = 0;
+    uint8_t *textPtr = getsegmentdata((const struct mach_header_64 *)webKitHeader, SEG_TEXT, &textSize);
+    if (textPtr && textSize > 0) {
+        webKitTextStart = (uintptr_t)textPtr;
+        webKitTextEnd = webKitTextStart + textSize;
+    } else {
+        webKitTextStart = (uintptr_t)webKitHeader;
+        webKitTextEnd = webKitTextStart + (128ULL << 20);
+    }
+}
 void NSFMGuestExtensionHooksInit(NSString *parentContainerPath) {
     extensionParentContainerPath = parentContainerPath;
     strictTestMode = [NSUserDefaults.guestContainerInfo[@"strictTestMode"] boolValue];
@@ -36,8 +57,11 @@ void NSFMGuestHooksInit(void) {
     if(!webKitHeader) {
         dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", RTLD_GLOBAL);
         webKitHeader = LCGetLoadedImageHeader(0, "/System/Library/Frameworks/WebKit.framework/WebKit");
-        saveCachedSymbol(@"webKitHeader", dscPtr, webKitHeader-dscPtr);
+        if (webKitHeader && dscPtr) {
+            saveCachedSymbol(@"webKitHeader", dscPtr, (uintptr_t)webKitHeader - (uintptr_t)dscPtr);
+        }
     }
+    updateWebKitTextBounds();
     
     swizzle(NSFileManager.class, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:), @selector(hook_createDirectoryAtPath:withIntermediateDirectories:attributes:error:));
     
@@ -67,8 +91,13 @@ void NSFMGuestHooksInit(void) {
 
 - (bool)hook_createDirectoryAtPath:(NSString *)path withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary<NSFileAttributeKey,id> *)attributes error:(NSError *__autoreleasing  _Nullable *)error {
     bool ans = [self hook_createDirectoryAtPath:path withIntermediateDirectories:createIntermediates attributes:attributes error:error];
-    void* callerAddr = __builtin_return_address(0);
-    if(webKitHeader && callerAddr > webKitHeader && callerAddr < (webKitHeader + (32 << 20) )) {
+    void *rawCaller = __builtin_return_address(0);
+#ifdef __PTRAUTH_INTRINSICS__
+    uintptr_t callerAddr = (uintptr_t)ptrauth_strip(rawCaller, ptrauth_key_return_address);
+#else
+    uintptr_t callerAddr = (uintptr_t)rawCaller;
+#endif
+    if (webKitHeader && webKitTextEnd > webKitTextStart && callerAddr >= webKitTextStart && callerAddr < webKitTextEnd) {
         if([path hasSuffix:@"Library/Cookies"]) {
             // symlink Cookies folder
             // https://github.com/apple-oss-distributions/WebKit/blob/0c8cf3581e5c01d970ea411128007c9325ba2d48/Source/WebKit/Shared/Cocoa/SandboxUtilities.mm#L56

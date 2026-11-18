@@ -26,12 +26,23 @@ NSString* accessGroup = nil;
 NSString* containerId = nil;
 
 OSStatus new_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
-    NSMutableDictionary *attributesCopy = ((__bridge NSDictionary *)attributes).mutableCopy;
-    attributesCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
-    // for keychain deletion in LCUI
-    attributesCopy[@"alis"] = containerId;
+    NSMutableDictionary *attributesCopy = attributes ? ((__bridge NSDictionary *)attributes).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        attributesCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
+    CFTypeRef secClass = attributes ? CFDictionaryGetValue(attributes, kSecClass) : NULL;
+    BOOL canAttachAlias = (secClass == NULL || CFEqual(secClass, kSecClassGenericPassword));
+    if (canAttachAlias && containerId.length > 0) {
+        // for keychain deletion in LCUI
+        attributesCopy[@"alis"] = containerId;
+    }
     
     OSStatus status = orig_SecItemAdd((__bridge CFDictionaryRef)attributesCopy, result);
+    if (status == errSecParam && attributesCopy[@"alis"] != nil) {
+        // Retry with access group isolation preserved before dropping isolation
+        [attributesCopy removeObjectForKey:@"alis"];
+        status = orig_SecItemAdd((__bridge CFDictionaryRef)attributesCopy, result);
+    }
     if(status == errSecParam) {
         return orig_SecItemAdd(attributes, result);
     }
@@ -40,8 +51,10 @@ OSStatus new_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
 }
 
 OSStatus new_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    NSMutableDictionary *queryCopy = ((__bridge NSDictionary *)query).mutableCopy;
-    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *queryCopy = query ? ((__bridge NSDictionary *)query).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
     OSStatus status = orig_SecItemCopyMatching((__bridge CFDictionaryRef)queryCopy, result);
     if(status == errSecParam) {
         // if this search don't support kSecAttrAccessGroup, we just use the original search
@@ -52,13 +65,13 @@ OSStatus new_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
 }
 
 OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
-    NSMutableDictionary *queryCopy = ((__bridge NSDictionary *)query).mutableCopy;
-    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
-    
-    NSMutableDictionary *attrCopy = ((__bridge NSDictionary *)attributesToUpdate).mutableCopy;
-    attrCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *queryCopy = query ? ((__bridge NSDictionary *)query).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
 
-    OSStatus status = orig_SecItemUpdate((__bridge CFDictionaryRef)queryCopy, (__bridge CFDictionaryRef)attrCopy);
+    // Do not inject kSecAttrAccessGroup into attributesToUpdate: queries scoped by accessGroup reject redundant group updates with errSecParam
+    OSStatus status = orig_SecItemUpdate((__bridge CFDictionaryRef)queryCopy, attributesToUpdate);
 
     if(status == errSecParam) {
         return orig_SecItemUpdate(query, attributesToUpdate);
@@ -68,8 +81,10 @@ OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUp
 }
 
 OSStatus new_SecItemDelete(CFDictionaryRef query){
-    NSMutableDictionary *queryCopy = ((__bridge NSDictionary *)query).mutableCopy;
-    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *queryCopy = query ? ((__bridge NSDictionary *)query).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
     OSStatus status = orig_SecItemDelete((__bridge CFDictionaryRef)queryCopy);
     if(status == errSecParam) {
         return orig_SecItemDelete(query);
@@ -79,8 +94,10 @@ OSStatus new_SecItemDelete(CFDictionaryRef query){
 }
 
 SecKeyRef new_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error) {
-    NSMutableDictionary *paramsCopy = ((__bridge NSDictionary *)parameters).mutableCopy;
-    paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *paramsCopy = parameters ? ((__bridge NSDictionary *)parameters).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
     SecKeyRef key = orig_SecKeyCreateRandomKey((__bridge CFDictionaryRef)paramsCopy, error);
     if(!key && error && *error) {
         CFRelease(*error);
@@ -92,8 +109,10 @@ SecKeyRef new_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *erro
 }
 
 SecKeyRef new_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef parameters, CFErrorRef *error) {
-    NSMutableDictionary *paramsCopy = ((__bridge NSDictionary *)parameters).mutableCopy;
-    paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *paramsCopy = parameters ? ((__bridge NSDictionary *)parameters).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
     SecKeyRef key = orig_SecKeyCreateWithData(keyData, (__bridge CFDictionaryRef)paramsCopy, error);
     if(!key && error && *error) {
         CFRelease(*error);
@@ -105,8 +124,10 @@ SecKeyRef new_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef parameters
 }
 
 OSStatus new_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey) {
-    NSMutableDictionary *queryCopy = ((__bridge NSDictionary *)parameters).mutableCopy;
-    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSMutableDictionary *queryCopy = parameters ? ((__bridge NSDictionary *)parameters).mutableCopy : [NSMutableDictionary dictionary];
+    if (accessGroup.length > 0) {
+        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
     OSStatus status = orig_SecKeyGeneratePair((__bridge CFDictionaryRef)queryCopy, publicKey, privateKey);
     if(status == errSecParam) {
         return orig_SecKeyGeneratePair(parameters, publicKey, privateKey);
@@ -122,6 +143,10 @@ void SecItemGuestHooksInit(void)  {
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
     int keychainGroupId = [infoDict[@"keychainGroupId"] intValue];
     NSString* groupId = [LCSharedUtils teamIdentifier];
+    if (groupId.length == 0) {
+        NSLog(@"[LC] missing team identifier, skipping SecItem hooks");
+        return;
+    }
     if(keychainGroupId == 0) {
         accessGroup = [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared", groupId];
     } else {

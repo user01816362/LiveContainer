@@ -196,9 +196,17 @@ enum LCTweakPackageInstaller {
     }
 }
 
-public struct LCAppInstallOutcome {
+public struct LCAppInstallOutcome: Sendable {
     let installedApp: LCAppModel?
     let warningMessage: String?
+}
+
+@MainActor
+private final class InstallProgressRelay {
+    let handler: (@MainActor (Double, String) -> Void)?
+    init(_ handler: (@MainActor (Double, String) -> Void)?) {
+        self.handler = handler
+    }
 }
 
 @MainActor
@@ -253,11 +261,12 @@ final class LCAppInstaller {
         let decompressProgress = Progress.discreteProgress(totalUnitCount: 100)
         installProgress.addChild(decompressProgress, withPendingUnitCount: 75)
 
+        let relay = InstallProgressRelay(progressHandler)
         let observer = installProgress.observe(\.fractionCompleted) { p, _ in
             let fraction = p.fractionCompleted
             Task { @MainActor in
                 let label = fraction < 0.75 ? "Unpacking…" : "Signing…"
-                progressHandler?(fraction, label)
+                relay.handler?(fraction, label)
             }
         }
         defer { observer.invalidate() }
@@ -378,17 +387,11 @@ final class LCAppInstaller {
         stagedAppInfo.save()
 
         progressHandler?(0.78, "Signing…")
-        var signError: String? = nil
-        var signSuccess = false
-        await withUnsafeContinuation { (continuation: UnsafeContinuation<Void, Never>) in
+        let (signSuccess, signError) = await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, String?), Never>) in
             stagedAppInfo.patchExecAndSignIfNeed(completionHandler: { success, error in
-                signError = error
-                signSuccess = success
-                continuation.resume()
+                continuation.resume(returning: (success, error))
             }, progressHandler: { signProgress in
-                if let signProgress {
-                    installProgress.addChild(signProgress, withPendingUnitCount: 25)
-                }
+                installProgress.addChild(signProgress, withPendingUnitCount: 25)
             }, forceSign: false)
         }
 
@@ -408,6 +411,21 @@ final class LCAppInstaller {
         let destinationURL = baseFolder.appendingPathComponent(appRelativePath, isDirectory: true)
 
         if isReplace, fm.fileExists(atPath: destinationURL.path) {
+            let existingUserDataURL = destinationURL.appendingPathComponent("LCUserData", isDirectory: true)
+            if fm.fileExists(atPath: existingUserDataURL.path) {
+                let stagedUserDataURL = stagedBundleURL.appendingPathComponent("LCUserData", isDirectory: true)
+                if !fm.fileExists(atPath: stagedUserDataURL.path) {
+                    try fm.copyItem(at: existingUserDataURL, to: stagedUserDataURL)
+                } else {
+                    let existingItems = (try? fm.contentsOfDirectory(at: existingUserDataURL, includingPropertiesForKeys: nil)) ?? []
+                    for item in existingItems {
+                        let target = stagedUserDataURL.appendingPathComponent(item.lastPathComponent)
+                        if !fm.fileExists(atPath: target.path) {
+                            try? fm.copyItem(at: item, to: target)
+                        }
+                    }
+                }
+            }
             _ = try fm.replaceItemAt(destinationURL, withItemAt: stagedBundleURL, backupItemName: nil, options: [.usingNewMetadataOnly])
         } else {
             if fm.fileExists(atPath: destinationURL.path) {
@@ -490,7 +508,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
 
     private let lock = NSLock()
     private var backgroundSession: URLSession!
-    private var bgCompletionHandler: (() -> Void)?
+    @MainActor private var bgCompletionHandler: (() -> Void)?
     private var taskIdToItemId: [Int: UUID] = [:]
     private var resumeDataByItemId: [UUID: Data] = [:]
     private var lastProgressPublish: [UUID: CFAbsoluteTime] = [:]
@@ -545,14 +563,13 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         }
     }
 
+    @MainActor
     public func handleEventsForBackgroundSession(identifier: String, completionHandler: @escaping () -> Void) {
         guard identifier == Self.sessionIdentifier else {
             completionHandler()
             return
         }
-        lock.withLock {
-            bgCompletionHandler = completionHandler
-        }
+        bgCompletionHandler = completionHandler
     }
 
     @MainActor
@@ -731,16 +748,16 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
 
         backgroundSession.getAllTasks { [weak self] activeTasks in
             guard let self else { return }
-            let taskById = Dictionary(uniqueKeysWithValues: activeTasks.map { ($0.taskIdentifier, $0) })
+            let taskStatesById = Dictionary(uniqueKeysWithValues: activeTasks.map { ($0.taskIdentifier, $0.state) })
             Task { @MainActor in
                 for index in self.items.indices {
-                    if let tid = self.items[index].taskIdentifier, let runningTask = taskById[tid] {
+                    if let tid = self.items[index].taskIdentifier, let runningState = taskStatesById[tid] {
                         self.lock.withLock {
                             self.taskIdToItemId[tid] = self.items[index].id
                         }
-                        if runningTask.state == .running {
+                        if runningState == .running {
                             self.items[index].state = .downloading
-                        } else if runningTask.state == .suspended {
+                        } else if runningState == .suspended {
                             self.items[index].state = .paused
                         }
                     } else if case .downloading = self.items[index].state {
@@ -864,15 +881,10 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
     }
 
     nonisolated public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        let handler = lock.withLock { () -> (() -> Void)? in
-            let current = bgCompletionHandler
-            bgCompletionHandler = nil
-            return current
-        }
-        if let handler {
-            DispatchQueue.main.async {
-                handler()
-            }
+        Task { @MainActor in
+            let handler = self.bgCompletionHandler
+            self.bgCompletionHandler = nil
+            handler?()
         }
     }
 

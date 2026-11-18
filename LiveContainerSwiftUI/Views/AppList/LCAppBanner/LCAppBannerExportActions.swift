@@ -23,32 +23,48 @@ extension LCAppBannerViewController {
     }
 
     private func createClonedAppModel() async throws -> LCAppModel {
-        let fm = FileManager.default
         let appInfo = configuration.model.appInfo
         guard let sourceBundlePath = appInfo.bundlePath() else {
             throw "Unable to read app bundle path."
         }
 
+        let isShared = configuration.model.uiIsShared
         let sourceBundleURL = URL(fileURLWithPath: sourceBundlePath, isDirectory: true)
-        let targetRootURL = configuration.model.uiIsShared ? LCPath.lcGroupBundlePath : LCPath.bundlePath
-        try fm.createDirectory(at: targetRootURL, withIntermediateDirectories: true)
+        let targetRootURL = isShared ? LCPath.lcGroupBundlePath : LCPath.bundlePath
+        let stemSource = (appInfo.bundleIdentifier() ?? appInfo.displayName() ?? "ClonedApp").sanitizeNonACSII()
 
-        let cloneRelativeBundlePath = makeCloneRelativeBundlePath(targetRootURL: targetRootURL, fileManager: fm)
-        let destinationBundleURL = targetRootURL.appendingPathComponent(cloneRelativeBundlePath, isDirectory: true)
+        let (cloneRelativeBundlePath, destinationBundleURL) = try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            try fm.createDirectory(at: targetRootURL, withIntermediateDirectories: true)
+
+            let cloneRelativeBundlePath = Self.makeCloneRelativeBundlePath(
+                stemSource: stemSource,
+                targetRootURL: targetRootURL,
+                fileManager: fm
+            )
+            let destinationBundleURL = targetRootURL.appendingPathComponent(cloneRelativeBundlePath, isDirectory: true)
+
+            do {
+                try fm.copyItem(at: sourceBundleURL, to: destinationBundleURL)
+            } catch {
+                throw "Failed to copy app bundle: \(error.localizedDescription)"
+            }
+
+            do {
+                try Self.resetClonedAppInfo(at: destinationBundleURL, fileManager: fm)
+            } catch {
+                try? fm.removeItem(at: destinationBundleURL)
+                throw error
+            }
+            return (cloneRelativeBundlePath, destinationBundleURL)
+        }.value
 
         do {
-            try fm.copyItem(at: sourceBundleURL, to: destinationBundleURL)
-        } catch {
-            throw "Failed to copy app bundle: \(error.localizedDescription)"
-        }
-
-        do {
-            try resetClonedAppInfo(at: destinationBundleURL, fileManager: fm)
             guard let clonedAppInfo = LCAppInfo(bundlePath: destinationBundleURL.path) else {
                 throw "Failed to initialize cloned app."
             }
             clonedAppInfo.relativeBundlePath = cloneRelativeBundlePath
-            clonedAppInfo.isShared = configuration.model.uiIsShared
+            clonedAppInfo.isShared = isShared
             clonedAppInfo.spoofSDKVersion = true
             clonedAppInfo.installationDate = Date.now
             try await signClonedAppIfNeeded(clonedAppInfo)
@@ -58,7 +74,7 @@ extension LCAppBannerViewController {
                 let initialContainer = LCContainer.makeNewContainer(
                     folderName: folderName,
                     name: folderName,
-                    isShared: configuration.model.uiIsShared
+                    isShared: isShared
                 )
                 initialContainer.makeLCContainerInfoPlist(
                     appIdentifier: bundleId,
@@ -70,15 +86,13 @@ extension LCAppBannerViewController {
             }
             return LCAppModel(appInfo: clonedAppInfo, delegate: configuration.model.delegate)
         } catch {
-            try? fm.removeItem(at: destinationBundleURL)
+            try? FileManager.default.removeItem(at: destinationBundleURL)
             throw error
         }
     }
 
-    private func makeCloneRelativeBundlePath(targetRootURL: URL, fileManager: FileManager) -> String {
-        let appInfo = configuration.model.appInfo
-        let bundleIdStem = (appInfo.bundleIdentifier() ?? appInfo.displayName() ?? "ClonedApp").sanitizeNonACSII()
-        let stem = bundleIdStem.isEmpty ? "ClonedApp" : bundleIdStem
+    nonisolated private static func makeCloneRelativeBundlePath(stemSource: String, targetRootURL: URL, fileManager: FileManager) -> String {
+        let stem = stemSource.isEmpty ? "ClonedApp" : stemSource
         let timestamp = Int(Date().timeIntervalSince1970)
 
         var candidate = "\(stem)_\(timestamp).app"
@@ -90,7 +104,7 @@ extension LCAppBannerViewController {
         return candidate
     }
 
-    private func resetClonedAppInfo(at clonedBundleURL: URL, fileManager: FileManager) throws {
+    nonisolated private static func resetClonedAppInfo(at clonedBundleURL: URL, fileManager: FileManager) throws {
         let lcAppInfoPath = clonedBundleURL.appendingPathComponent("LCAppInfo.plist")
         if fileManager.fileExists(atPath: lcAppInfoPath.path) {
             try fileManager.removeItem(at: lcAppInfoPath)
@@ -105,13 +119,9 @@ extension LCAppBannerViewController {
     }
 
     private func signClonedAppIfNeeded(_ clonedAppInfo: LCAppInfo) async throws {
-        var signError: String?
-        var signSuccess = false
-        await withCheckedContinuation { continuation in
+        let (signSuccess, signError) = await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, String?), Never>) in
             clonedAppInfo.patchExecAndSignIfNeed(completionHandler: { success, error in
-                signSuccess = success
-                signError = error
-                continuation.resume()
+                continuation.resume(returning: (success, error))
             }, progressHandler: { _ in
             }, forceSign: false)
         }
@@ -240,7 +250,9 @@ extension LCAppBannerViewController {
 
     private func copySelectedToTweaks(selectedItems: [AppBinaryExportItem], destinationFolderURL: URL) async {
         do {
-            let copiedCount = try copySelectedBinaryItems(selectedItems: selectedItems, to: destinationFolderURL)
+            let copiedCount = try await Task.detached(priority: .userInitiated) {
+                try Self.copySelectedBinaryItems(selectedItems: selectedItems, to: destinationFolderURL)
+            }.value
             await MainActor.run {
                 dismiss(animated: true) {
                     self.showExportSuccess("Copied \(copiedCount) item(s) to \(destinationFolderURL.lastPathComponent).")
@@ -253,7 +265,7 @@ extension LCAppBannerViewController {
         }
     }
 
-    private func copySelectedBinaryItems(selectedItems: [AppBinaryExportItem], to destinationFolderURL: URL) throws -> Int {
+    nonisolated private static func copySelectedBinaryItems(selectedItems: [AppBinaryExportItem], to destinationFolderURL: URL) throws -> Int {
         let fm = FileManager.default
         try fm.createDirectory(at: destinationFolderURL, withIntermediateDirectories: true)
 
@@ -267,7 +279,7 @@ extension LCAppBannerViewController {
         return copiedCount
     }
 
-    private func nextAvailableCopyURL(for proposedURL: URL) -> URL {
+    nonisolated private static func nextAvailableCopyURL(for proposedURL: URL) -> URL {
         let fm = FileManager.default
         if !fm.fileExists(atPath: proposedURL.path) {
             return proposedURL
@@ -296,47 +308,54 @@ extension LCAppBannerViewController {
             throw "Unable to read app bundle path."
         }
 
-        let fm = FileManager.default
-        let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCAppExport-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: stagingRoot) }
-
-        try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-        let payloadDir = stagingRoot.appendingPathComponent("Payload", isDirectory: true)
-        try fm.createDirectory(at: payloadDir, withIntermediateDirectories: true)
-
-        let sourceAppURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
-        let destinationAppURL = payloadDir.appendingPathComponent(sourceAppURL.lastPathComponent, isDirectory: true)
-        try fm.copyItem(at: sourceAppURL, to: destinationAppURL)
-
+        var containerDataURL: URL? = nil
+        var containerHasBookmark = false
         if includeData {
             guard let container = configuration.model.uiSelectedContainer else {
                 throw "Select a container before exporting app data."
             }
-            let dataURL = container.containerURL
-            let needsSecurityAccess = container.storageBookMark != nil
-            if needsSecurityAccess && !dataURL.startAccessingSecurityScopedResource() {
-                throw "Unable to access selected external container."
-            }
-            defer {
-                if needsSecurityAccess {
-                    dataURL.stopAccessingSecurityScopedResource()
-                }
-            }
-            guard fm.fileExists(atPath: dataURL.path) else {
-                throw "Selected container data does not exist."
-            }
-            try copyContainerDataForExport(
-                from: dataURL,
-                to: destinationAppURL.appendingPathComponent("LCUserData", isDirectory: true)
-            )
+            containerDataURL = container.containerURL
+            containerHasBookmark = (container.storageBookMark != nil)
         }
+        let appName = Self.sanitizedFileStem(appInfo.displayName() ?? "App")
 
-        let appName = sanitizedFileStem(appInfo.displayName() ?? "App")
-        let fileName = includeData ? "\(appName)-with-data.ipa" : "\(appName).ipa"
-        let exportURL = try lcExportArtifactFileURL(fileName: fileName, fileManager: fm)
-        try? fm.removeItem(at: exportURL)
-        try await zipDirectory(sourceURL: stagingRoot, destinationURL: exportURL)
-        return exportURL
+        return try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCAppExport-\(UUID().uuidString)", isDirectory: true)
+            defer { try? fm.removeItem(at: stagingRoot) }
+
+            try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+            let payloadDir = stagingRoot.appendingPathComponent("Payload", isDirectory: true)
+            try fm.createDirectory(at: payloadDir, withIntermediateDirectories: true)
+
+            let sourceAppURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
+            let destinationAppURL = payloadDir.appendingPathComponent(sourceAppURL.lastPathComponent, isDirectory: true)
+            try fm.copyItem(at: sourceAppURL, to: destinationAppURL)
+
+            if let dataURL = containerDataURL {
+                if containerHasBookmark && !dataURL.startAccessingSecurityScopedResource() {
+                    throw "Unable to access selected external container."
+                }
+                defer {
+                    if containerHasBookmark {
+                        dataURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+                guard fm.fileExists(atPath: dataURL.path) else {
+                    throw "Selected container data does not exist."
+                }
+                try Self.copyContainerDataForExport(
+                    from: dataURL,
+                    to: destinationAppURL.appendingPathComponent("LCUserData", isDirectory: true)
+                )
+            }
+
+            let fileName = includeData ? "\(appName)-with-data.ipa" : "\(appName).ipa"
+            let exportURL = try lcExportArtifactFileURL(fileName: fileName, fileManager: fm)
+            try? fm.removeItem(at: exportURL)
+            try Self.zipDirectorySync(sourceURL: stagingRoot, destinationURL: exportURL)
+            return exportURL
+        }.value
     }
 
     private func createDataArchive() async throws -> URL {
@@ -346,34 +365,37 @@ extension LCAppBannerViewController {
 
         let containerURL = container.containerURL
         let needsSecurityAccess = container.storageBookMark != nil
-        if needsSecurityAccess && !containerURL.startAccessingSecurityScopedResource() {
-            throw "Unable to access selected external container."
-        }
-        defer {
-            if needsSecurityAccess {
-                containerURL.stopAccessingSecurityScopedResource()
+        let appName = Self.sanitizedFileStem(configuration.model.appInfo.displayName() ?? "App")
+        let containerName = Self.sanitizedFileStem(container.name)
+
+        return try await Task.detached(priority: .userInitiated) {
+            if needsSecurityAccess && !containerURL.startAccessingSecurityScopedResource() {
+                throw "Unable to access selected external container."
             }
-        }
+            defer {
+                if needsSecurityAccess {
+                    containerURL.stopAccessingSecurityScopedResource()
+                }
+            }
 
-        let fm = FileManager.default
-        var sourceIsDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: containerURL.path, isDirectory: &sourceIsDirectory), sourceIsDirectory.boolValue else {
-            throw "Selected container path is not a directory."
-        }
+            let fm = FileManager.default
+            var sourceIsDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: containerURL.path, isDirectory: &sourceIsDirectory), sourceIsDirectory.boolValue else {
+                throw "Selected container path is not a directory."
+            }
 
-        let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCDataExport-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: stagingRoot) }
-        try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+            let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCDataExport-\(UUID().uuidString)", isDirectory: true)
+            defer { try? fm.removeItem(at: stagingRoot) }
+            try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
 
-        let appName = sanitizedFileStem(configuration.model.appInfo.displayName() ?? "App")
-        let containerName = sanitizedFileStem(container.name)
-        let stagedContainerURL = stagingRoot.appendingPathComponent("\(appName)-\(containerName)-data", isDirectory: true)
-        try copyContainerDataForExport(from: containerURL, to: stagedContainerURL)
+            let stagedContainerURL = stagingRoot.appendingPathComponent("\(appName)-\(containerName)-data", isDirectory: true)
+            try Self.copyContainerDataForExport(from: containerURL, to: stagedContainerURL)
 
-        let exportURL = try lcExportArtifactFileURL(fileName: "\(appName)-\(containerName)-data.zip", fileManager: fm)
-        try? fm.removeItem(at: exportURL)
-        try await zipDirectory(sourceURL: stagedContainerURL, destinationURL: exportURL)
-        return exportURL
+            let exportURL = try lcExportArtifactFileURL(fileName: "\(appName)-\(containerName)-data.zip", fileManager: fm)
+            try? fm.removeItem(at: exportURL)
+            try Self.zipDirectorySync(sourceURL: stagedContainerURL, destinationURL: exportURL)
+            return exportURL
+        }.value
     }
 
     private func createSelectedBinaryArchive(selectedItems: [AppBinaryExportItem]) async throws -> URL {
@@ -381,59 +403,52 @@ extension LCAppBannerViewController {
         guard appInfo.bundlePath() != nil else {
             throw "Unable to read app bundle path."
         }
+        let appName = Self.sanitizedFileStem(appInfo.displayName() ?? "App")
 
-        let fm = FileManager.default
-        let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCBinaryExport-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: stagingRoot) }
+        return try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCBinaryExport-\(UUID().uuidString)", isDirectory: true)
+            defer { try? fm.removeItem(at: stagingRoot) }
 
-        let appName = sanitizedFileStem(appInfo.displayName() ?? "App")
-        let contentRoot = stagingRoot.appendingPathComponent("\(appName)-dylibs-frameworks", isDirectory: true)
-        try fm.createDirectory(at: contentRoot, withIntermediateDirectories: true)
+            let contentRoot = stagingRoot.appendingPathComponent("\(appName)-dylibs-frameworks", isDirectory: true)
+            try fm.createDirectory(at: contentRoot, withIntermediateDirectories: true)
 
-        for item in selectedItems {
-            let destinationURL = contentRoot.appendingPathComponent(item.relativePath, isDirectory: item.kind == .framework)
-            try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? fm.removeItem(at: destinationURL)
-            try fm.copyItem(at: item.url, to: destinationURL)
-        }
+            for item in selectedItems {
+                let destinationURL = contentRoot.appendingPathComponent(item.relativePath, isDirectory: item.kind == .framework)
+                try fm.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fm.removeItem(at: destinationURL)
+                try fm.copyItem(at: item.url, to: destinationURL)
+            }
 
-        let archiveURL = try lcExportArtifactFileURL(fileName: "\(appName)-dylibs-frameworks.zip", fileManager: fm)
-        try? fm.removeItem(at: archiveURL)
-        try await zipDirectory(sourceURL: contentRoot, destinationURL: archiveURL)
-        return archiveURL
+            let archiveURL = try lcExportArtifactFileURL(fileName: "\(appName)-dylibs-frameworks.zip", fileManager: fm)
+            try? fm.removeItem(at: archiveURL)
+            try Self.zipDirectorySync(sourceURL: contentRoot, destinationURL: archiveURL)
+            return archiveURL
+        }.value
     }
 
-    private func zipDirectory(sourceURL: URL, destinationURL: URL) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let coordinator = NSFileCoordinator()
-                var coordinationError: NSError?
-                var didResume = false
+    nonisolated private static func zipDirectorySync(sourceURL: URL, destinationURL: URL) throws {
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var copyError: Error?
 
-                coordinator.coordinate(readingItemAt: sourceURL, options: [.forUploading], error: &coordinationError) { zippedURL in
-                    do {
-                        if FileManager.default.fileExists(atPath: destinationURL.path) {
-                            try FileManager.default.removeItem(at: destinationURL)
-                        }
-                        try FileManager.default.copyItem(at: zippedURL, to: destinationURL)
-                        if !didResume {
-                            didResume = true
-                            continuation.resume()
-                        }
-                    } catch {
-                        if !didResume {
-                            didResume = true
-                            continuation.resume(throwing: error)
-                        }
-                    }
+        coordinator.coordinate(readingItemAt: sourceURL, options: [.forUploading], error: &coordinationError) { zippedURL in
+            do {
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.removeItem(at: destinationURL)
                 }
-
-                if let coordinationError, !didResume {
-                    didResume = true
-                    continuation.resume(throwing: coordinationError)
-                }
+                try FileManager.default.copyItem(at: zippedURL, to: destinationURL)
+            } catch {
+                copyError = error
             }
-        }.value
+        }
+
+        if let copyError {
+            throw copyError
+        }
+        if let coordinationError {
+            throw coordinationError
+        }
     }
 
     @MainActor
@@ -444,13 +459,13 @@ extension LCAppBannerViewController {
             popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
             popover.permittedArrowDirections = []
         }
-        activityController.completionWithItemsHandler = { [weak self] _, _, _, _ in
-            self?.cleanupExportArtifacts()
+        activityController.completionWithItemsHandler = { _, _, _, _ in
+            Self.cleanupExportArtifacts()
         }
         present(activityController, animated: true)
     }
 
-    private func cleanupExportArtifacts() {
+    nonisolated private static func cleanupExportArtifacts() {
         try? FileManager.default.removeItem(at: lcExportArtifactDirectoryURL())
     }
 
@@ -464,7 +479,7 @@ extension LCAppBannerViewController {
         present(alert, animated: true)
     }
 
-    private func sanitizedFileStem(_ value: String) -> String {
+    nonisolated private static func sanitizedFileStem(_ value: String) -> String {
         let invalidCharacters = CharacterSet(charactersIn: "/\\:?%*|\"<>")
         let cleaned = value
             .components(separatedBy: invalidCharacters)
@@ -473,7 +488,7 @@ extension LCAppBannerViewController {
         return cleaned.isEmpty ? "Export" : cleaned
     }
 
-    private func copyContainerDataForExport(from sourceContainerURL: URL, to destinationContainerURL: URL) throws {
+    nonisolated private static func copyContainerDataForExport(from sourceContainerURL: URL, to destinationContainerURL: URL) throws {
         let fm = FileManager.default
         var sourceIsDirectory: ObjCBool = false
         guard fm.fileExists(atPath: sourceContainerURL.path, isDirectory: &sourceIsDirectory), sourceIsDirectory.boolValue else {
@@ -482,7 +497,7 @@ extension LCAppBannerViewController {
         try copyDirectoryForExport(from: sourceContainerURL, to: destinationContainerURL)
     }
 
-    private func copyDirectoryForExport(from sourceDirectoryURL: URL, to destinationDirectoryURL: URL) throws {
+    nonisolated private static func copyDirectoryForExport(from sourceDirectoryURL: URL, to destinationDirectoryURL: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: destinationDirectoryURL, withIntermediateDirectories: true)
 
@@ -515,7 +530,7 @@ extension LCAppBannerViewController {
         }
     }
 
-    private func shouldSkipDataExportItem(values: URLResourceValues) -> Bool {
+    nonisolated private static func shouldSkipDataExportItem(values: URLResourceValues) -> Bool {
         if values.isSymbolicLink == true {
             return true
         }
@@ -530,7 +545,7 @@ extension LCAppBannerViewController {
         return false
     }
 
-    private func shouldIgnoreDataExportCopyError(_ error: Error, resourceValues: URLResourceValues) -> Bool {
+    nonisolated private static func shouldIgnoreDataExportCopyError(_ error: Error, resourceValues: URLResourceValues) -> Bool {
         if shouldSkipDataExportItem(values: resourceValues) {
             return true
         }
@@ -558,7 +573,7 @@ extension LCAppBannerViewController {
         return false
     }
 
-    private func isNoSuchFileError(_ nsError: NSError) -> Bool {
+    nonisolated private static func isNoSuchFileError(_ nsError: NSError) -> Bool {
         if nsError.domain == NSCocoaErrorDomain {
             return nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError
         }

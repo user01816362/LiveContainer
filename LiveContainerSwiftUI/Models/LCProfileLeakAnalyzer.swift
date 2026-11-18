@@ -12,7 +12,7 @@ import SwiftUI
 import UIKit
 
 /// Surface vector through which real host identity or device contradictions can leak.
-enum LCLeakVector: String, CaseIterable, Identifiable {
+enum LCLeakVector: String, CaseIterable, Identifiable, Sendable {
     case network = "Network & HTTP"
     case webkit = "WebKit & Browser JS"
     case hardware = "In-App Hardware & Kernel"
@@ -29,7 +29,7 @@ enum LCLeakVector: String, CaseIterable, Identifiable {
 }
 
 /// Severity of an identified leak risk or fingerprint contradiction.
-enum LCLeakSeverity: Int, Comparable {
+enum LCLeakSeverity: Int, Comparable, Sendable {
     case info = 0
     case warning = 1
     case critical = 2
@@ -56,7 +56,7 @@ enum LCLeakSeverity: Int, Comparable {
 }
 
 /// Single diagnostic finding produced by ``LCProfileLeakAnalyzer``.
-struct LCProfileLeakFinding: Identifiable, Hashable {
+struct LCProfileLeakFinding: Identifiable, Hashable, Sendable {
     let id = UUID()
     let vector: LCLeakVector
     let severity: LCLeakSeverity
@@ -66,8 +66,8 @@ struct LCProfileLeakFinding: Identifiable, Hashable {
 }
 
 /// Overall protection summary across all three leak vectors.
-struct LCProfileAuditReport {
-    enum OverallStatus {
+struct LCProfileAuditReport: Sendable {
+    enum OverallStatus: Sendable {
         case disabled
         case bypassExposed
         case leaksDetected
@@ -126,9 +126,10 @@ struct LCProfileAuditReport {
 /// Analyzes ``LCContainer`` profiles for host-identity leakage, cross-API
 /// contradictions, and app-breaking feature overrides across Network, WebKit,
 /// and native hardware layers.
+@MainActor
 enum LCProfileLeakAnalyzer {
     /// Captures the unspoofed `uname().machine` identifier of the running host device.
-    static func currentHostMachine() -> String {
+    nonisolated static func currentHostMachine() -> String {
         var uts = utsname()
         guard uname(&uts) == 0 else { return "" }
         let machine = uts.machine
@@ -326,6 +327,28 @@ enum LCProfileLeakAnalyzer {
                 detail: "Canvas WebGL/WebGL2 queries can fingerprint the real physical Apple GPU if 'web.webGL' is OFF.",
                 isAutoFixable: true
             ))
+        }
+        if !container.isSpoofFeatureEnabled("web.canvas") {
+            findings.append(LCProfileLeakFinding(
+                vector: .webkit,
+                severity: .warning,
+                title: "Canvas & Audio Farbling Off",
+                detail: "2D Canvas, OffscreenCanvas, WebGL readPixels, and AudioBuffer outputs reveal subtle GPU/DSP rasterization signatures if 'web.canvas' is OFF.",
+                isAutoFixable: true
+            ))
+        } else {
+            let trimmedSeed = container.spoofWebCanvasSeed.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stripped = trimmedSeed.lowercased().hasPrefix("0x") ? String(trimmedSeed.dropFirst(2)) : trimmedSeed
+            let parsedSeed = UInt32(stripped, radix: trimmedSeed.lowercased().hasPrefix("0x") ? 16 : 10) ?? 0
+            if parsedSeed == 0 {
+                findings.append(LCProfileLeakFinding(
+                    vector: .webkit,
+                    severity: .warning,
+                    title: "Zero Canvas Farbling Seed",
+                    detail: "Canvas farbling falls back to a derived IDFV hash when seed is empty or zero; set a non-zero hex seed like 0xA53F91C2.",
+                    isAutoFixable: true
+                ))
+            }
         }
         if !container.isSpoofFeatureEnabled("web.timeZone") && container.spoofLocaleCategoryEnabled && !container.spoofTimeZoneIdentifier.isEmpty {
             findings.append(LCProfileLeakFinding(
@@ -530,11 +553,18 @@ enum LCProfileLeakAnalyzer {
         overrides["web.navigator"] = true
         overrides["web.screen"] = true
         overrides["web.webGL"] = true
+        overrides["web.canvas"] = true
         overrides["web.timeZone"] = true
         overrides["network.pathMonitor"] = false
         overrides["graphics.allFamilies"] = false
         container.spoofFeatureOverrides = overrides
         container.spoofGraphicsSupportsAllFamilies = false
+        let trimmedSeed = container.spoofWebCanvasSeed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = trimmedSeed.lowercased().hasPrefix("0x") ? String(trimmedSeed.dropFirst(2)) : trimmedSeed
+        let parsedSeed = UInt32(stripped, radix: trimmedSeed.lowercased().hasPrefix("0x") ? 16 : 10) ?? 0
+        if parsedSeed == 0 {
+            container.spoofWebCanvasSeed = String(format: "0x%08X", UInt32.random(in: 1...UInt32.max))
+        }
 
         let hostMachine = currentHostMachine()
         let hostIDFV = UIDevice.current.identifierForVendor?.uuidString ?? ""

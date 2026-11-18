@@ -19,6 +19,7 @@ struct LCTabView: View {
     @ObservedObject var sourcesViewModel = AltStoreSourcesViewModel.shared
     @State var shouldToggleMainWindowOpen = false
     @Environment(\.scenePhase) var scenePhase
+    @Environment(\.openWindow) private var openWindow
 
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
 
@@ -103,7 +104,11 @@ struct LCTabView: View {
                 .navigationBarTitleDisplayMode(.inline)
             }
         }
+        .onAppear {
+            MultitaskWindowManager.openWindowAction = openWindow
+        }
         .task {
+            MultitaskWindowManager.openWindowAction = openWindow
             closeDuplicatedWindow()
             checkLastLaunchError()
             checkTeamId()

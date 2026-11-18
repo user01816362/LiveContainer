@@ -8,7 +8,7 @@
 import Foundation
 
 /// Runtime interception telemetry recorded inside a container by `TweakLoader` hooks.
-struct LCProfileRuntimeTelemetry: Equatable {
+struct LCProfileRuntimeTelemetry: Equatable, Sendable {
     let spoofProfileEnabled: Bool
     let blockDeviceInfoReads: Bool
     let realHostMachine: String
@@ -27,6 +27,7 @@ struct LCProfileRuntimeTelemetry: Equatable {
 
 /// Persistent per-container isolation and device-fingerprint spoof configuration
 /// serialized to `LCContainerInfo.plist`.
+@MainActor
 class LCContainer : ObservableObject, Hashable {
     @Published var folderName : String
     @Published var name : String
@@ -35,7 +36,6 @@ class LCContainer : ObservableObject, Hashable {
     @Published var storageBookMark: Data?
     @Published var resolvedContainerURL: URL?
     @Published var bookmarkResolved = false
-    var bookmarkResolveContinuation: UnsafeContinuation<(), Never>? = nil
     
     @Published var isolateAppGroup : Bool
 
@@ -130,7 +130,7 @@ class LCContainer : ObservableObject, Hashable {
     @Published var spoofCustomUserAgent: String
     @Published var spoofWebGLVendor: String
     @Published var spoofWebGLRenderer: String
-    @Published var spoofWebCanvasDataURL: String
+    @Published var spoofWebCanvasSeed: String
     @Published var spoofWebColorDepth: Int
     @Published var spoofFeatureOverrides: [String: Bool]
     private var infoDict : [String:Any]?
@@ -261,7 +261,7 @@ class LCContainer : ObservableObject, Hashable {
         spoofCustomUserAgent: String = "",
         spoofWebGLVendor: String = "Apple Inc.",
         spoofWebGLRenderer: String = "Apple GPU",
-        spoofWebCanvasDataURL: String = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        spoofWebCanvasSeed: String = "0xA53F91C2",
         spoofWebColorDepth: Int = 24,
         spoofFeatureOverrides: [String: Bool] = [:],
         bookmarkData: Data? = nil,
@@ -355,7 +355,7 @@ class LCContainer : ObservableObject, Hashable {
         self.spoofCustomUserAgent = spoofCustomUserAgent
         self.spoofWebGLVendor = spoofWebGLVendor
         self.spoofWebGLRenderer = spoofWebGLRenderer
-        self.spoofWebCanvasDataURL = spoofWebCanvasDataURL
+        self.spoofWebCanvasSeed = spoofWebCanvasSeed
         self.spoofWebColorDepth = spoofWebColorDepth
         self.spoofFeatureOverrides = spoofFeatureOverrides
         self.storageBookMark = bookmarkData
@@ -613,7 +613,7 @@ class LCContainer : ObservableObject, Hashable {
         infoDict!["spoofCustomUserAgent"] = spoofCustomUserAgent
         infoDict!["spoofWebGLVendor"] = spoofWebGLVendor
         infoDict!["spoofWebGLRenderer"] = spoofWebGLRenderer
-        infoDict!["spoofWebCanvasDataURL"] = spoofWebCanvasDataURL
+        infoDict!["spoofWebCanvasSeed"] = spoofWebCanvasSeed
         infoDict!["spoofWebColorDepth"] = spoofWebColorDepth
         infoDict!["spoofFeatureOverrides"] = spoofFeatureOverrides
         infoDict!["spoofUserInterfaceStyle"] = spoofUserInterfaceStyle
@@ -721,8 +721,13 @@ class LCContainer : ObservableObject, Hashable {
         spoofCustomUserAgent = dictionary["spoofCustomUserAgent"] as? String ?? ""
         spoofWebGLVendor = dictionary["spoofWebGLVendor"] as? String ?? "Apple Inc."
         spoofWebGLRenderer = dictionary["spoofWebGLRenderer"] as? String ?? "Apple GPU"
-        spoofWebCanvasDataURL = dictionary["spoofWebCanvasDataURL"] as? String
-            ?? "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        if let seedStr = dictionary["spoofWebCanvasSeed"] as? String, !seedStr.isEmpty {
+            spoofWebCanvasSeed = seedStr
+        } else if let seedNum = dictionary["spoofWebCanvasSeed"] as? NSNumber {
+            spoofWebCanvasSeed = String(format: "0x%08X", seedNum.uint32Value)
+        } else {
+            spoofWebCanvasSeed = LCContainer.defaultCanvasSeed(for: folderName)
+        }
         spoofWebColorDepth = dictionary["spoofWebColorDepth"] as? Int ?? 24
         spoofFeatureOverrides = dictionary["spoofFeatureOverrides"] as? [String: Bool] ?? [:]
         spoofUserInterfaceStyle = dictionary["spoofUserInterfaceStyle"] as? Int ?? 0
@@ -776,15 +781,26 @@ class LCContainer : ObservableObject, Hashable {
         if spoofScreenBrightness >= 0 { dictionary["spoofScreenBrightness"] = spoofScreenBrightness }
     }
     
-    static func == (lhs: LCContainer, rhs: LCContainer) -> Bool {
+    nonisolated static func defaultCanvasSeed(for key: String) -> String {
+        var hash: UInt32 = 2166136261
+        for byte in key.utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        if hash == 0 { hash = 0xA53F91C2 }
+        return String(format: "0x%08X", hash)
+    }
+
+    nonisolated static func == (lhs: LCContainer, rhs: LCContainer) -> Bool {
         return lhs === rhs
     }
     
-    func hash(into hasher: inout Hasher) {
+    nonisolated func hash(into hasher: inout Hasher) {
         hasher.combine(ObjectIdentifier(self))
     }
 }
 
+@MainActor
 extension LCAppInfo {
     var containers : [LCContainer] {
         get {

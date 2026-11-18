@@ -8,8 +8,9 @@
 import Foundation
 import AppIntents
 import OSLog
+import os
 
-enum SideStoreIntentError: LocalizedError {
+enum SideStoreIntentError: LocalizedError, Sendable {
     case typeNotFound(String)
     case typeIsNotAppIntent(String)
 
@@ -63,20 +64,27 @@ struct SideStoreIntentCaller {
     }
 
     // call this when no IntentContext exists (when sidestore is loaded in LiveProcess)
-    func callRefreshIntent2(identifier: String, mangledTypeName: String, progressCallback: (Progress)->Void ) async throws {
-        try await withUnsafeThrowingContinuation { (c: UnsafeContinuation<(), any Error>) in
+    func callRefreshIntent2(identifier: String, mangledTypeName: String, progressCallback: (Progress) -> Void) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
             let parent = PrivateIntentRunner.run(
-                        identifier: identifier,
-                        mangledTypeName: mangledTypeName
-                    ) { result, error in
-                        print("performAction result=\(String(describing: result)), " +
-                              "error=\(String(describing: error))")
-                        if let error {
-                            c.resume(throwing: error)
-                        } else {
-                            c.resume()
-                        }
-                    }
+                identifier: identifier,
+                mangledTypeName: mangledTypeName
+            ) { result, error in
+                print("performAction result=\(String(describing: result)), " +
+                      "error=\(String(describing: error))")
+                let shouldResume = resumed.withLock { flag -> Bool in
+                    guard !flag else { return false }
+                    flag = true
+                    return true
+                }
+                guard shouldResume else { return }
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
             if let parent {
                 progressCallback(parent)
             }
@@ -88,16 +96,22 @@ struct SideStoreIntentCaller {
     @objc(performRefreshForRealWithIdentifier:mangledTypeName:server:)
     func performRefreshForReal(identifier: String, mangledTypeName: String, server: any RefreshServer) {
         Task {
+            let obsLock = OSAllocatedUnfairLock<NSKeyValueObservation?>(initialState: nil)
+            defer {
+                obsLock.withLock {
+                    $0?.invalidate()
+                    $0 = nil
+                }
+            }
             do {
-                var obs: NSKeyValueObservation? = nil
                 try await SideStoreIntentCaller.shared.callRefreshIntent2(identifier: identifier, mangledTypeName: mangledTypeName) { progress in
-                    obs = progress.observe(\.fractionCompleted, options: [.new]) { progress, change in
+                    let observation = progress.observe(\.fractionCompleted, options: [.new]) { _, change in
                         if let newValue = change.newValue {
                             server.updateProgress(newValue)
                         }
                     }
+                    obsLock.withLock { $0 = observation }
                 }
-                obs?.invalidate()
                 server.finish(nil)
             } catch {
                 server.finish(error.localizedDescription)

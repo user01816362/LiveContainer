@@ -1,9 +1,8 @@
-import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-final class SharePayload: ObservableObject {
-    enum Kind {
+struct SharePayload: Sendable {
+    enum Kind: Sendable {
         case loading
         case url(URL)
         case file(URL)
@@ -11,7 +10,7 @@ final class SharePayload: ObservableObject {
         case failed(String)
     }
 
-    @Published var kind: Kind = .loading
+    var kind: Kind = .loading
 
     var sharedURL: URL? {
         if case .url(let url) = kind {
@@ -20,6 +19,7 @@ final class SharePayload: ObservableObject {
         return nil
     }
     
+    @MainActor
     static func load(from context: NSExtensionContext?) async throws -> SharePayload.Kind {
         guard let items = context?.inputItems as? [NSExtensionItem] else {
             return .empty
@@ -62,14 +62,14 @@ final class SharePayload: ObservableObject {
     }
 }
 
-struct ShareContainer: Identifiable, Hashable {
+struct ShareContainer: Identifiable, Hashable, Sendable {
     let id: String
     let folderName: String
     let name: String
     let isShared: Bool
 }
 
-struct ShareApp: Identifiable, Hashable {
+struct ShareApp: Identifiable, Hashable, Sendable {
     let id: String
     let relativeBundlePath: String
     let displayName: String
@@ -89,7 +89,7 @@ struct ShareApp: Identifiable, Hashable {
     }
 }
 
-struct ShareLaunchItem: Identifiable, Hashable {
+struct ShareLaunchItem: Identifiable, Hashable, Sendable {
     let app: ShareApp
     let container: ShareContainer
 
@@ -98,7 +98,7 @@ struct ShareLaunchItem: Identifiable, Hashable {
     }
 }
 
-struct ShareExtensionError: LocalizedError {
+struct ShareExtensionError: LocalizedError, Sendable {
     let message: String
 
     init(_ message: String) {

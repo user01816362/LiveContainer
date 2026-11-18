@@ -18,6 +18,7 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
     let onInitialized: (Int32, Error?) -> Void
     let onExit: () -> Void
 
+    @MainActor
     final class Coordinator: NSObject, AppSceneViewControllerDelegate {
         let onInitialized: (Int32, Error?) -> Void
         let onExit: () -> Void
@@ -28,21 +29,16 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
             self.onExit = onExit
         }
 
-        func appSceneVCAppDidExit(_ vc: AppSceneViewController!) {
-            DispatchQueue.main.async {
-                self.onExit()
-            }
+        func appSceneVCAppDidExit(_ vc: AppSceneViewController) {
+            onExit()
         }
 
-        func appSceneVC(_ vc: AppSceneViewController!, didInitializeWithError error: (any Error)!) {
-            let pid = vc?.pid ?? 0
-            DispatchQueue.main.async {
-                self.onInitialized(pid, error)
-            }
+        func appSceneVC(_ vc: AppSceneViewController, didInitializeWithError error: (any Error)?) {
+            let pid = vc.pid
+            onInitialized(pid, error)
         }
 
-        func appSceneVCWillActivateScene(_ vc: AppSceneViewController!) {
-            guard let vc else { return }
+        func appSceneVCWillActivateScene(_ vc: AppSceneViewController) {
             vc.updateSettings { settings in
                 guard let settings else { return }
                 let safeTop: CGFloat = 12
@@ -61,7 +57,7 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
             vc.contentView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         }
 
-        func appSceneVC(_ vc: AppSceneViewController!, didUpdateFrom settings: UIMutableApplicationSceneSettings!, transitionContext context: Any!, lifecycleActionType actionType: UInt32) {
+        func appSceneVC(_ vc: AppSceneViewController, didUpdateFrom settings: UIMutableApplicationSceneSettings, transitionContext context: Any?, lifecycleActionType actionType: UInt32) {
             settings.interruptionPolicy = 0
             vc.presenter.scene.updateSettings(settings, withTransitionContext: context, completion: nil)
         }

@@ -9,10 +9,12 @@ import Intents
         UserDefaults.standard.removeObject(forKey: "LCNeedToAcquireJIT")
         
         NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { _ in
-            // Fix launching app if user opens JIT waiting dialog and kills the app. Won't trigger normally.
-            if DataManager.shared.model.isJITModalOpen && !UserDefaults.standard.bool(forKey: "LCKeepSelectedWhenQuit"){
-                UserDefaults.standard.removeObject(forKey: "selected")
-                UserDefaults.standard.removeObject(forKey: "selectedContainer")
+            MainActor.assumeIsolated {
+                // Fix launching app if user opens JIT waiting dialog and kills the app. Won't trigger normally.
+                if DataManager.shared.model.isJITModalOpen && !UserDefaults.standard.bool(forKey: "LCKeepSelectedWhenQuit") {
+                    UserDefaults.standard.removeObject(forKey: "selected")
+                    UserDefaults.standard.removeObject(forKey: "selectedContainer")
+                }
             }
         }
         
@@ -59,6 +61,7 @@ import Intents
     }
 }
 
+@MainActor
 class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make SceneDelegate conform ObservableObject
     var window: UIWindow?
 

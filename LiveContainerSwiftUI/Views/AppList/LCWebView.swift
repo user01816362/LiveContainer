@@ -5,21 +5,99 @@
 //
 
 import SwiftUI
-@preconcurrency import WebKit
+import WebKit
+
+@MainActor
+private final class WebViewControllerModel: ObservableObject {
+    let webView = WKWebView()
+    @Published var loadStatus = 0.0
+    @Published var pageURL: URL?
+    @Published var canGoBack = false
+    @Published var canGoForward = false
+    @Published var isLoading = false
+    @Published var pageTitle = ""
+
+    private var delegate: WebViewDelegate?
+    private var observations: [NSKeyValueObservation] = []
+
+    func configure(
+        urlSchemeHandler: @escaping @MainActor (URL) async -> Void,
+        universalLinkHandler: @escaping @MainActor (URL, [String]) async -> Void
+    ) {
+        if observations.isEmpty {
+            observations = [
+                webView.observe(\.estimatedProgress, options: [.initial, .new]) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.loadStatus = self.webView.estimatedProgress
+                    }
+                },
+                webView.observe(\.url, options: [.initial, .new]) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.pageURL = self.webView.url
+                    }
+                },
+                webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.canGoBack = self.webView.canGoBack
+                    }
+                },
+                webView.observe(\.canGoForward, options: [.initial, .new]) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.canGoForward = self.webView.canGoForward
+                    }
+                },
+                webView.observe(\.isLoading, options: [.initial, .new]) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.isLoading = self.webView.isLoading
+                    }
+                }
+            ]
+        }
+
+        let navDelegate = WebViewDelegate(
+            onTitleChange: { [weak self] title in
+                self?.pageTitle = title
+            },
+            urlSchemeHandler: urlSchemeHandler,
+            universalLinkHandler: universalLinkHandler
+        )
+        self.delegate = navDelegate
+        self.webView.navigationDelegate = navDelegate
+    }
+
+    func loadURL(_ url: URL) {
+        webView.load(URLRequest(url: url))
+    }
+
+    func reload() {
+        webView.reload()
+    }
+
+    func stopLoading() {
+        webView.stopLoading()
+    }
+
+    func goBack() {
+        webView.goBack()
+    }
+
+    func goForward() {
+        webView.goForward()
+    }
+}
 
 struct LCWebView: View {
-    @State private var webView : WebView
+    @StateObject private var webController = WebViewControllerModel()
     @State private var didAppear = false
     
     @Binding var url : URL
     @Binding var isPresent: Bool
-    @State private var loadStatus = 0.0
     @State private var uiLoadStatus = 0.0
-    @State private var pageTitle = ""
-    @State private var pageURL: URL?
-    @State private var canGoBack = false
-    @State private var canGoForward = false
-    @State private var isLoading = false
     @State private var showShareSheet = false
     
     @StateObject private var runAppAlert = YesNoHelper()
@@ -39,7 +117,6 @@ struct LCWebView: View {
     var itmsServicesHandler: ((String) async -> Void)?
     
     init(url: Binding<URL>, isPresent: Binding<Bool>, itmsServicesHandler: ((String) async -> Void)? = nil) {
-        self._webView = State(initialValue: WebView())
         self._url = url
         self._isPresent = isPresent
         self.itmsServicesHandler = itmsServicesHandler
@@ -51,7 +128,7 @@ struct LCWebView: View {
             ZStack {
                 // Extend the web view itself under the bars and the home indicator.
                 // Scroll insets keep the first and last page content reachable.
-                webView.withContentInsets(UIEdgeInsets(
+                WebView(webView: webController.webView, contentInsets: UIEdgeInsets(
                     top: geometry.safeAreaInsets.top + navigationBarHeight,
                     left: geometry.safeAreaInsets.leading,
                     bottom: geometry.safeAreaInsets.bottom + bottomBarHeight,
@@ -72,7 +149,7 @@ struct LCWebView: View {
             if !didAppear {
                 onViewAppear()
                 didAppear = true
-                webView.loadURL(url: url)
+                webController.loadURL(url)
             }
         }
         .sheet(isPresented: $showShareSheet) {
@@ -109,7 +186,7 @@ struct LCWebView: View {
     }
     
     private var currentURL: URL {
-        pageURL ?? url
+        webController.pageURL ?? url
     }
 
     private var navigationBar: some View {
@@ -125,12 +202,12 @@ struct LCWebView: View {
                 }
 
                 VStack(spacing: 3) {
-                    Text(pageTitle.isEmpty ? (currentURL.host ?? currentURL.absoluteString) : pageTitle)
+                    Text(webController.pageTitle.isEmpty ? (currentURL.host ?? currentURL.absoluteString) : webController.pageTitle)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         .accessibilityAddTraits(.isHeader)
                     HStack(spacing: 4) {
-                        if currentURL.scheme == "https" {
+                        if currentURL.scheme?.lowercased() == "https" {
                             Image(systemName: "lock.fill")
                                 .font(.system(size: 9))
                         }
@@ -146,13 +223,13 @@ struct LCWebView: View {
                 .padding(.horizontal, 12)
                 .modifier(LCWebViewGlassBackground(shape: Capsule()))
                 Button {
-                    if isLoading {
-                        webView.webView.stopLoading()
+                    if webController.isLoading {
+                        webController.stopLoading()
                     } else {
-                        webView.reload()
+                        webController.reload()
                     }
                 } label: {
-                    if isLoading {
+                    if webController.isLoading {
                         Image(systemName: "xmark")
                     } else {
                         Image(systemName: "arrow.clockwise")
@@ -169,12 +246,12 @@ struct LCWebView: View {
             .overlay(alignment: .bottom) {
                 ProgressView(value: uiLoadStatus)
                     .progressViewStyle(.linear)
-                    .opacity(isLoading ? 1 : 0)
+                    .opacity(webController.isLoading ? 1 : 0)
                     .scaleEffect(y: 0.5, anchor: .bottom)
                     .allowsHitTesting(false)
             }
         }
-        .onChange(of: loadStatus) { _, newValue in
+        .onChange(of: webController.loadStatus) { _, newValue in
             if newValue > uiLoadStatus {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     uiLoadStatus = newValue
@@ -188,18 +265,18 @@ struct LCWebView: View {
     private var bottomBar: some View {
         GlassEffectContainer {
             HStack {
-                Button(action: webView.goBack) {
+                Button(action: webController.goBack) {
                     Image(systemName: "chevron.backward")
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!canGoBack)
+                .disabled(!webController.canGoBack)
 
                 Spacer(minLength: 0)
-                Button(action: webView.goForward) {
+                Button(action: webController.goForward) {
                     Image(systemName: "chevron.forward")
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!canGoForward)
+                .disabled(!webController.canGoForward)
 
                 Spacer(minLength: 0)
                 Button {
@@ -216,7 +293,7 @@ struct LCWebView: View {
                     Image(systemName: "safari")
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!["http", "https"].contains(currentURL.scheme ?? ""))
+                .disabled(!["http", "https"].contains((currentURL.scheme ?? "").lowercased()))
             }
             .font(.system(size: 20))
             .frame(maxWidth: 420)
@@ -231,10 +308,14 @@ struct LCWebView: View {
     }
 
     func onViewAppear() {
-        let observer = WebViewLoadObserver(loadStatus: $loadStatus, pageURL: $pageURL, canGoBack: $canGoBack, canGoForward: $canGoForward, isLoading: $isLoading, webView: webView.webView)
-        let webViewDelegate = WebViewDelegate(pageTitle: $pageTitle, urlSchemeHandler: onURLSchemeDetected, universalLinkHandler: onUniversalLinkDetected)
-        webView.setDelegate(delegete: webViewDelegate)
-        webView.setObserver(observer: observer)
+        webController.configure(
+            urlSchemeHandler: { url in
+                await onURLSchemeDetected(url: url)
+            },
+            universalLinkHandler: { url, bundleIDs in
+                await onUniversalLinkDetected(url: url, bundleIDs: bundleIDs)
+            }
+        )
     }
 
     func launchToApp(app: LCAppModel, url: URL) async {
@@ -262,7 +343,7 @@ struct LCWebView: View {
         var appToLaunch : LCAppModel? = nil
         var appListsToConsider = [sharedModel.apps]
         
-        if url.scheme == "itms-services", let handler = itmsServicesHandler {
+        if url.scheme?.lowercased() == "itms-services", let handler = itmsServicesHandler {
             installAppAlertMsg = "lc.webView.installAppDesc"
             
             if let doInstall = await installAppAlert.open(), !doInstall {
@@ -279,9 +360,9 @@ struct LCWebView: View {
         appLoop:
         for appList in appListsToConsider {
             for app in appList {
-                if let schemes = app.appInfo.urlSchemes() {
+                if let schemes = app.appInfo.urlSchemes(), let targetScheme = url.scheme {
                     for scheme in schemes {
-                        if let scheme = scheme as? String, scheme == url.scheme {
+                        if let scheme = scheme as? String, scheme.caseInsensitiveCompare(targetScheme) == .orderedSame {
                             appToLaunch = app
                             break appLoop
                         }
@@ -292,7 +373,7 @@ struct LCWebView: View {
     
         
         guard let appToLaunch = appToLaunch else {
-            errorInfo = "lc.appList.schemeCannotOpenError %@".localizeWithFormat(url.scheme!)
+            errorInfo = "lc.appList.schemeCannotOpenError %@".localizeWithFormat(url.scheme ?? "")
             errorShow = true
             return
         }
@@ -371,74 +452,55 @@ private struct LCWebViewGlassBackground<S: Shape>: ViewModifier {
     }
 }
 
-class WebViewLoadObserver: NSObject {
-    private var observations: [NSKeyValueObservation] = []
-
-    init(loadStatus: Binding<Double>, pageURL: Binding<URL?>, canGoBack: Binding<Bool>, canGoForward: Binding<Bool>, isLoading: Binding<Bool>, webView: WKWebView) {
-        super.init()
-        observations = [
-            webView.observe(\.estimatedProgress, options: [.initial, .new]) { webView, _ in
-                loadStatus.wrappedValue = webView.estimatedProgress
-            },
-            webView.observe(\.url, options: [.initial, .new]) { webView, _ in
-                pageURL.wrappedValue = webView.url
-            },
-            webView.observe(\.canGoBack, options: [.initial, .new]) { webView, _ in
-                canGoBack.wrappedValue = webView.canGoBack
-            },
-            webView.observe(\.canGoForward, options: [.initial, .new]) { webView, _ in
-                canGoForward.wrappedValue = webView.canGoForward
-            },
-            webView.observe(\.isLoading, options: [.initial, .new]) { webView, _ in
-                isLoading.wrappedValue = webView.isLoading
-            }
-        ]
-    }
-}
-
-class WebViewDelegate : NSObject,WKNavigationDelegate {
-    private var pageTitle: Binding<String>
-    private var urlSchemeHandler: (URL) async -> Void
-    private var universalLinkHandler: (URL , [String]) async -> Void // url, [String] of all apps that can open this web page
-    var domainBundleIdDict : [String:[String]] = [:]
+@MainActor
+private final class WebViewDelegate: NSObject, WKNavigationDelegate {
+    private var onTitleChange: @MainActor (String) -> Void
+    private var urlSchemeHandler: @MainActor (URL) async -> Void
+    private var universalLinkHandler: @MainActor (URL, [String]) async -> Void // url, [String] of all apps that can open this web page
+    var domainBundleIdDict: [String: [String]] = [:]
     
-    init(pageTitle: Binding<String>, urlSchemeHandler: @escaping (URL) async -> Void, universalLinkHandler: @escaping (URL , [String]) async -> Void) {
-        self.pageTitle = pageTitle
+    init(
+        onTitleChange: @escaping @MainActor (String) -> Void,
+        urlSchemeHandler: @escaping @MainActor (URL) async -> Void,
+        universalLinkHandler: @escaping @MainActor (URL, [String]) async -> Void
+    ) {
+        self.onTitleChange = onTitleChange
         self.urlSchemeHandler = urlSchemeHandler
         self.universalLinkHandler = universalLinkHandler
         super.init()
     }
     
     func webView(_ webView: WKWebView,
-                   decidePolicyFor navigationAction: WKNavigationAction,
-                   decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        decisionHandler((WKNavigationActionPolicy)(rawValue: WKNavigationActionPolicy.allow.rawValue + 2)!)
-        guard let url = navigationAction.request.url, let scheme = navigationAction.request.url?.scheme else {
-            return
+                 decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+        let policy = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
+        guard let url = navigationAction.request.url, let scheme = url.scheme?.lowercased() else {
+            return policy
         }
-        if(scheme == "https") {
-            Task {
+        if scheme == "https" {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
                 await self.loadDomainAssociations(url: url)
                 if let host = url.host, let appIDs = self.domainBundleIdDict[host] {
-                    Task{ await self.universalLinkHandler(url, appIDs) }
+                    await self.universalLinkHandler(url, appIDs)
                 }
             }
-            return
+            return policy
         }
-        if(scheme == "http" || scheme == "about" || scheme == "itms-apps") {
-            return;
+        if scheme == "http" || scheme == "about" || scheme == "itms-apps" {
+            return policy
         }
-        Task{ await urlSchemeHandler(url) }
-
+        Task { @MainActor [weak self] in
+            await self?.urlSchemeHandler(url)
+        }
+        return policy
     }
     
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        self.pageTitle.wrappedValue = webView.title ?? ""
+        onTitleChange(webView.title ?? "")
     }
     
-    
     func loadDomainAssociations(url: URL) async {
-        if url.scheme != "https" || url.host == nil {
+        if url.scheme?.lowercased() != "https" || url.host == nil {
             return
         }
         guard let host = url.host else {
@@ -479,35 +541,21 @@ class WebViewDelegate : NSObject,WKNavigationDelegate {
         if !collectedBundleIds.isEmpty {
             self.domainBundleIdDict[host] = collectedBundleIds
         }
-
     }
 }
 
-struct WebView: UIViewRepresentable {
-    
+private struct WebView: UIViewRepresentable {
     let webView: WKWebView
-    var observer: WebViewLoadObserver?
-    var delegate: WKNavigationDelegate?
-    private var contentInsets: UIEdgeInsets = .zero
-    
-    init() {
-        self.webView = WKWebView()
-    }
-    
-    mutating func setDelegate(delegete: WKNavigationDelegate) {
-        self.delegate = delegete
-        self.webView.navigationDelegate = delegete
-    }
-    
-    mutating func setObserver(observer: WebViewLoadObserver) {
-        self.observer = observer
-    }
-    
+    let contentInsets: UIEdgeInsets
+
     func makeUIView(context: Context) -> WKWebView {
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.scrollView.automaticallyAdjustsScrollIndicatorInsets = false
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        let osStr = "\(v.majorVersion)_\(v.minorVersion)\(v.patchVersion > 0 ? "_\(v.patchVersion)" : "")"
+        let safariStr = "\(v.majorVersion).\(v.minorVersion)"
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS \(osStr) like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariStr) Mobile/15E148 Safari/604.1"
         return webView
     }
     
@@ -523,30 +571,5 @@ struct WebView: UIViewRepresentable {
             scrollView.contentOffset.y = -contentInsets.top
         }
     }
-
-    func withContentInsets(_ insets: UIEdgeInsets) -> WebView {
-        var view = self
-        view.contentInsets = insets
-        return view
-    }
-    
-    func reload() {
-        webView.reload()
-    }
-    
-    func goBack(){
-        webView.goBack()
-    }
-    
-    func goForward(){
-        webView.goForward()
-    }
-    
-    
-    func loadURL(url: URL) {
-        webView.load(URLRequest(url: url))
-    }
-    
-
 }
 

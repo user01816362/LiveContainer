@@ -426,7 +426,7 @@
             
             __block NSProgress *progress = [LCUtils signAppBundleWithZSign:appPathURL completionHandler:signCompletionHandler];
 
-            if (progress) {
+            if (progress && progressHandler) {
                 progressHandler(progress);
             }
 }

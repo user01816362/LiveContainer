@@ -69,7 +69,7 @@ struct LCAppBinaryExportView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", action: onCancel)
                 }
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     if !items.isEmpty {
                         Button(selectedItemIDs.count == items.count ? "Unselect All" : "Select All") {
                             if selectedItemIDs.count == items.count {
@@ -94,6 +94,5 @@ struct LCAppBinaryExportView: View {
                 }
             }
         }
-        .navigationViewStyle(.stack)
     }
 }

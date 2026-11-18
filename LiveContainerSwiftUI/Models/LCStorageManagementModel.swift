@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-struct LCAppStorageItem: Identifiable {
+struct LCAppStorageItem: Identifiable, Sendable {
     let id: UUID
 
     let appModel: LCAppModel
@@ -13,14 +13,14 @@ struct LCAppStorageItem: Identifiable {
     let containerDetails: [LCAppStorageContainerItem]
 }
 
-struct LCAppStorageContainerItem: Identifiable {
+struct LCAppStorageContainerItem: Identifiable, Sendable {
     let id: UUID
     let name: String
     let size: Int64
     let isExternalContainer: Bool
 }
 
-struct LCStorageBreakdown {
+struct LCStorageBreakdown: Sendable {
     let totalSize: Int64
     let appBundleSize: Int64
     let containersSize: Int64
@@ -38,6 +38,21 @@ final class LCStorageManagementModel: ObservableObject {
     @Published var isCalculating = false
     @Published var errorInfo: String?
 
+    private struct ContainerSnapshot: Sendable {
+        let name: String
+        let url: URL
+        let bookmarkResolved: Bool
+        let isExternal: Bool
+    }
+
+    private struct AppSnapshot: Sendable {
+        let appModel: LCAppModel
+        let displayName: String
+        let bundlePath: String?
+        let isBuiltInSideStore: Bool
+        let containers: [ContainerSnapshot]
+    }
+
     func refresh(apps: [LCAppModel], hiddenApps: [LCAppModel]) async {
         guard !isCalculating else {
             return
@@ -48,14 +63,36 @@ final class LCStorageManagementModel: ObservableObject {
         errorInfo = nil
         breakdown = nil
 
+        var allApps = DataManager.shared.model.isHiddenAppUnlocked ? (apps + hiddenApps) : apps
+        if UserDefaults.sideStoreExist() {
+            allApps.append(LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared))
+        }
+
+        let snapshots = allApps.map { model in
+            AppSnapshot(
+                appModel: model,
+                displayName: model.displayName,
+                bundlePath: model.appInfo.bundlePath(),
+                isBuiltInSideStore: model.appInfo is BuiltInSideStoreAppInfo,
+                containers: model.uiContainers.map { container in
+                    ContainerSnapshot(
+                        name: container.name,
+                        url: container.containerURL,
+                        bookmarkResolved: container.bookmarkResolved,
+                        isExternal: container.storageBookMark != nil
+                    )
+                }
+            )
+        }
+
         do {
-            breakdown = try await Self.calculateBreakdown(apps: apps, hiddenApps: hiddenApps)
+            breakdown = try await Self.calculateBreakdown(from: snapshots)
         } catch {
             errorInfo = error.localizedDescription
         }
     }
 
-    private enum StorageCategory {
+    private enum StorageCategory: Sendable {
         case appBundle
         case containers
         case temporaryFiles
@@ -63,22 +100,8 @@ final class LCStorageManagementModel: ObservableObject {
         case tweaks
     }
 
-    nonisolated private static func calculateBreakdown(apps: [LCAppModel], hiddenApps: [LCAppModel]) async throws -> LCStorageBreakdown {
-        var allApps: [LCAppModel]
-        if DataManager.shared.model.isHiddenAppUnlocked {
-            allApps = apps + hiddenApps
-        } else {
-            allApps = apps
-        }
-        
-        if UserDefaults.sideStoreExist() {
-            allApps.append(LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared))
-        }
-
-        // Show per-app bundle usage only when every installed app has a reliable bundle path.
-        let appItems = try await calculateAppItems(
-            from: allApps
-        )
+    nonisolated private static func calculateBreakdown(from snapshots: [AppSnapshot]) async throws -> LCStorageBreakdown {
+        let appItems = try await calculateAppItems(from: snapshots)
 
         var sizesByCategory: [StorageCategory: Int64] = [:]
         
@@ -90,8 +113,9 @@ final class LCStorageManagementModel: ObservableObject {
         sizesByCategory[.appBundle] = 0
         sizesByCategory[.containers] = 0
         
+        let builtInSideStoreIDs = Set(snapshots.filter(\.isBuiltInSideStore).map { ObjectIdentifier($0.appModel) })
         for appItem in appItems {
-            if !(appItem.appModel.appInfo is BuiltInSideStoreAppInfo) {
+            if !builtInSideStoreIDs.contains(ObjectIdentifier(appItem.appModel)) {
                 sizesByCategory[.appBundle]! += appItem.bundleSize ?? 0
             }
             
@@ -150,24 +174,24 @@ final class LCStorageManagementModel: ObservableObject {
     }
 
     nonisolated private static func calculateAppItem(
-        from input: LCAppModel,
+        from input: AppSnapshot
     ) async throws -> LCAppStorageItem {
         var containerDetails: [LCAppStorageContainerItem] = []
-        containerDetails.reserveCapacity(input.uiContainers.count)
+        containerDetails.reserveCapacity(input.containers.count)
 
         var containersSize: Int64 = 0
-        for container in input.uiContainers {
+        for container in input.containers {
             if container.bookmarkResolved {
-                let _ = container.containerURL.startAccessingSecurityScopedResource()
+                let _ = container.url.startAccessingSecurityScopedResource()
             }
             
-            let size = try await calculateSize(at: container.containerURL)
+            let size = try await calculateSize(at: container.url)
             
             if container.bookmarkResolved {
-                container.containerURL.stopAccessingSecurityScopedResource()
+                container.url.stopAccessingSecurityScopedResource()
             }
             
-            if container.storageBookMark == nil {
+            if !container.isExternal {
                 containersSize += size
             }
             containerDetails.append(
@@ -175,21 +199,21 @@ final class LCStorageManagementModel: ObservableObject {
                     id: UUID(),
                     name: container.name,
                     size: size,
-                    isExternalContainer: container.storageBookMark != nil
+                    isExternalContainer: container.isExternal
                 )
             )
         }
 
 
         let bundleSize: Int64?
-        if let bundlePath = input.appInfo.bundlePath() {
+        if let bundlePath = input.bundlePath {
             bundleSize = try await calculateSize(at: URL(fileURLWithPath: bundlePath))
         } else {
             bundleSize = nil
         }
         
         let totalSize: Int64
-        if input.appInfo is BuiltInSideStoreAppInfo {
+        if input.isBuiltInSideStore {
             totalSize = containersSize
         } else {
             totalSize = (bundleSize ?? 0) + containersSize
@@ -197,7 +221,7 @@ final class LCStorageManagementModel: ObservableObject {
 
         return LCAppStorageItem(
             id: UUID(),
-            appModel: input,
+            appModel: input.appModel,
             bundleSize: bundleSize,
             containersSize: containersSize,
             totalSize: totalSize,
@@ -206,31 +230,30 @@ final class LCStorageManagementModel: ObservableObject {
     }
 
     nonisolated private static func calculateAppItems(
-        from inputs: [LCAppModel]
+        from inputs: [AppSnapshot]
     ) async throws -> [LCAppStorageItem] {
-        var appItems: [LCAppStorageItem] = []
-        appItems.reserveCapacity(inputs.count)
+        var itemsWithNames: [(LCAppStorageItem, String)] = []
+        itemsWithNames.reserveCapacity(inputs.count)
 
-        try await withThrowingTaskGroup(of: LCAppStorageItem.self) { group in
+        try await withThrowingTaskGroup(of: (LCAppStorageItem, String).self) { group in
             for input in inputs {
+                let name = input.displayName
                 group.addTask(priority: .utility) {
-                    try await calculateAppItem(
-                        from: input
-                    )
+                    (try await calculateAppItem(from: input), name)
                 }
             }
 
-            for try await item in group {
-                appItems.append(item)
+            for try await pair in group {
+                itemsWithNames.append(pair)
             }
         }
 
-        return appItems.sorted {
-            if $0.totalSize == $1.totalSize {
-                return ($0.appModel.displayName).localizedCaseInsensitiveCompare($1.appModel.displayName) == .orderedAscending
+        return itemsWithNames.sorted {
+            if $0.0.totalSize == $1.0.totalSize {
+                return $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending
             }
-            return $0.totalSize > $1.totalSize
-        }
+            return $0.0.totalSize > $1.0.totalSize
+        }.map(\.0)
     }
 
     nonisolated private static func calculateCombinedSize(of urls: [URL]) async throws -> Int64 {

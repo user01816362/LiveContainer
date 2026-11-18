@@ -16,6 +16,8 @@
 @property(nonatomic) UIBarButtonItem *maximizeButton;
 @property(nonatomic) bool isAppTerminationRequested;
 @property(nonatomic) BOOL isObservingDefaults;
+@property(nonatomic) BOOL isObservingKeyboard;
+@property(nonatomic) CGFloat keyboardShiftY;
 @end
 
 static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
@@ -144,6 +146,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     self.view.axis = UILayoutConstraintAxisVertical;
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.view.layer.cornerRadius = 10;
+    self.view.layer.cornerCurve = kCACornerCurveContinuous;
     self.view.layer.masksToBounds = YES;
 
     self.navigationBar = navigationBar;
@@ -200,13 +203,82 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         self.isObservingDefaults = YES;
         [defaults addObserver:self forKeyPath:@"LCMultitaskBottomWindowBar" options:NSKeyValueObservingOptionNew context:NULL];
     }
+    if (!self.isObservingKeyboard) {
+        self.isObservingKeyboard = YES;
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(handleKeyboardWillChangeFrame:) name:UIKeyboardWillChangeFrameNotification object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(handleKeyboardWillHide:) name:UIKeyboardWillHideNotification object:nil];
+    }
     [self updateOriginalFrame];
+}
+
+- (void)handleKeyboardWillChangeFrame:(NSNotification *)notification {
+    if (_isMaximized || self.view.hidden || !self.view.window || !self.view.superview) {
+        return;
+    }
+    NSValue *endFrameValue = notification.userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (!endFrameValue) {
+        return;
+    }
+    CGRect kbScreenFrame = endFrameValue.CGRectValue;
+    UIWindow *window = self.view.window;
+    CGRect kbInWindow = [window convertRect:kbScreenFrame fromWindow:nil];
+    CGRect currentInWindow = [self.view.superview convertRect:self.view.frame toView:window];
+
+    CGFloat unshiftedMaxY = CGRectGetMaxY(currentInWindow) + self.keyboardShiftY;
+    CGFloat unshiftedMinY = CGRectGetMinY(currentInWindow) + self.keyboardShiftY;
+
+    CGFloat targetShiftY = 0.0;
+    if (!CGRectIsEmpty(kbInWindow) && CGRectGetMinY(kbInWindow) < CGRectGetMaxY(window.bounds) - 1.0) {
+        CGFloat padding = 8.0;
+        CGFloat neededShift = (unshiftedMaxY + padding) - CGRectGetMinY(kbInWindow);
+        if (neededShift > 0.0) {
+            CGFloat safeTop = window.safeAreaInsets.top + 8.0;
+            CGFloat maxUpShift = MAX(0.0, unshiftedMinY - safeTop);
+            targetShiftY = MIN(neededShift, maxUpShift);
+        }
+    }
+
+    CGFloat delta = targetShiftY - self.keyboardShiftY;
+    self.keyboardShiftY = targetShiftY;
+    if (fabs(delta) < 0.5) {
+        return;
+    }
+
+    NSTimeInterval duration = [notification.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSInteger rawCurve = [notification.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    UIViewAnimationOptions options = ((UIViewAnimationOptions)(rawCurve & 0x7) << 16) | UIViewAnimationOptionBeginFromCurrentState;
+    [UIView animateWithDuration:duration delay:0.0 options:options animations:^{
+        self.view.center = CGPointMake(self.view.center.x, self.view.center.y - delta);
+    } completion:nil];
+}
+
+- (void)handleKeyboardWillHide:(NSNotification *)notification {
+    CGFloat shift = self.keyboardShiftY;
+    if (shift <= 0.0) {
+        self.keyboardShiftY = 0.0;
+        return;
+    }
+    self.keyboardShiftY = 0.0;
+    if (_isMaximized) {
+        return;
+    }
+
+    NSTimeInterval duration = [notification.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSInteger rawCurve = [notification.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    UIViewAnimationOptions options = ((UIViewAnimationOptions)(rawCurve & 0x7) << 16) | UIViewAnimationOptionBeginFromCurrentState;
+    [UIView animateWithDuration:duration delay:0.0 options:options animations:^{
+        self.view.center = CGPointMake(self.view.center.x, self.view.center.y + shift);
+    } completion:nil];
 }
 
 - (void)dealloc {
     if (_isObservingDefaults) {
         _isObservingDefaults = NO;
         [NSUserDefaults.lcSharedDefaults removeObserver:self forKeyPath:@"LCMultitaskBottomWindowBar"];
+    }
+    if (_isObservingKeyboard) {
+        _isObservingKeyboard = NO;
+        [NSNotificationCenter.defaultCenter removeObserver:self];
     }
 }
 
@@ -255,11 +327,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 - (void)scaleSliderChanged:(_UIPrototypingMenuSlider *)slider {
     self.scaleRatio = slider.value;
     self.appSceneVC.scaleRatio = _scaleRatio;
-    if(self.appSceneVC.usesHostingControllerAPI) {
-        self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(_scaleRatio, _scaleRatio);
-    } else {
-        self.appSceneVC.contentView.layer.sublayerTransform = CATransform3DMakeScale(_scaleRatio, _scaleRatio, 1.0);
-    }
+    self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(_scaleRatio, _scaleRatio);
     __weak typeof(self) weakSelf = self;
     [self.appSceneVC updateFrameWithSettingsBlock:^(UIMutableApplicationSceneSettings *settings) {
         if(weakSelf.isMaximized) {
@@ -495,6 +563,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 
 - (void)moveWindow:(UIPanGestureRecognizer*)sender {
     if(_isMaximized) return;
+    self.keyboardShiftY = 0.0;
     
     CGPoint point = [sender translationInView:self.view];
     [sender setTranslation:CGPointZero inView:self.view];

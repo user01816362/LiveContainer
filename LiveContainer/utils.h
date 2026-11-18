@@ -25,6 +25,7 @@ kern_return_t builtin_vm_protect(mach_port_name_t task, mach_vm_address_t addres
 void *jitless_hook_dlopen(const char *path, int mode);
 
 uint64_t aarch64_get_tbnz_jump_address(uint32_t instruction, uint64_t pc);
+uint64_t aarch64_get_tbz_or_tbnz_jump_address(uint32_t instruction, uint64_t pc);
 uint64_t aarch64_emulate_adrp(uint32_t instruction, uint64_t pc);
 bool aarch64_emulate_add_imm(uint32_t instruction, uint32_t *dst, uint32_t *src, uint32_t *imm);
 uint64_t aarch64_emulate_adrp_add(uint32_t instruction, uint32_t addInstruction, uint64_t pc);

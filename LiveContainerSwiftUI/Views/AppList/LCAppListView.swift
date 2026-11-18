@@ -9,28 +9,42 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
 class SearchContext: ObservableObject {
-    @Published var query: String = ""
+    @Published var query: String = "" {
+        didSet {
+            scheduleDebounce()
+        }
+    }
     @Published var debouncedQuery: String = ""
     @Published var isTyping: Bool = false
 
-    private var cancellables = Set<AnyCancellable>()
+    private var debounceTask: Task<Void, Never>?
 
-    init() {
-        $query
-            .debounce(for: .seconds(0.2), scheduler: DispatchQueue.main)
-            .sink { [weak self] value in
-                self?.isTyping = true
-                self?.debouncedQuery = value
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    self?.isTyping = false
-                }
+    private func scheduleDebounce() {
+        debounceTask?.cancel()
+        let currentQuery = query
+        debounceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+            } catch {
+                return
             }
-            .store(in: &cancellables)
+            guard let self, !Task.isCancelled else { return }
+            self.isTyping = true
+            self.debouncedQuery = currentQuery
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            self.isTyping = false
+        }
+    }
+
+    deinit {
+        debounceTask?.cancel()
     }
 }
 
-struct AppReplaceOption : Hashable {
+struct AppReplaceOption : Hashable, Sendable {
     var isReplace: Bool
     var nameOfFolderToInstall: String
     var appToReplace: LCAppModel?
@@ -84,7 +98,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     
     @State private var isViewAppeared = false
     
-    @ObservedObject var searchContext: SearchContext = SearchContext()
+    @StateObject var searchContext: SearchContext = SearchContext()
     var sortedApps: [LCAppModel] {
         return sharedAppSortManager.sortedApps
     }
@@ -491,18 +505,24 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
             .onDrop(of: [.url], isTargeted: nil) { providers in
                 guard let provider = providers.first else { return false }
-                _ = provider.loadObject(ofClass: URL.self) { url, error in
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     guard let url else { return }
-                    Task {
-                        guard let urlToOpen = await webViewUrlInput.open(initVal: url.absoluteString), urlToOpen != "" else {
-                            return
-                        }
-                        await openWebView(urlString: urlToOpen)
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: Notification.Name("LC.OpenDroppedWebURL"), object: url)
                     }
                 }
                 return true
             }
-            .onReceive(NotificationCenter.default.publisher(for: NSNotification.InstallAppNotification)) { obj in
+            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("LC.OpenDroppedWebURL")).receive(on: RunLoop.main)) { note in
+                guard let url = note.object as? URL else { return }
+                Task { @MainActor in
+                    guard let urlToOpen = await webViewUrlInput.open(initVal: url.absoluteString), !urlToOpen.isEmpty else {
+                        return
+                    }
+                    await openWebView(urlString: urlToOpen)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSNotification.InstallAppNotification).receive(on: RunLoop.main)) { obj in
                 if let obj2 = obj.object as? [String: Any], let installUrl = obj2["url"] as? URL {
                     Task { await installFromUrl(urlStr: installUrl.absoluteString) }
                 }
@@ -673,12 +693,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         webViewURL = urlToOpen.url!
         if webViewOpened {
             webViewOpened = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
-                webViewOpened = true
-            })
-        } else {
-            webViewOpened = true
+            try? await Task.sleep(for: .milliseconds(100))
         }
+        webViewOpened = true
     }
 
 
@@ -893,44 +910,38 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     }
     
     func removeApp(app: LCAppModel) {
-        DispatchQueue.main.async {
-            sharedModel.apps.removeAll { now in
-                return app == now
-            }
-            sharedModel.hiddenApps.removeAll { now in
-                return app == now
-            }
-            
+        sharedModel.apps.removeAll { now in
+            return app == now
+        }
+        sharedModel.hiddenApps.removeAll { now in
+            return app == now
         }
     }
     
     func changeAppVisibility(app: LCAppModel) {
-        DispatchQueue.main.async {
-            let schemes = (app.appInfo.urlSchemes() as? [Any]) ?? []
-            if app.appInfo.isHidden {
-                sharedModel.apps.removeAll { now in
-                    return app == now
-                }
-                if !sharedModel.hiddenApps.contains(app) {
-                    sharedModel.hiddenApps.append(app)
-                }
-                if !schemes.isEmpty {
-                    UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
-                        .removeObjects(in: schemes)
-                }
-            } else {
-                sharedModel.hiddenApps.removeAll { now in
-                    return app == now
-                }
-                if !sharedModel.apps.contains(app) {
-                    sharedModel.apps.append(app)
-                }
-                if !schemes.isEmpty {
-                    UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
-                        .addObjects(from: schemes)
-                }
+        let schemes = (app.appInfo.urlSchemes() as? [Any]) ?? []
+        if app.appInfo.isHidden {
+            sharedModel.apps.removeAll { now in
+                return app == now
             }
-            
+            if !sharedModel.hiddenApps.contains(app) {
+                sharedModel.hiddenApps.append(app)
+            }
+            if !schemes.isEmpty {
+                UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
+                    .removeObjects(in: schemes)
+            }
+        } else {
+            sharedModel.hiddenApps.removeAll { now in
+                return app == now
+            }
+            if !sharedModel.apps.contains(app) {
+                sharedModel.apps.append(app)
+            }
+            if !schemes.isEmpty {
+                UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
+                    .addObjects(from: schemes)
+            }
         }
     }
     
@@ -1014,9 +1025,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         let enableJITTask = Task {
             
             let _ = await LCUtils.askForJIT(withScript: script, appName: appName, classicMode: classicMode) { newMsg in
-                Task { await MainActor.run {
-                    self.jitLog += "\(newMsg)\n"
-                }}
+                self.jitLog += "\(newMsg)\n"
             }
             guard let _ = JITEnablerType(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCJITEnablerType")) else {
                 return
@@ -1043,7 +1052,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                             app.appInfo.urlSchemes().contains("stosdebug") &&
                             (sharedModel.multiLCStatus != 2 || app.appInfo.isShared)
                         }) {
-                            if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)&pid=\(pid)&relaunchApp=false& forcePID=true\(encoded)") {
+                            let safeAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? appName
+                            if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(safeAppName)&pid=\(pid)&relaunchApp=false&forcePID=true\(encoded)") {
                                 Task { await openWebView(urlString: url.absoluteString) }
                             }
                         } else {
@@ -1052,7 +1062,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                             return
                         }
                     } else {
-                        if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)&pid=\(pid)&forcePID=true\(encoded)") {
+                        let safeAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? appName
+                        if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(safeAppName)&pid=\(pid)&forcePID=true\(encoded)") {
                             UIApplication.shared.open(url)
                         }
                     }

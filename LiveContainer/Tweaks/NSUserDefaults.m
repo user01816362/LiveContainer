@@ -46,26 +46,41 @@ void NUDGuestHooksInit(void) {
 #pragma clang diagnostic pop
     
     Class CFXPreferencesClass = NSClassFromString(@"_CFXPreferences");
-    NSMutableDictionary* sources = object_getIvar([CFXPreferencesClass copyDefaultPreferences], class_getInstanceVariable(CFXPreferencesClass, "_sources"));
+    Ivar sourcesIvar = CFXPreferencesClass ? class_getInstanceVariable(CFXPreferencesClass, "_sources") : NULL;
+    id defaultPrefs = CFXPreferencesClass ? [CFXPreferencesClass copyDefaultPreferences] : nil;
+    NSMutableDictionary* sources = (defaultPrefs && sourcesIvar) ? object_getIvar(defaultPrefs, sourcesIvar) : nil;
 
-    [sources removeObjectForKey:@"C/A//B/L"];
-    [sources removeObjectForKey:@"C/C//*/L"];
+    if ([sources isKindOfClass:NSMutableDictionary.class]) {
+        [sources removeObjectForKey:@"C/A//B/L"];
+        [sources removeObjectForKey:@"C/C//*/L"];
+    }
     
     // replace _CFPrefsCurrentAppIdentifierCache so kCFPreferencesCurrentApplication refers to the guest app
     const char* coreFoundationPath = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
     struct mach_header_64* coreFoundationHeader = LCGetLoadedImageHeader(2, coreFoundationPath);
     
 #if !TARGET_OS_SIMULATOR
-    CFStringRef* _CFPrefsCurrentAppIdentifierCache = getCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader);
-    if(!_CFPrefsCurrentAppIdentifierCache) {
+    static NSString *sGuestAppIdentifierCache = nil;
+    CFStringRef* _CFPrefsCurrentAppIdentifierCache = coreFoundationHeader ? getCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader) : NULL;
+    if (!_CFPrefsCurrentAppIdentifierCache && coreFoundationHeader) {
         _CFPrefsCurrentAppIdentifierCache = litehook_find_dsc_symbol(coreFoundationPath, "__CFPrefsCurrentAppIdentifierCache");
-        uint64_t offset = (uint64_t)((void*)_CFPrefsCurrentAppIdentifierCache - (void*)coreFoundationHeader);
-        saveCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader, offset);
+        if (_CFPrefsCurrentAppIdentifierCache) {
+            uint64_t offset = (uint64_t)((uintptr_t)_CFPrefsCurrentAppIdentifierCache - (uintptr_t)coreFoundationHeader);
+            saveCachedSymbol(@"__CFPrefsCurrentAppIdentifierCache", coreFoundationHeader, offset);
+        }
     }
-    if(_CFPrefsCurrentAppIdentifierCache) {
-        NSString *copiedId = CFBridgingRelease(CFStringCreateCopy(nil, *_CFPrefsCurrentAppIdentifierCache));
-        [NSUserDefaults.lcUserDefaults _setIdentifier:copiedId];
-        *_CFPrefsCurrentAppIdentifierCache = (__bridge CFStringRef)NSUserDefaults.lcGuestAppId;
+    if (_CFPrefsCurrentAppIdentifierCache) {
+        CFStringRef currentCachedId = *_CFPrefsCurrentAppIdentifierCache;
+        if (currentCachedId) {
+            NSString *copiedId = CFBridgingRelease(CFStringCreateCopy(nil, currentCachedId));
+            [NSUserDefaults.lcUserDefaults _setIdentifier:copiedId];
+        } else if (NSUserDefaults.lcMainBundle.bundleIdentifier) {
+            [NSUserDefaults.lcUserDefaults _setIdentifier:NSUserDefaults.lcMainBundle.bundleIdentifier];
+        }
+        sGuestAppIdentifierCache = [NSUserDefaults.lcGuestAppId copy];
+        if (sGuestAppIdentifierCache) {
+            *_CFPrefsCurrentAppIdentifierCache = (__bridge CFStringRef)sGuestAppIdentifierCache;
+        }
     }
 #else
     // FIXME: for now we skip overwriting _CFPrefsCurrentAppIdentifierCache on simulator, since there is no way to find private symbol
@@ -76,18 +91,23 @@ void NUDGuestHooksInit(void) {
     NSUserDefaults.standardUserDefaults = newStandardUserDefaults;
 
 #if !TARGET_OS_SIMULATOR
+    static NSMutableArray *sGuestUserLanguages = nil;
     NSString* selectedLanguage = NSUserDefaults.guestAppInfo[@"LCSelectedLanguage"];
     if(selectedLanguage) {
         [newStandardUserDefaults setObject:@[selectedLanguage] forKey:@"AppleLanguages"];
-        CFMutableArrayRef* _CFBundleUserLanguages = getCachedSymbol(@"__CFBundleUserLanguages", coreFoundationHeader);
-        if(!_CFBundleUserLanguages) {
+        CFMutableArrayRef* _CFBundleUserLanguages = coreFoundationHeader ? getCachedSymbol(@"__CFBundleUserLanguages", coreFoundationHeader) : NULL;
+        if (!_CFBundleUserLanguages && coreFoundationHeader) {
             _CFBundleUserLanguages = litehook_find_dsc_symbol(coreFoundationPath, "__CFBundleUserLanguages");
-            uint64_t offset = (uint64_t)((void*)_CFBundleUserLanguages - (void*)coreFoundationHeader);
-            saveCachedSymbol(@"__CFBundleUserLanguages", coreFoundationHeader, offset);
+            if (_CFBundleUserLanguages) {
+                uint64_t offset = (uint64_t)((uintptr_t)_CFBundleUserLanguages - (uintptr_t)coreFoundationHeader);
+                saveCachedSymbol(@"__CFBundleUserLanguages", coreFoundationHeader, offset);
+            }
         }
-        // set _CFBundleUserLanguages to selected languages
-        NSMutableArray* newUserLanguages = [NSMutableArray arrayWithObjects:selectedLanguage, nil];
-        *_CFBundleUserLanguages = (__bridge CFMutableArrayRef)newUserLanguages;
+        // Keep a strong static reference so ARC never releases the array pointed to by _CFBundleUserLanguages
+        if (_CFBundleUserLanguages) {
+            sGuestUserLanguages = [NSMutableArray arrayWithObjects:selectedLanguage, nil];
+            *_CFBundleUserLanguages = (__bridge CFMutableArrayRef)sGuestUserLanguages;
+        }
     } else {
         [newStandardUserDefaults removeObjectForKey:@"AppleLanguages"];
     }

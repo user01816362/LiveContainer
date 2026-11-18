@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import os
 import SwiftUI
 import UIKit
 
@@ -21,7 +22,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
     fileprivate let delegate: LCAppBannerDelegate
     private let bannerView = LCAppBannerRootView()
     private(set) var configuration: LCAppBannerConfiguration
-    private var exportTemporaryDirectory: URL?
+    private let exportTemporaryDirectoryLock = OSAllocatedUnfairLock<URL?>(initialState: nil)
 
     init(delegate: LCAppBannerDelegate, config: LCAppBannerConfiguration) {
         self.delegate = delegate
@@ -427,7 +428,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             let displayName = rawDisplayName.replacingOccurrences(of: "/", with: "_")
             let fileURL = temporaryDirectory.appendingPathComponent("\(displayName) Icon.png")
             try imageData.write(to: fileURL, options: .atomic)
-            exportTemporaryDirectory = temporaryDirectory
+            exportTemporaryDirectoryLock.withLock { $0 = temporaryDirectory }
 
             guard viewIfLoaded?.window != nil, presentedViewController == nil else {
                 cleanupExportTemporaryDirectory()
@@ -456,11 +457,15 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         cleanupExportTemporaryDirectory()
     }
 
-    private func cleanupExportTemporaryDirectory() {
-        guard let exportTemporaryDirectory else {
+    nonisolated private func cleanupExportTemporaryDirectory() {
+        let directory = exportTemporaryDirectoryLock.withLock { dir -> URL? in
+            let current = dir
+            dir = nil
+            return current
+        }
+        guard let directory else {
             return
         }
-        try? FileManager.default.removeItem(at: exportTemporaryDirectory)
-        self.exportTemporaryDirectory = nil
+        try? FileManager.default.removeItem(at: directory)
     }
 }

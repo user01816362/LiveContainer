@@ -14,16 +14,19 @@ final class ShareExtensionViewModel: ObservableObject {
 
     var allApps: [ShareApp] = []
     var sharedDefaults: UserDefaults?
-    var privateDocURL: URL?
-    var privateDocAccessing = false
+    let privateDocURL: URL?
+    let privateDocAccessing: Bool
     var appGroupRootURL: URL?
     weak var currentContext: NSExtensionContext?
+    private var loadTask: Task<Void, Never>?
 
     init() {
-        sharedDefaults = UserDefaults(suiteName: LCSharedUtils.appGroupID())
-        appGroupRootURL = LCSharedUtils.appGroupPath()?.appendingPathComponent("LiveContainer")
-        privateDocURL = Self.resolvePrivateDocURL(sharedDefaults: sharedDefaults)
-        privateDocAccessing = privateDocURL != nil
+        let defaults = UserDefaults(suiteName: LCSharedUtils.appGroupID())
+        let resolvedPrivateDocURL = Self.resolvePrivateDocURL(sharedDefaults: defaults)
+        self.sharedDefaults = defaults
+        self.appGroupRootURL = LCSharedUtils.appGroupPath()?.appendingPathComponent("LiveContainer")
+        self.privateDocURL = resolvedPrivateDocURL
+        self.privateDocAccessing = resolvedPrivateDocURL != nil
         reloadApps()
     }
 
@@ -37,23 +40,22 @@ final class ShareExtensionViewModel: ObservableObject {
         if let context {
             currentContext = context
         }
-        Task {
+        let targetContext = context ?? currentContext
+        loadTask?.cancel()
+        loadTask = Task { @MainActor in
             do {
-                let loaded = try await SharePayload.load(from: context)
-                await MainActor.run {
-                    self.payload.kind = loaded
-                }
-                if let url = await MainActor.run(body: { self.payload.sharedURL }) {
+                let loaded = try await SharePayload.load(from: targetContext)
+                guard !Task.isCancelled else { return }
+                self.payload.kind = loaded
+                if let url = self.payload.sharedURL {
                     await refreshRecommendation(for: url)
                 } else {
-                    await MainActor.run {
-                        self.recommendedBundleIDs = []
-                    }
+                    self.recommendedBundleIDs = []
                 }
+            } catch is CancellationError {
+                return
             } catch {
-                await MainActor.run {
-                    self.payload.kind = .failed(error.localizedDescription)
-                }
+                self.payload.kind = .failed(error.localizedDescription)
             }
         }
     }
@@ -120,9 +122,7 @@ final class ShareExtensionViewModel: ObservableObject {
             return
         }
         let bundleIDs = await AssociatedDomainResolver.bundleIDs(for: host)
-        await MainActor.run {
-            self.recommendedBundleIDs = bundleIDs
-        }
+        self.recommendedBundleIDs = bundleIDs
     }
 
     static func authenticateUser() async throws -> Bool {
@@ -572,7 +572,7 @@ final class ShareExtensionViewModel: ObservableObject {
     }
 
     private func firstFreeInstalledLC() -> String? {
-        for scheme in LCSharedUtils.lcUrlSchemes() {
+        for scheme in LCSharedUtils.lcUrlSchemes() ?? [] {
             guard
                 let url = URL(string: "\(scheme)://"),
                 LCShareExtensionLauncher.canOpenURL(fromShareExtension: url)

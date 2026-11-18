@@ -55,7 +55,7 @@
     return nil;
 }
 
-+ (void)launchMultitaskGuestApp:(NSString *)displayName completionHandler:(void (^)(NSNumber *pid, NSError *error))completionHandler {
++ (void)launchMultitaskGuestApp:(nonnull NSString *)displayName completionHandler:(void (^ _Nullable)(NSNumber * _Nullable pid, NSError * _Nullable error))completionHandler {
     if(!self.liveProcessBundleIdentifier) {
         NSError *error = [NSError errorWithDomain:displayName code:2 userInfo:@{NSLocalizedDescriptionKey: @"LiveProcess extension not found. Please reinstall LiveContainer and select Keep Extensions"}];
         if (completionHandler) completionHandler(nil, error);
@@ -125,7 +125,7 @@
     }
 }
 
-+ (NSProgress *)signAppBundleWithZSign:(NSURL *)path completionHandler:(void (^)(BOOL success, NSError *error))completionHandler {
++ (nullable NSProgress *)signAppBundleWithZSign:(nonnull NSURL *)path completionHandler:(void (^)(BOOL success, NSError * _Nullable error))completionHandler {
     NSError *error;
 
     // use zsign as our signer~
@@ -144,7 +144,7 @@
     return ans;
 }
 
-+ (NSProgress *)signFilesWithZSignWithURLs:(NSArray<NSURL*>*)urls completionHandler:(void (^)(BOOL success, NSError *error))completionHandler {
++ (nullable NSProgress *)signFilesWithZSignWithURLs:(nonnull NSArray<NSURL*>*)urls completionHandler:(void (^)(BOOL success, NSError * _Nullable error))completionHandler {
     NSError *error;
     [self loadStoreFrameworksWithError2:&error];
     if (error) {
@@ -160,7 +160,7 @@
                                                       pass:LCSharedUtils.certificatePassword completionHandler:completionHandler];
 }
 
-+ (NSString*)getCertTeamIdWithKeyData:(NSData*)keyData password:(NSString*)password {
++ (nullable NSString*)getCertTeamIdWithKeyData:(nonnull NSData*)keyData password:(nullable NSString*)password {
     NSError *error;
     [self loadStoreFrameworksWithError2:&error];
     if (error) {
@@ -170,13 +170,16 @@
     return ans;
 }
 
-+ (int)validateCertificateWithCompletionHandler:(void(^)(int status, NSDate *expirationDate, NSString *organizationalUnitName, NSString *error))completionHandler {
-    NSError *error;
++ (int)validateCertificateWithCompletionHandler:(void(^)(int status, NSDate * _Nullable expirationDate, NSString * _Nullable organizationalUnitName, NSString * _Nullable error))completionHandler {
+    NSError *error = nil;
     NSData *certData = [LCUtils certificateData];
+    [self loadStoreFrameworksWithError2:&error];
     if (error) {
+        if (completionHandler) {
+            completionHandler(2, nil, nil, error.localizedDescription);
+        }
         return -6;
     }
-    [self loadStoreFrameworksWithError2:&error];
     int ans = [NSClassFromString(@"ZSigner") checkCert:certData pass:[LCSharedUtils certificatePassword] completionHandler:completionHandler];
     return ans;
 }
@@ -252,43 +255,37 @@
     [infoDict writeToURL:infoPath error:error];
 }
 
-+ (void)validateJITLessSetupWithCompletionHandler:(void (^)(BOOL success, NSError *error))completionHandler {
++ (void)validateJITLessSetupWithCompletionHandler:(void (^)(BOOL success, NSError * _Nullable error))completionHandler {
     // Verify that the certificate is usable
     // Create a test app bundle
     NSString *path = NSTemporaryDirectory();
     [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *tmpLibPath = [path stringByAppendingPathComponent:@"TestJITLess.dylib"];
+    [NSFileManager.defaultManager removeItemAtPath:tmpLibPath error:nil];
     [NSFileManager.defaultManager copyItemAtPath:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/TestJITLess.dylib"] toPath:tmpLibPath error:nil];
 
-    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-    __block bool signSuccess = false;
-    __block NSError* signError = nil;
-    
-    // Sign the test app bundle
-
+    // Sign the test dylib asynchronously without blocking the calling thread
     [LCUtils signFilesWithZSignWithURLs:@[[NSURL fileURLWithPath:tmpLibPath]]
-                  completionHandler:^(BOOL success, NSError *_Nullable error) {
-        signSuccess = success;
-        signError = error;
-        dispatch_semaphore_signal(sema);
-    }];
-
-    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if(!signSuccess) {
-            completionHandler(NO, signError);
-        } else if (checkCodeSignature([tmpLibPath UTF8String])) {
-            completionHandler(YES, signError);
-        } else {
-            completionHandler(NO, [NSError errorWithDomain:NSBundle.mainBundle.bundleIdentifier code:2 userInfo:@{NSLocalizedDescriptionKey: @"lc.signer.latestCertificateInvalidErr"}]);
-        }
+                  completionHandler:^(BOOL success, NSError * _Nullable error) {
+        BOOL signatureValid = success && checkCodeSignature([tmpLibPath UTF8String]);
         [NSFileManager.defaultManager removeItemAtPath:tmpLibPath error:nil];
-    });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!completionHandler) {
+                return;
+            }
+            if (!success) {
+                completionHandler(NO, error);
+            } else if (signatureValid) {
+                completionHandler(YES, error);
+            } else {
+                completionHandler(NO, [NSError errorWithDomain:NSBundle.mainBundle.bundleIdentifier code:2 userInfo:@{NSLocalizedDescriptionKey: @"lc.signer.latestCertificateInvalidErr"}]);
+            }
+        });
+    }];
 }
 
-+ (NSURL *)archiveIPAWithBundleName:(NSString*)newBundleName includingExtraInfoDict:(NSDictionary *)extraInfoDict error:(NSError **)error {
-    if (*error) return nil;
++ (nullable NSURL *)archiveIPAWithBundleName:(nonnull NSString*)newBundleName includingExtraInfoDict:(nullable NSDictionary *)extraInfoDict error:(NSError * _Nullable * _Nullable)error {
+    if (error && *error) return nil;
 
     NSFileManager *manager = NSFileManager.defaultManager;
     NSURL *bundlePath = NSBundle.mainBundle.bundleURL;

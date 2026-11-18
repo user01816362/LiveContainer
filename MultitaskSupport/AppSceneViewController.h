@@ -12,33 +12,33 @@
 
 @class AppSceneViewController;
 
+NS_SWIFT_UI_ACTOR
 @protocol AppSceneViewControllerDelegate <NSObject>
-- (void)appSceneVCAppDidExit:(AppSceneViewController*)vc;
-- (void)appSceneVC:(AppSceneViewController*)vc didInitializeWithError:(NSError*)error;
+- (void)appSceneVCAppDidExit:(nonnull AppSceneViewController*)vc;
+- (void)appSceneVC:(nonnull AppSceneViewController*)vc didInitializeWithError:(nullable NSError*)error;
 @optional
-- (void)appSceneVC:(AppSceneViewController*)vc didUpdateFromSettings:(UIMutableApplicationSceneSettings *)settings transitionContext:(id)context lifecycleActionType:(uint32_t)actionType;
-- (void)appSceneVCWillActivateScene:(AppSceneViewController *)vc;
+- (void)appSceneVC:(nonnull AppSceneViewController*)vc didUpdateFromSettings:(nonnull UIMutableApplicationSceneSettings *)settings transitionContext:(nullable id)context lifecycleActionType:(uint32_t)actionType;
+- (void)appSceneVCWillActivateScene:(nonnull AppSceneViewController *)vc;
 @end
 
 @interface AppSceneViewController : UIViewController<_UISceneSettingsDiffAction>
-@property(nonatomic) NSString* bundleId;
-@property(nonatomic) NSString* dataUUID;
+@property(nonatomic, null_unspecified) NSString* bundleId;
+@property(nonatomic, null_unspecified) NSString* dataUUID;
 @property(nonatomic) int pid;
-@property(nonatomic) id<AppSceneViewControllerDelegate> delegate;
+@property(nonatomic, null_unspecified) id<AppSceneViewControllerDelegate> delegate;
 @property(nonatomic) BOOL isAppRunning;
 @property(nonatomic) BOOL shouldIgnoreSceneUpdates, shouldSkipDebounceOnce;
 @property(nonatomic) CGFloat scaleRatio;
-@property(nonatomic) UIView* contentView;
-@property(nonatomic) _UIScenePresenter *presenter;
-@property(nonatomic) _UISceneHostingController *hostingController;
-- (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID delegate:(id<AppSceneViewControllerDelegate>)delegate;
+@property(nonatomic, null_unspecified) UIView* contentView;
+@property(nonatomic, null_unspecified) _UIScenePresenter *presenter;
+@property(nonatomic, null_unspecified) _UISceneHostingController *hostingController;
+- (instancetype _Null_unspecified)initWithBundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID delegate:(id<AppSceneViewControllerDelegate> _Null_unspecified)delegate;
 - (void)setBackgroundNotificationEnabled:(bool)enabled;
-- (void)updateFrameWithSettingsBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block;
-- (void)updateSettingsWithBlock:(void(^)(UIMutableApplicationSceneSettings *settings))block;
+- (void)updateFrameWithSettingsBlock:(void (^ _Null_unspecified)(UIMutableApplicationSceneSettings * _Null_unspecified settings))block;
+- (void)updateSettingsWithBlock:(void (^ _Null_unspecified)(UIMutableApplicationSceneSettings * _Null_unspecified settings))block;
 - (void)appTerminationCleanUp;
 - (void)terminate;
-- (void)openURLScheme:(NSString *)urlString;
-- (void)handleStatusBarTapAction:(UIAction *)action;
-- (BOOL)usesHostingControllerAPI;
+- (void)openURLScheme:(NSString * _Null_unspecified)urlString;
+- (void)handleStatusBarTapAction:(nonnull UIAction *)action;
 @end
 

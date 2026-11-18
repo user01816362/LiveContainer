@@ -11,13 +11,13 @@ import UIKit
 import Combine
 
 // MARK: - App Info Provider
-class AppInfoProvider {
+@MainActor
+final class AppInfoProvider {
     
     static let shared = AppInfoProvider()
     
     private var infoCacheByUUID = [String: LCAppInfo]()
     private var infoCacheByName = [String: LCAppInfo]()
-    private let cacheQueue = DispatchQueue(label: "com.livecontainer.appinfoprovider.cachequeue", attributes: .concurrent)
     
     private init() {}
     
@@ -32,7 +32,7 @@ class AppInfoProvider {
     }
     
     public func findAppInfo(byUUID dataUUID: String) -> LCAppInfo? {
-        if let cachedInfo = cacheQueue.sync(execute: { infoCacheByUUID[dataUUID] }) {
+        if let cachedInfo = infoCacheByUUID[dataUUID] {
             return cachedInfo
         }
         
@@ -49,8 +49,7 @@ class AppInfoProvider {
                let appInfoDict = NSDictionary(contentsOfFile: path),
                let bundlePath = appInfoDict["bundlePath"] as? String,
                let appInfo = LCAppInfo(bundlePath: bundlePath) {
-                
-                cacheQueue.async(flags: .barrier) { self.infoCacheByUUID[dataUUID] = appInfo }
+                infoCacheByUUID[dataUUID] = appInfo
                 return appInfo
             }
         }
@@ -58,7 +57,7 @@ class AppInfoProvider {
     }
 
     public func findAppInfo(byName appName: String) -> LCAppInfo? {
-        if let cachedInfo = cacheQueue.sync(execute: { infoCacheByName[appName] }) {
+        if let cachedInfo = infoCacheByName[appName] {
             return cachedInfo
         }
 
@@ -75,7 +74,7 @@ class AppInfoProvider {
             
             for appDir in appDirs where appDir.hasSuffix(".app") {
                 if let appInfo = LCAppInfo(bundlePath: "\(appsPath)/\(appDir)"), appInfo.displayName() == appName {
-                    cacheQueue.async(flags: .barrier) { self.infoCacheByName[appName] = appInfo }
+                    infoCacheByName[appName] = appInfo
                     return appInfo
                 }
             }
@@ -101,15 +100,13 @@ class AppInfoProvider {
     }
     
     public func clearCache() {
-        cacheQueue.async(flags: .barrier) {
-            self.infoCacheByUUID.removeAll()
-            self.infoCacheByName.removeAll()
-        }
+        infoCacheByUUID.removeAll()
+        infoCacheByName.removeAll()
     }
 }
 
 // MARK: - App Model for Dock
-@objc class DockAppModel: NSObject, ObservableObject, Identifiable {
+@MainActor @objc final class DockAppModel: NSObject, ObservableObject, Identifiable {
     let id = UUID()
     @objc let appName: String
     @objc let appUUID: String
@@ -126,7 +123,7 @@ class AppInfoProvider {
 }
 
 // MARK: - MultitaskDockView Manager
-@objc public class MultitaskDockManager: NSObject, ObservableObject {
+@MainActor @objc public final class MultitaskDockManager: NSObject, ObservableObject {
     @objc public static let shared = MultitaskDockManager()
     
     @Published var apps: [DockAppModel] = []
@@ -308,16 +305,16 @@ class AppInfoProvider {
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
     }
 
-    @objc private func deviceOrientationDidChange() {
-        DispatchQueue.main.async {
-            if self.isVisible {
-                self.updateDockFrame()
-            }
+    @objc nonisolated private func deviceOrientationDidChange() {
+        Task { @MainActor [weak self] in
+            guard let self, self.isVisible else { return }
+            self.updateDockFrame()
         }
     }
     
-    @objc private func userDefaultsDidChange() {
-        DispatchQueue.main.async {
+    @objc nonisolated private func userDefaultsDidChange() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             self.settingsChanged.toggle()
             if self.isVisible {
                 self.updateDockFrame()
@@ -326,14 +323,12 @@ class AppInfoProvider {
     }
     
     private func setupDockView() {
-        DispatchQueue.main.async {
-            let dockView = AnyView(MultitaskDockSwiftView()
-                .environmentObject(self))
-            
-            self.hostingController = UIHostingController(rootView: dockView)
-            self.hostingController?.view.autoresizingMask = [.flexibleTopMargin, .flexibleLeftMargin, .flexibleRightMargin, .flexibleBottomMargin]
-            self.hostingController?.view.backgroundColor = .clear
-        }
+        let dockView = AnyView(MultitaskDockSwiftView()
+            .environmentObject(self))
+        
+        self.hostingController = UIHostingController(rootView: dockView)
+        self.hostingController?.view.autoresizingMask = [.flexibleTopMargin, .flexibleLeftMargin, .flexibleRightMargin, .flexibleBottomMargin]
+        self.hostingController?.view.backgroundColor = .clear
     }
 
     private func updateDockFrame(animated: Bool = true) {
@@ -435,14 +430,12 @@ class AppInfoProvider {
     @objc public func removeRunningApp(_ appUUID: String) {
         guard isDockEnabled() else { return }
         
-        DispatchQueue.main.async {
-            self.apps.removeAll { $0.appUUID == appUUID }
-            
-            if self.apps.isEmpty {
-                self.hideDock()
-            } else if self.isVisible {
-                self.updateDockFrame()
-            }
+        self.apps.removeAll { $0.appUUID == appUUID }
+        
+        if self.apps.isEmpty {
+            self.hideDock()
+        } else if self.isVisible {
+            self.updateDockFrame()
         }
     }
     
@@ -452,69 +445,65 @@ class AppInfoProvider {
         
         guard let keyWindow = self.keyWindow else { return }
         
-        DispatchQueue.main.async {
-            self.isVisible = true
-            
-            let screenBounds = keyWindow.bounds
-            let currentDockWidth = self.dockWidth
-            let initialHeight = Constants.initialDockShowHeight
-            
-            // If not already in view hierarchy, add it
-            if hostingController.view.superview == nil {
-                keyWindow.addSubview(hostingController.view)
-                hostingController.view.frame = CGRect(
-                    x: screenBounds.width - currentDockWidth,
-                    y: (screenBounds.height - initialHeight) / 2,
-                    width: currentDockWidth,
-                    height: initialHeight
-                )
-            }
-            
-            self.updateDockFrame(animated: false) 
-            
-            self.setupEdgeGestureRecognizers()
-            
-            hostingController.view.alpha = 0
-            let initialScale = Constants.initialScale
-            hostingController.view.transform = CGAffineTransform(scaleX: initialScale, y: initialScale)
-            
-            UIView.animate(
-                withDuration: Constants.standardAnimationDuration,
-                delay: 0,
-                usingSpringWithDamping: Constants.showHideSpringDamping,
-                initialSpringVelocity: Constants.showHideSpringVelocity,
-                options: .curveEaseOut
-            ) {
-                hostingController.view.alpha = 1
-                hostingController.view.transform = .identity
-            }
+        self.isVisible = true
+        
+        let screenBounds = keyWindow.bounds
+        let currentDockWidth = self.dockWidth
+        let initialHeight = Constants.initialDockShowHeight
+        
+        // If not already in view hierarchy, add it
+        if hostingController.view.superview == nil {
+            keyWindow.addSubview(hostingController.view)
+            hostingController.view.frame = CGRect(
+                x: screenBounds.width - currentDockWidth,
+                y: (screenBounds.height - initialHeight) / 2,
+                width: currentDockWidth,
+                height: initialHeight
+            )
+        }
+        
+        self.updateDockFrame(animated: false) 
+        
+        self.setupEdgeGestureRecognizers()
+        
+        hostingController.view.alpha = 0
+        let initialScale = Constants.initialScale
+        hostingController.view.transform = CGAffineTransform(scaleX: initialScale, y: initialScale)
+        
+        UIView.animate(
+            withDuration: Constants.standardAnimationDuration,
+            delay: 0,
+            usingSpringWithDamping: Constants.showHideSpringDamping,
+            initialSpringVelocity: Constants.showHideSpringVelocity,
+            options: .curveEaseOut
+        ) {
+            hostingController.view.alpha = 1
+            hostingController.view.transform = .identity
         }
     }
     
     @objc public func hideDock() {
         guard isVisible, let hostingController = hostingController else { return }
         
-        DispatchQueue.main.async {
-            UIView.animate(
-                withDuration: Constants.standardAnimationDuration,
-                delay: 0,
-                usingSpringWithDamping: Constants.showHideSpringDamping,
-                initialSpringVelocity: Constants.showHideSpringVelocity,
-                options: .curveEaseOut
-            ) {
-                hostingController.view.alpha = 0
-                let finalScale = Constants.initialScale
-                hostingController.view.transform = CGAffineTransform(scaleX: finalScale, y: finalScale)
-                // Move off-screen to hide, but keep in view hierarchy
-                let screenBounds = self.keyWindow?.bounds ?? .zero
-                let currentDockWidth = self.dockWidth
-                let targetX = self.calculateTargetX(isDockHidden: true, isOnRightSide: hostingController.view.frame.midX > screenBounds.width / 2, dockWidth: currentDockWidth, screenWidth: screenBounds.width)
-                let targetY = hostingController.view.frame.origin.y // Keep current Y
-                hostingController.view.frame.origin = CGPoint(x: targetX, y: targetY)
-            } completion: { _ in
-                self.isVisible = false
-                hostingController.view.transform = .identity
-            }
+        UIView.animate(
+            withDuration: Constants.standardAnimationDuration,
+            delay: 0,
+            usingSpringWithDamping: Constants.showHideSpringDamping,
+            initialSpringVelocity: Constants.showHideSpringVelocity,
+            options: .curveEaseOut
+        ) {
+            hostingController.view.alpha = 0
+            let finalScale = Constants.initialScale
+            hostingController.view.transform = CGAffineTransform(scaleX: finalScale, y: finalScale)
+            // Move off-screen to hide, but keep in view hierarchy
+            let screenBounds = self.keyWindow?.bounds ?? .zero
+            let currentDockWidth = self.dockWidth
+            let targetX = self.calculateTargetX(isDockHidden: true, isOnRightSide: hostingController.view.frame.midX > screenBounds.width / 2, dockWidth: currentDockWidth, screenWidth: screenBounds.width)
+            let targetY = hostingController.view.frame.origin.y // Keep current Y
+            hostingController.view.frame.origin = CGPoint(x: targetX, y: targetY)
+        } completion: { _ in
+            self.isVisible = false
+            hostingController.view.transform = .identity
         }
     }
 
@@ -704,35 +693,29 @@ class AppInfoProvider {
         let appName = appInfo?.displayName() ?? "Unknown App"
         let appModel = DockAppModel(appName: appName, appUUID: appUUID, appInfo: appInfo, view: view)
         
-        DispatchQueue.main.async {
-            self.apps.append(appModel)
-            
-            if self.apps.count == 1 {
-                self.showDock()
-            } else if self.isVisible {
-                self.updateDockFrame()
-            }
+        self.apps.append(appModel)
+        
+        if self.apps.count == 1 {
+            self.showDock()
+        } else if self.isVisible {
+            self.updateDockFrame()
         }
     }
     
     @objc public func minimizeAllWindows(except: DecoratedAppSceneViewController? = nil) {
-        DispatchQueue.main.async {
-            self.apps.forEach { app in
-                if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController,
-                   vc != except {
-                    app.view?.layer.removeAllAnimations()
-                    vc.minimizeWindow()
-                }
+        self.apps.forEach { app in
+            if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController,
+               vc != except {
+                app.view?.layer.removeAllAnimations()
+                vc.minimizeWindow()
             }
         }
     }
     
     @objc public func toggleDockCollapse() {
-        DispatchQueue.main.async {
-            self.isCollapsed.toggle()
-            self.updateDockFrame()
-            self.notifyDockCollapseChanged()
-        }
+        self.isCollapsed.toggle()
+        self.updateDockFrame()
+        self.notifyDockCollapseChanged()
     }
     
     @objc public func notifyDockCollapseChanged() {
@@ -747,26 +730,20 @@ class AppInfoProvider {
     
     // Toggle dock hide/show state
     @objc public func toggleDockVisibility() {
-        DispatchQueue.main.async {
-            self.isDockHidden.toggle()
-            self.updateDockFrame()
-        }
+        self.isDockHidden.toggle()
+        self.updateDockFrame()
     }
     
     @objc public func showDockFromHidden() {
-        DispatchQueue.main.async {
-            self.isDockHidden = false
-            self.updateDockFrame()
-            self.setupEdgeGestureRecognizers()
-        }
+        self.isDockHidden = false
+        self.updateDockFrame()
+        self.setupEdgeGestureRecognizers()
     }
     
     @objc public func hideDockToSide() {
-        DispatchQueue.main.async {
-            self.isDockHidden = true
-            self.updateDockFrame()
-            self.setupEdgeGestureRecognizers()
-        }
+        self.isDockHidden = true
+        self.updateDockFrame()
+        self.setupEdgeGestureRecognizers()
     }
     
     // Add edge gesture recognition areas when dock is hidden
@@ -812,6 +789,7 @@ class AppInfoProvider {
 // MARK: - SwiftUI Dock View
 public struct MultitaskDockSwiftView: View {
     @EnvironmentObject var dockManager: MultitaskDockManager
+    @Namespace private var dockGlassNamespace
     @State private var dragOffset = CGSize.zero
     @State private var isMoving: Bool = false
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
@@ -825,9 +803,11 @@ public struct MultitaskDockSwiftView: View {
     
     public var body: some View {
         GeometryReader { g in
-            VStack(spacing: 8) {
+            let containerRadius = (dockManager.adaptiveIconSize * 0.2667) + dynamicPadding
+            GlassEffectContainer(spacing: 8) {
                 if dockManager.isCollapsed {
                     CollapsedDockView(isHidden: dockManager.isDockHidden)
+                        .glassEffectID("multitaskDockSurface", in: dockGlassNamespace)
                         .onTapGesture {
                             dockManager.toggleDockCollapse()
                         }
@@ -847,10 +827,11 @@ public struct MultitaskDockSwiftView: View {
                             AppIconView(app: app)
                         }
                     }
+                    .padding(dynamicPadding)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: containerRadius, style: .continuous))
+                    .glassEffectID("multitaskDockSurface", in: dockGlassNamespace)
                 }
             }
-            .padding(dynamicPadding)
-            .glassEffect(.regular, in: .rect(cornerRadius: 15))
             .scaleEffect(dockManager.isVisible ? 1.0 : 0.8)
             .opacity(dockManager.isDockHidden ? (hideCollapsedDock && dockManager.isCollapsed ? 0.01 : 0.4) : 1.0)
             .offset(dragOffset)
@@ -896,7 +877,8 @@ public struct MultitaskDockSwiftView: View {
                         self.dragOffset = newOffset
                     }
                     
-                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(animationDuration))
                         dockManager.updateFrameAfterAnimation(finalOffset: newOffset)
                         
                         self.dragOffset = .zero
@@ -910,7 +892,8 @@ public struct MultitaskDockSwiftView: View {
                     withAnimation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping)) {
                         self.dragOffset = .zero
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + MultitaskDockManager.Constants.longAnimationDuration) {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(MultitaskDockManager.Constants.longAnimationDuration))
                         self.isMoving = false
                     }
                     return
@@ -947,7 +930,8 @@ public struct MultitaskDockSwiftView: View {
                     self.dragOffset = newOffset
                 }
                 
-                DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(animationDuration))
                     dockManager.updateFrameAfterAnimation(finalOffset: newOffset)
                     
                     self.dragOffset = .zero
@@ -971,41 +955,18 @@ struct CollapsedDockView: View {
     @EnvironmentObject var dockManager: MultitaskDockManager
     
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(
-                    LinearGradient(
-                        gradient: Gradient(colors: [
-                            Color.blue.opacity(isHidden ? 0.4 : 0.8),
-                            Color.blue.opacity(isHidden ? 0.3 : 0.6)
-                        ]),
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(width: dockManager.adaptiveIconSize, height: dockManager.adaptiveIconSize)
-            
-            Group {
-                if isHidden {
-                    Image(systemName: "eye.slash")
-                        .foregroundColor(.white.opacity(0.8))
-                        .font(.system(size: dockManager.adaptiveIconSize * 0.35, weight: .bold))
-                } else {
-                    Image(systemName: "chevron.up")
-                        .foregroundColor(.white)
-                        .font(.system(size: dockManager.adaptiveIconSize * 0.4, weight: .bold))
-                }
-            }
-            .shadow(color: .black.opacity(0.3), radius: 1, x: 0, y: 1)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.white.opacity(isHidden ? 0.2 : 0.3), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.3), radius: 3, x: 0, y: 2)
-        .scaleEffect(isHidden ? 0.9 : 1.0)
-        .animation(.easeInOut(duration: 0.2), value: isHidden)
-        .animation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.adaptiveIconSize)
+        let buttonSize = max(44, dockManager.adaptiveIconSize)
+        Image(systemName: isHidden ? "eye.slash" : "chevron.up")
+            .font(.system(size: buttonSize * 0.38, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(isHidden ? .secondary : .primary)
+            .contentTransition(.symbolEffect(.replace))
+            .frame(width: buttonSize, height: buttonSize)
+            .contentShape(Circle())
+            .glassEffect(.regular.interactive(), in: Circle())
+            .scaleEffect(isHidden ? 0.92 : 1.0)
+            .animation(.easeInOut(duration: 0.2), value: isHidden)
+            .animation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.adaptiveIconSize)
     }
 }
 
@@ -1014,20 +975,15 @@ struct CollapseButtonView: View {
     @EnvironmentObject var dockManager: MultitaskDockManager
     
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8)  
-                .fill(Color.gray.opacity(0.8))
-                .frame(width: dockManager.adaptiveIconSize, height: dockManager.adaptiveIconSize)
-            
-            Image(systemName: "chevron.down")
-                .foregroundColor(.white)
-                .font(.system(size: dockManager.adaptiveIconSize * 0.4, weight: .semibold))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)  
-                .stroke(Color.white.opacity(0.2), lineWidth: 1)
-        }
-        .animation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.adaptiveIconSize)
+        let radius = dockManager.adaptiveIconSize * 0.2667
+        Image(systemName: "chevron.down")
+            .font(.system(size: dockManager.adaptiveIconSize * 0.4, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(.primary)
+            .frame(width: dockManager.adaptiveIconSize, height: dockManager.adaptiveIconSize)
+            .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .animation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.adaptiveIconSize)
     }
 }
 
@@ -1036,46 +992,35 @@ struct MinimizeAllButtonView: View {
     @EnvironmentObject var dockManager: MultitaskDockManager
     
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.gray.opacity(0.8))
-                .frame(width: dockManager.adaptiveIconSize, height: dockManager.adaptiveIconSize)
-            
-            Image(systemName: "rectangle.stack.badge.minus")
-                .foregroundColor(.white)
-                .font(.system(size: dockManager.adaptiveIconSize * 0.4, weight: .semibold))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.white.opacity(0.2), lineWidth: 1)
-        }
+        let radius = dockManager.adaptiveIconSize * 0.2667
+        Image(systemName: "rectangle.stack.badge.minus")
+            .font(.system(size: dockManager.adaptiveIconSize * 0.4, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(.primary)
+            .frame(width: dockManager.adaptiveIconSize, height: dockManager.adaptiveIconSize)
+            .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
     }
 }
 
 // MARK: - Icon Cache Manager
-class IconCacheManager {
+@MainActor
+final class IconCacheManager {
     static let shared = IconCacheManager()
-    private var cache: [String: UIImage] = [:]
-    private let cacheQueue = DispatchQueue(label: "icon.cache.queue", attributes: .concurrent)
+    private let cache = NSCache<NSString, UIImage>()
     
     private init() {}
     
     func getIcon(for key: String) -> UIImage? {
-        return cacheQueue.sync {
-            return cache[key]
-        }
+        cache.object(forKey: key as NSString)
     }
     
     func setIcon(_ icon: UIImage, for key: String) {
-        cacheQueue.async(flags: .barrier) {
-            self.cache[key] = icon
-        }
+        cache.setObject(icon, forKey: key as NSString)
     }
     
     func clearCache() {
-        cacheQueue.async(flags: .barrier) {
-            self.cache.removeAll()
-        }
+        cache.removeAllObjects()
     }
 }
 // MARK: - App Icon View
@@ -1133,24 +1078,17 @@ struct AppIconView: View {
             return
         }
         
-        DispatchQueue.global(qos: .userInitiated).async {
-            var finalIcon: UIImage?
-            
-            if let appInfo = self.app.appInfo {
-                finalIcon = appInfo.iconIsDarkIcon(darkModeIcon)
-            } else {
-                if let foundAppInfo = AppInfoProvider.shared.findAppInfo(appName: self.app.appName, dataUUID: self.app.appUUID) {
-                    finalIcon = foundAppInfo.iconIsDarkIcon(darkModeIcon)
-                }
-            }
-            
-            DispatchQueue.main.async {
-                self.isLoading = false
-                if let icon = finalIcon {
-                    self.appIcon = icon
-                    IconCacheManager.shared.setIcon(icon, for: cacheKey)
-                }
-            }
+        var finalIcon: UIImage?
+        if let appInfo = self.app.appInfo {
+            finalIcon = appInfo.iconIsDarkIcon(darkModeIcon)
+        } else if let foundAppInfo = AppInfoProvider.shared.findAppInfo(appName: self.app.appName, dataUUID: self.app.appUUID) {
+            finalIcon = foundAppInfo.iconIsDarkIcon(darkModeIcon)
+        }
+        
+        self.isLoading = false
+        if let icon = finalIcon {
+            self.appIcon = icon
+            IconCacheManager.shared.setIcon(icon, for: cacheKey)
         }
     }
 }
@@ -1180,7 +1118,8 @@ struct LoadingIconView: View {
                 .fill(Color.gray.opacity(0.3))
             
             ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                .progressViewStyle(.circular)
+                .tint(.white)
                 .scaleEffect(1.2)
         }
     }

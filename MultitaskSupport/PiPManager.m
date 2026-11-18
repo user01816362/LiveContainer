@@ -74,15 +74,10 @@ static PiPManager* sharedInstance = nil;
         self.displayingVC = vc;
         self.pipVideoCallViewController = [AVPictureInPictureVideoCallViewController new];
         self.pipVideoCallViewController.preferredContentSize = vc.view.bounds.size;
-        if(vc.usesHostingControllerAPI) {
-            self.pipVideoCallContentView = [[UIView alloc] initWithFrame:self.pipVideoCallViewController.view.bounds];
-            //self.pipVideoCallContentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            self.pipVideoCallContentView.layer.anchorPoint = CGPointMake(0, 0);
-            self.pipVideoCallContentView.layer.position = CGPointMake(0, 0);
-            [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];
-        } else {
-            self.pipVideoCallContentView = vc.contentView;
-        }
+        self.pipVideoCallContentView = [[UIView alloc] initWithFrame:self.pipVideoCallViewController.view.bounds];
+        self.pipVideoCallContentView.layer.anchorPoint = CGPointMake(0, 0);
+        self.pipVideoCallContentView.layer.position = CGPointMake(0, 0);
+        [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];
         AVPictureInPictureControllerContentSource* contentSource =  [[AVPictureInPictureControllerContentSource alloc] initWithActiveVideoCallSourceView:vc.view contentViewController:self.pipVideoCallViewController];
         self.pipController = [[AVPictureInPictureController alloc] initWithContentSource:contentSource];
         self.pipController.canStartPictureInPictureAutomaticallyFromInline = YES;
@@ -102,13 +97,9 @@ static PiPManager* sharedInstance = nil;
 // PIP delegate
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
     [self.displayingDecoratedVC minimizeWindowPiP];
-    if(self.displayingVC.usesHostingControllerAPI) {
-        self.pipVideoCallContentView.frame = CGRectMake(0, 0, self.displayingVC.view.bounds.size.width, self.displayingVC.view.bounds.size.height);
-        self.pipVideoCallViewController.additionalSafeAreaInsets = self.displayingVC.view.safeAreaInsets;
-        [self.pipVideoCallContentView addSubview:self.displayingVC.contentView];
-    } else {
-        self.displayingVC.contentView.frame = CGRectMake(0, 0, self.displayingVC.view.bounds.size.width, self.displayingVC.view.bounds.size.height);
-    }
+    self.pipVideoCallContentView.frame = CGRectMake(0, 0, self.displayingVC.view.bounds.size.width, self.displayingVC.view.bounds.size.height);
+    self.pipVideoCallViewController.additionalSafeAreaInsets = self.displayingVC.view.safeAreaInsets;
+    [self.pipVideoCallContentView addSubview:self.displayingVC.contentView];
     [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];
     [self removeBoundsObserver];
     self.observedBoundsLayer = self.pipVideoCallViewController.view.layer;
@@ -154,7 +145,7 @@ static PiPManager* sharedInstance = nil;
 
 - (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(NSObject*)object change:(NSDictionary<NSString *,id> *) change context:(void *) context {
     CGRect rect = [change[@"new"] CGRectValue];
-    CGFloat scale = self.displayingVC.usesHostingControllerAPI ? self.displayingVC.scaleRatio : 1;
+    CGFloat scale = self.displayingVC.scaleRatio;
     CGSize contentSize = self.displayingVC.contentView.bounds.size;
     if (contentSize.width <= 0 || contentSize.height <= 0 || scale <= 0) {
         return;

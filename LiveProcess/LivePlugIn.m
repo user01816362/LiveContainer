@@ -44,7 +44,13 @@ static xpc_connection_t hostConnection;
 
 + (NSString*)retrieveLaunchConfiguration {
     xpc_object_t properties = launch_copy_extension_properties_for_pid(getpid());
+    if (!properties || xpc_get_type(properties) != XPC_TYPE_DICTIONARY) {
+        return @"Unable to read LiveProcess extension properties";
+    }
     pid_t expectedHostPID = (pid_t)xpc_dictionary_get_int64(properties, "XPCExtensionHostPID");
+    if (expectedHostPID <= 0) {
+        return @"Missing LiveProcess host PID";
+    }
 
     NSString *appGroup = LCSharedUtils.appGroupID;
 
@@ -60,8 +66,7 @@ static xpc_connection_t hostConnection;
     mach_port_deallocate(mach_task_self(), port);
 
     dispatch_queue_t queue = dispatch_queue_create("com.kdt.livecontainer.liveprocess.launch", DISPATCH_QUEUE_SERIAL);
-//    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, LCLiveProcessLaunchTimeout * NSEC_PER_SEC);
-    dispatch_time_t deadline = DISPATCH_TIME_FOREVER;
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCLivePlugInLaunchTimeout * NSEC_PER_SEC));
     dispatch_semaphore_t connected = dispatch_semaphore_create(0);
     __block xpc_endpoint_t listenerEndpoint;
     // A pipe routine has no timeout. Bound startup's wait and keep a late reply

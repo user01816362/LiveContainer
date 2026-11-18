@@ -73,7 +73,9 @@ int LiveProcessMain(int argc, char *argv[]) {
     
     bool access = false;
     NSArray* bookmarks = appInfo[@"bookmarks"];
-    NSMutableArray<NSURL *>* bookmarkedUrls = [NSMutableArray array];
+    static NSMutableArray<NSURL *> *sActiveBookmarkedURLs = nil;
+    sActiveBookmarkedURLs = [NSMutableArray array];
+    NSMutableArray<NSURL *>* bookmarkedUrls = sActiveBookmarkedURLs;
     for(int i = 0; i < bookmarks.count; i++) {
         bool isStale = false;
         NSError* error = nil;
@@ -134,16 +136,20 @@ extern int LivePlugInMain(int argc, char *argv[], char *envp[], char *apple[]);
 // Extension entry point
 int NSExtensionMain(int argc, char *argv[], char *envp[], char *apple[]) {
     xpc_object_t properties = launch_copy_extension_properties_for_pid(getpid());
-    pid_t expectedHostPID = (pid_t)xpc_dictionary_get_int64(properties, "XPCExtensionHostPID");
+    pid_t expectedHostPID = (properties && xpc_get_type(properties) == XPC_TYPE_DICTIONARY)
+        ? (pid_t)xpc_dictionary_get_int64(properties, "XPCExtensionHostPID")
+        : 0;
 
-    NSString *appGroup = LCSharedUtils.appGroupID;
+    if (expectedHostPID > 0) {
+        NSString *appGroup = LCSharedUtils.appGroupID;
 
-    NSString *service = LCLivePlugInServiceName(appGroup, expectedHostPID);
-    mach_port_t port = MACH_PORT_NULL;
-    kern_return_t status = bootstrap_look_up(bootstrap_port, service.UTF8String, &port);
-    if (status == KERN_SUCCESS && MACH_PORT_VALID(port)) {
-        mach_port_deallocate(mach_task_self(), port);
-        return LivePlugInMain(argc, argv, envp, apple);
+        NSString *service = LCLivePlugInServiceName(appGroup, expectedHostPID);
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t status = bootstrap_look_up(bootstrap_port, service.UTF8String, &port);
+        if (status == KERN_SUCCESS && MACH_PORT_VALID(port)) {
+            mach_port_deallocate(mach_task_self(), port);
+            return LivePlugInMain(argc, argv, envp, apple);
+        }
     }
     
 #pragma clang diagnostic push

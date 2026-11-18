@@ -11,31 +11,33 @@
 __attribute__((swift_attr("@Sendable")))
 @protocol RefreshServer
 - (void)updateProgress:(double)value;
-- (void)finish:(NSString*)error;
-- (void)onConnection:(NSXPCConnection*)connection;
+- (void)finish:(nullable NSString*)error;
+- (void)onConnection:(nonnull NSXPCConnection*)connection;
 - (void)finishedLaunching;
-- (void)addNotificationRequest:(UNNotificationRequest*)request;
-- (void)removePendingNotificationRequestsWithIdentifiers:(NSArray<NSString*>*)identifiers;
+- (void)addNotificationRequest:(nonnull UNNotificationRequest*)request;
+- (void)removePendingNotificationRequestsWithIdentifiers:(nonnull NSArray<NSString*>*)identifiers;
 @end
 
+__attribute__((swift_attr("@Sendable")))
 @protocol RefreshClient
-- (void)refreshAllAppsWithIdentifier:(NSString*)identifier mangledTypeName:(NSString *)mangledTypeName;
+- (void)refreshAllAppsWithIdentifier:(nonnull NSString*)identifier mangledTypeName:(nonnull NSString *)mangledTypeName;
 @end
 
 @interface LiveProcessSideStoreHandler : NSObject
-@property (class, readonly, strong) LiveProcessSideStoreHandler* shared;
-@property NSXPCConnection* connection;
-@property NSObject<RefreshServer>* server;
+@property (class, readonly, strong, nonnull) LiveProcessSideStoreHandler* shared;
+@property (nullable) NSXPCConnection* connection;
+@property (nullable) NSObject<RefreshServer>* server;
 
 @end
 
-NSXPCListener* startAnonymousListener(NSObject<RefreshServer>* reporter);
-NSData* bookmarkForURL(NSURL* url);
+NSXPCListener * _Nullable startAnonymousListener(NSObject<RefreshServer> * _Nonnull reporter);
+NSData * _Nullable bookmarkForURL(NSURL * _Nonnull url);
 
 void installSideStoreHooks(void);
 void installSideStoreNotificationHooks(void);
 
+__attribute__((swift_attr("@Sendable")))
 @interface SideStoreClient : NSObject<RefreshClient>
-@property (class, readonly) SideStoreClient* shared;
+@property (class, readonly, nonnull) SideStoreClient* shared;
 - (void) relaunchLC;
 @end

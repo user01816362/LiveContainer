@@ -7,6 +7,7 @@ typedef void (^LCParseMachOCallback)(const char *path, struct mach_header_64 *he
 #define PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH 2
 
 void LCPatchAppBundleFixupARM64eSlice(NSURL *bundleURL);
+NSString *LCPatchMachOFixupARM64eSlice(const char *path);
 NSString *LCParseMachO(const char *path, bool readOnly, NS_NOESCAPE LCParseMachOCallback callback);
 void LCPatchAddRPath(const char *path, struct mach_header_64 *header);
 int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInject);

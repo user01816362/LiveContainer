@@ -6,6 +6,7 @@
 //
 import SwiftUI
 
+@MainActor
 protocol LCAppPreferencesDelegate {
     func get(key: String) -> AnyHashable?
     func set(key: String, val: AnyHashable?)
@@ -340,24 +341,14 @@ struct AppPreferencePageView : View {
     }
 }
 
-class AppPreferenceModel: LCAppPreferencesDelegate {
+@MainActor
+final class AppPreferenceModel: LCAppPreferencesDelegate {
     let settingsBundle : Bundle
     let userDefaults : UserDefaults
     let table : String?
-    private static var _enBundle : Bundle?
-    private static var _enBundleFound = false
-    private var enBundle : Bundle? {
-        if AppPreferenceModel._enBundleFound {
-            return AppPreferenceModel._enBundle;
-        }
-        let language = "en"
-        if let path = settingsBundle.path(forResource:language, ofType: "lproj") {
-            let bundle = Bundle(path: path)
-            AppPreferenceModel._enBundle = bundle
-        }
-        AppPreferenceModel._enBundleFound = true
-        return AppPreferenceModel._enBundle
-    }
+    private lazy var enBundle : Bundle? = {
+        settingsBundle.path(forResource: "en", ofType: "lproj").flatMap(Bundle.init(path:))
+    }()
     
     init(settingsBundle: Bundle, userDefaults: UserDefaults, table: String?) {
         self.settingsBundle = settingsBundle

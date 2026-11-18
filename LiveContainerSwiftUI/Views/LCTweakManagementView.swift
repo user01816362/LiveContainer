@@ -14,12 +14,12 @@ private extension Notification.Name {
     static let lcTweakManagementDidChange = Notification.Name("LC.TweakManagementDidChange")
 }
 
-private enum LCTweakTransferOperation {
+private enum LCTweakTransferOperation: Sendable {
     case copy
     case move
 }
 
-private struct LCTweakTransferRequest: Identifiable {
+private struct LCTweakTransferRequest: Identifiable, Sendable {
     let id = UUID()
     let sourceURL: URL
     let operation: LCTweakTransferOperation
@@ -30,6 +30,7 @@ private struct LCTweakDestinationMode {
     let onSelect: (URL) -> Void
 }
 
+@MainActor
 private final class LCTweakManagementContext: ObservableObject {
     @Published var draggingItemURL: URL?
 
@@ -42,7 +43,7 @@ private final class LCTweakManagementContext: ObservableObject {
     }
 }
 
-private struct LCManagedTweakItem: Hashable {
+private struct LCManagedTweakItem: Hashable, Sendable {
     let fileURL: URL
     let isFolder: Bool
     let isFramework: Bool
@@ -448,14 +449,13 @@ private struct LCManagedTweakFolderView: View {
     }
 
     private func signAllTweaks() async {
+        isTweakSigning = true
+        defer { isTweakSigning = false }
         do {
-            try await LCUtils.signTweaks(tweakFolderUrl: baseURL, force: true) { _ in
-                isTweakSigning = true
-            }
+            try await LCUtils.signTweaks(tweakFolderUrl: baseURL, force: true) { _ in }
         } catch {
             show(error)
         }
-        isTweakSigning = false
     }
 
     private func moveTweakItem(from sourceURL: URL, toFolder destinationFolderURL: URL) {

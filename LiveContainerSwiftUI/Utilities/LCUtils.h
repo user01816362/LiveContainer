@@ -10,44 +10,44 @@ typedef NS_ENUM(NSInteger, Store){
     Unknown = -1
 };
 
-void refreshFile(NSString* execPath);
+void refreshFile(NSString * _Null_unspecified execPath);
 int dyld_get_program_sdk_version(void);
-uint32_t dyld_get_sdk_version(const struct mach_header* mh);
+uint32_t dyld_get_sdk_version(const struct mach_header * _Null_unspecified mh);
 
 @interface PKZipArchiver : NSObject
 
-- (NSData *)zippedDataForURL:(NSURL *)url;
+- (NSData * _Null_unspecified)zippedDataForURL:(NSURL * _Null_unspecified)url;
 
 @end
 
 @interface UIDevice(private)
-@property(readonly) NSString* buildVersion;
+@property(readonly, null_unspecified) NSString* buildVersion;
 @end
 
 @interface LCUtils : NSObject
 
-+ (void)validateJITLessSetupWithCompletionHandler:(void (^)(BOOL success, NSError *error))completionHandler;
-+ (NSURL *)archiveIPAWithBundleName:(NSString*)newBundleName includingExtraInfoDict:(NSDictionary *)extraInfoDict error:(NSError **)error;
-+ (NSData *)certificateData;
-+ (void)launchMultitaskGuestApp:(NSString *)displayName completionHandler:(void (^)(NSNumber *pid, NSError *error))completionHandler;
++ (void)validateJITLessSetupWithCompletionHandler:(void (^ NS_SWIFT_SENDABLE _Nonnull)(BOOL success, NSError * _Nullable error))completionHandler;
++ (nullable NSURL *)archiveIPAWithBundleName:(nonnull NSString*)newBundleName includingExtraInfoDict:(nullable NSDictionary *)extraInfoDict error:(NSError * _Nullable * _Nullable)error;
++ (nullable NSData *)certificateData;
++ (void)launchMultitaskGuestApp:(nonnull NSString *)displayName completionHandler:(void (^ NS_SWIFT_SENDABLE _Nullable)(NSNumber * _Nullable pid, NSError * _Nullable error))completionHandler;
 
 
-+ (NSProgress *)signAppBundleWithZSign:(NSURL *)path completionHandler:(void (^)(BOOL success, NSError *error))completionHandler;
-+ (NSProgress *)signFilesWithZSignWithURLs:(NSArray<NSURL*>*)urls completionHandler:(void (^)(BOOL success, NSError *error))completionHandler;
-+ (NSString*)getCertTeamIdWithKeyData:(NSData*)keyData password:(NSString*)password;
-+ (int)validateCertificateWithCompletionHandler:(void(^)(int status, NSDate *expirationDate, NSString *organizationalUnitName, NSString *error))completionHandler;
++ (nullable NSProgress *)signAppBundleWithZSign:(nonnull NSURL *)path completionHandler:(void (^ NS_SWIFT_SENDABLE _Nonnull)(BOOL success, NSError * _Nullable error))completionHandler;
++ (nullable NSProgress *)signFilesWithZSignWithURLs:(nonnull NSArray<NSURL*>*)urls completionHandler:(void (^ NS_SWIFT_SENDABLE _Nonnull)(BOOL success, NSError * _Nullable error))completionHandler;
++ (nullable NSString*)getCertTeamIdWithKeyData:(nonnull NSData*)keyData password:(nullable NSString*)password;
++ (int)validateCertificateWithCompletionHandler:(void(^ NS_SWIFT_SENDABLE _Nonnull)(int status, NSDate * _Nullable expirationDate, NSString * _Nullable organizationalUnitName, NSString * _Nullable error))completionHandler;
 
 + (BOOL)isTXMScriptRequired;
-+ (NSString *)base64EncodedUniversalJITScript;
++ (NSString * _Null_unspecified)base64EncodedUniversalJITScript;
 
 + (BOOL)isAppGroupAltStoreLike;
 + (Store)store;
-+ (NSString *)appUrlScheme;
-+ (NSString *)storeInstallURLScheme;
-+ (NSString *)getVersionInfo;
-+ (NSString *)liveProcessBundleIdentifier;
-+ (NSData*)bookmarkForURL:(NSURL*) url;
-+ (BOOL)isAppSchemeInstalled:(NSString *)scheme;
++ (NSString * _Null_unspecified)appUrlScheme;
++ (NSString * _Null_unspecified)storeInstallURLScheme;
++ (NSString * _Null_unspecified)getVersionInfo;
++ (NSString * _Null_unspecified)liveProcessBundleIdentifier;
++ (NSData * _Null_unspecified)bookmarkForURL:(NSURL * _Null_unspecified)url;
++ (BOOL)isAppSchemeInstalled:(NSString * _Null_unspecified)scheme;
 @end
 
 @interface NSUserDefaults(LiveContainerSideStore)
@@ -56,9 +56,9 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
 
 @interface LCP12CertHelper : NSObject
 
-- (instancetype)initWithP12Data:(NSData*)p12Data password:(NSString*)password error:(NSError**)error;
-- (NSDate*)getNotValidityNotAfterWithError:(NSError**)error;
-- (NSString*)getOrgnizationUnitWithError:(NSError**)error;
+- (instancetype _Null_unspecified)initWithP12Data:(NSData * _Null_unspecified)p12Data password:(NSString * _Null_unspecified)password error:(NSError * _Null_unspecified * _Null_unspecified)error;
+- (NSDate * _Null_unspecified)getNotValidityNotAfterWithError:(NSError * _Null_unspecified * _Null_unspecified)error;
+- (NSString * _Null_unspecified)getOrgnizationUnitWithError:(NSError * _Null_unspecified * _Null_unspecified)error;
 
 @end
 
@@ -69,8 +69,8 @@ typedef NS_ENUM(NSInteger, GeneratedIconStyle){
 };
 
 @interface UIImage(LiveContainer)
-+ (instancetype)generateIconForBundleURL:(NSURL*)url style:(GeneratedIconStyle)style hasBorder:(BOOL)hasBorder;
++ (instancetype _Null_unspecified)generateIconForBundleURL:(NSURL * _Null_unspecified)url style:(GeneratedIconStyle)style hasBorder:(BOOL)hasBorder;
 @end
-BOOL saveCGImage(CGImageRef image, NSURL *url);
-CGImageRef loadCGImageFromURL(NSURL *url);
-NSNumber *LCGetDefaultClassicMode(NSURL *appURL);
+BOOL saveCGImage(CGImageRef _Null_unspecified image, NSURL * _Null_unspecified url);
+CGImageRef _Null_unspecified loadCGImageFromURL(NSURL * _Null_unspecified url);
+NSNumber * _Null_unspecified LCGetDefaultClassicMode(NSURL * _Null_unspecified appURL);

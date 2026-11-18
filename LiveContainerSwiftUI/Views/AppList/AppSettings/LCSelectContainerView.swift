@@ -7,6 +7,7 @@
 
 import SwiftUI
 
+@MainActor
 protocol LCSelectContainerViewDelegate {
     func addContainers(containers: Set<String>)
 }

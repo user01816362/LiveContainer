@@ -8,9 +8,11 @@
 import LocalAuthentication
 
 extension LCUtils {
-    public static let appGroupUserDefault = UserDefaults.init(suiteName: LCSharedUtils.appGroupID()) ?? UserDefaults.standard
+    public static var appGroupUserDefault: UserDefaults {
+        UserDefaults(suiteName: LCSharedUtils.appGroupID()) ?? UserDefaults.standard
+    }
     
-    public static func signTweaks(tweakFolderUrl: URL, force : Bool = false, progressHandler : ((Progress) -> Void)? = nil) async throws {
+    public static func signTweaks(tweakFolderUrl: URL, force: Bool = false, progressHandler: (@Sendable (Progress) -> Void)? = nil) async throws {
         guard LCSharedUtils.certificatePassword() != nil else {
             return
         }
@@ -22,137 +24,120 @@ extension LCUtils {
                 return
             }
         }
-        var isFolder :ObjCBool = false
-        if(fm.fileExists(atPath: tweakFolderUrl.path, isDirectory: &isFolder) && !isFolder.boolValue) {
+        var isFolder: ObjCBool = false
+        guard fm.fileExists(atPath: tweakFolderUrl.path, isDirectory: &isFolder), isFolder.boolValue else {
             return
         }
-        
-        // check if re-sign is needed
-        // if signature is invalid, we need to re-sign. dylib and framework's main binary are supported
-        let fileURLs = try fm.contentsOfDirectory(at: tweakFolderUrl, includingPropertiesForKeys: nil)
+
+        guard let enumerator = fm.enumerator(
+            at: tweakFolderUrl,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
 
         var filesToSign: [URL] = []
-        
-        for fileURL in fileURLs {
-            var fileURL = fileURL
-            let attributes = try fm.attributesOfItem(atPath: fileURL.path)
-            let fileType = attributes[.type] as? FileAttributeType
-            if(fileType != FileAttributeType.typeDirectory && fileType != FileAttributeType.typeRegular) {
-                continue
-            }
-            let name = fileURL.lastPathComponent
+        var seenPaths = Set<String>()
+
+        while let entry = enumerator.nextObject() as? URL {
+            let resourceValues = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            let isDir = resourceValues?.isDirectory ?? false
+            let name = entry.lastPathComponent
             let baseName = name.hasSuffix(".disabled") ? String(name.dropLast(".disabled".count)) : name
-            if(fileType == FileAttributeType.typeDirectory) {
-                if(!baseName.hasSuffix(".framework")) {
+
+            if isDir {
+                if name.hasSuffix(".disabled") && !baseName.hasSuffix(".framework") {
+                    enumerator.skipDescendants()
                     continue
                 }
-                guard let frameworkBundle = Bundle(url: fileURL), let executableURL = frameworkBundle.executableURL else {
-                    continue
+                if baseName.hasSuffix(".framework") {
+                    enumerator.skipDescendants()
+                    if let frameworkBundle = Bundle(url: entry),
+                       let executableURL = frameworkBundle.executableURL {
+                        let resolvedPath = executableURL.standardizedFileURL.path
+                        if seenPaths.insert(resolvedPath).inserted && (force || !checkCodeSignature((resolvedPath as NSString).utf8String)) {
+                            filesToSign.append(executableURL)
+                        }
+                    }
                 }
-                fileURL = executableURL
-            } else if (fileType == FileAttributeType.typeRegular && !baseName.hasSuffix(".dylib")) {
                 continue
             }
 
-            if !force, checkCodeSignature((fileURL.path as NSString).utf8String) {
-                continue;
+            guard (resourceValues?.isRegularFile ?? false) && baseName.hasSuffix(".dylib") else {
+                continue
             }
-            
-            filesToSign.append(fileURL)
+            let resolvedPath = entry.standardizedFileURL.path
+            if seenPaths.insert(resolvedPath).inserted && (force || !checkCodeSignature((resolvedPath as NSString).utf8String)) {
+                filesToSign.append(entry)
+            }
         }
-        
+
         if filesToSign.isEmpty {
             return
         }
-        
+
         for fileURL in filesToSign {
-            LCPatchAppBundleFixupARM64eSlice(fileURL)
+            LCPatchMachOFixupARM64eSlice((fileURL.path as NSString).utf8String)
         }
-        
-        try await withUnsafeThrowingContinuation({ c in
+
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             let progress = signFilesWithZSign(with: filesToSign) { success, error in
-                if(success) {
+                if success {
                     c.resume()
                     return
                 }
-                
-                guard let error else {
+                if let error {
+                    c.resume(throwing: error)
+                } else {
                     c.resume()
-                    return
                 }
-                c.resume(throwing: error)
             }
             if let progress {
                 progressHandler?(progress)
             }
-        })
-    }
-        
-    private static func authenticateUser(completion: @escaping (Bool, Error?) -> Void) {
-        // Create a context for authentication
-        let context = LAContext()
-        var error: NSError?
-
-        // Check if the device supports biometric authentication
-        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
-            // Determine the reason for the authentication request
-            let reason = "lc.utils.requireAuthentication".loc
-
-            // Evaluate the authentication policy
-            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, evaluationError in
-                DispatchQueue.main.async {
-                    if success {
-                        // Authentication successful
-                        completion(true, nil)
-                    } else {
-                        if let evaluationError = evaluationError as? LAError, evaluationError.code == LAError.userCancel || evaluationError.code == LAError.appCancel {
-                            completion(false, nil)
-                        } else {
-                            // Authentication failed
-                            completion(false, evaluationError)
-                        }
-
-                    }
-                }
-            }
-        } else {
-            // Biometric authentication is not available
-            DispatchQueue.main.async {
-                if let evaluationError = error as? LAError, evaluationError.code == LAError.passcodeNotSet {
-                    // No passcode set, we also define this as successful Authentication
-                    completion(true, nil)
-                } else {
-                    completion(false, error)
-                }
-
-            }
         }
     }
-    
+
+    @MainActor
     public static func authenticateUser() async throws -> Bool {
         if DataManager.shared.model.isHiddenAppUnlocked {
             return true
         }
-        
-        var success = false
-        var error : Error? = nil
-        await withUnsafeContinuation { c in
-            LCUtils.authenticateUser { success1, error1 in
-                success = success1
-                error = error1
-                c.resume()
+
+        let context = LAContext()
+        var authError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &authError) else {
+            if let evaluationError = authError as? LAError, evaluationError.code == .passcodeNotSet {
+                DataManager.shared.model.isHiddenAppUnlocked = true
+                return true
             }
-        }
-        if let error = error {
-            throw error
-        }
-        if !success {
+            if let authError {
+                throw authError
+            }
             return false
         }
-        DispatchQueue.main.async {
+
+        let reason = "lc.utils.requireAuthentication".loc
+        let success: Bool = try await withCheckedThrowingContinuation { continuation in
+            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, evaluationError in
+                if ok {
+                    continuation.resume(returning: true)
+                } else if let evaluationError = evaluationError as? LAError,
+                          evaluationError.code == .userCancel || evaluationError.code == .appCancel {
+                    continuation.resume(returning: false)
+                } else if let evaluationError {
+                    continuation.resume(throwing: evaluationError)
+                } else {
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+
+        if success {
             DataManager.shared.model.isHiddenAppUnlocked = true
         }
-        return true
+        return success
     }
     
     public static func getStoreName() -> String {
@@ -182,7 +167,7 @@ extension LCUtils {
     }
     
     public static func forEachInstalledLC(isFree: Bool, block: (String, inout Bool) -> Void) {
-        for scheme in LCSharedUtils.lcUrlSchemes() {
+        for scheme in (LCSharedUtils.lcUrlSchemes() ?? []) {
             if scheme == UserDefaults.lcAppUrlScheme() {
                 continue
             }
@@ -205,8 +190,9 @@ extension LCUtils {
             }
         }
     }
-    
-    public static func askForJIT(withScript script: String? = nil, appName: String? = nil, classicMode: UInt = 0, onServerMessage: ((String) -> Void)? = nil) async -> Bool {
+
+    @MainActor
+    public static func askForJIT(withScript script: String? = nil, appName: String? = nil, classicMode: UInt = 0, onServerMessage: (@MainActor (String) -> Void)? = nil) async -> Bool {
         // if LiveContainer is installed by TrollStore
         let tsPath = "\(Bundle.main.bundlePath)/../_TrollStore"
         if (access((tsPath as NSString).utf8String, 0) == 0) {
@@ -293,10 +279,13 @@ extension LCUtils {
             }
         } else if jitEnabler == .StosDebug || jitEnabler == .StosDebugLC {
             guard let appName else { onServerMessage?("Unable to get App Name, Please try again."); return false }
-            var launchURLStr = "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)"
+            let queryValueAllowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
+            let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? appName
+            var launchURLStr = "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)"
             
             if let script = script, !script.isEmpty {
-                launchURLStr += "&script=\(script)"
+                let encodedScript = script.addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? script
+                launchURLStr += "&script=\(encodedScript)"
             }
             
             if jitEnabler == .StosDebugLC {
@@ -354,10 +343,12 @@ extension LCUtils {
             }
             
         } else if jitEnabler == .StikJIT || jitEnabler == .StikJITLC {
+            let queryValueAllowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+#?"))
             var launchURLStr = "stikjit://enable-jit?bundle-id=\(Bundle.main.bundleIdentifier!)"
 
             if let script = script, !script.isEmpty {
-                launchURLStr += "&script-data=\(script)"
+                let encodedScript = script.addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? script
+                launchURLStr += "&script-data=\(encodedScript)"
             }
             let launchURL : URL
             if jitEnabler == .StikJITLC {
@@ -515,6 +506,7 @@ extension LCUtils {
         }
     }
     
+    @MainActor
     static func openSideStore(delegate: LCAppModelDelegate? = nil, urlStr: String? = nil) {
         let sideStoreApp = LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared, delegate: delegate)
         

@@ -34,7 +34,15 @@ struct LCMultitaskSettingView: View {
                 Toggle(isOn: $launchInMultitaskMode) {
                     Text("lc.settings.autoLaunchInMultitaskMode".loc)
                 }
-                
+                Toggle(isOn: $skipTerminatedScreen) {
+                    Text("lc.settings.skipTerminatedScreen".loc)
+                }
+                if skipTerminatedScreen {
+                    Toggle(isOn: $restartTerminatedApp) {
+                        Text("lc.settings.restartTerminatedApp".loc)
+                    }
+                }
+
                 if multitaskMode == .virtualWindow {
                     Toggle(isOn: $launchMultitaskMaximized) {
                         Text("lc.settings.launchMultitaskMaximized".loc)
@@ -46,14 +54,6 @@ struct LCMultitaskSettingView: View {
                     }
                     Toggle(isOn: $autoEndPiP) {
                         Text("lc.settings.autoEndPiP".loc)
-                    }
-                    Toggle(isOn: $skipTerminatedScreen) {
-                        Text("lc.settings.skipTerminatedScreen".loc)
-                    }
-                    if skipTerminatedScreen {
-                        Toggle(isOn: $restartTerminatedApp) {
-                            Text("lc.settings.restartTerminatedApp".loc)
-                        }
                     }
                     Toggle(isOn: $bottomWindowBar) {
                         Text("lc.settings.bottomWindowBar".loc)

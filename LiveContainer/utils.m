@@ -5,14 +5,26 @@ void __assert_rtn(const char* func, const char* file, int line, const char* fail
     abort(); // silent compiler warning
 }
 
+static uint64_t aarch64_decode_tb_imm14_target(uint32_t instruction, uint64_t pc) {
+    uint32_t raw = (instruction >> 5) & 0x3FFFU;
+    int32_t signedImm = (raw & 0x2000U) ? (int32_t)raw - 0x4000 : (int32_t)raw;
+    return (uint64_t)((int64_t)pc + (int64_t)signedImm * 4);
+}
+
 uint64_t aarch64_get_tbnz_jump_address(uint32_t instruction, uint64_t pc) {
-    // Check that this is a tbnz instruction
-    if ((instruction & 0xFF000000) != 0x37000000) {
+    // Check that this is a tbnz instruction (including b5 == 1 for 64-bit registers)
+    if ((instruction & 0x7F000000) != 0x37000000) {
         return 0;
     }
+    return aarch64_decode_tb_imm14_target(instruction, pc);
+}
 
-    uint32_t imm = ((instruction >> 5) & 0xFFFF) * 4;
-    return imm + pc;
+uint64_t aarch64_get_tbz_or_tbnz_jump_address(uint32_t instruction, uint64_t pc) {
+    uint32_t opcode = instruction & 0x7F000000;
+    if (opcode != 0x36000000 && opcode != 0x37000000) {
+        return 0;
+    }
+    return aarch64_decode_tb_imm14_target(instruction, pc);
 }
 
 // https://github.com/pinauten/PatchfinderUtils/blob/master/Sources/CFastFind/CFastFind.c

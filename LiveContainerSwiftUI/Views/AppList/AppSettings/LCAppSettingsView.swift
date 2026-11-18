@@ -14,8 +14,9 @@ struct LCAppSettingsView: View {
     private let documentPickerCoordinator = DocumentPickerCoordinator()
     @Environment(\.dismiss) private var dismiss
 
-    private class DocumentPickerCoordinator: NSObject, UIDocumentPickerDelegate {
-        var onDocumentPicked: ((URL) -> Void)?
+    @MainActor
+    private final class DocumentPickerCoordinator: NSObject, UIDocumentPickerDelegate {
+        var onDocumentPicked: (@MainActor (URL) -> Void)?
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
@@ -499,7 +500,7 @@ struct LCAppSettingsView: View {
             text: $renameFolderInput.initVal,
             placeholder: "",
             action: { newText in
-                renameFolderInput.close(result: newText!)
+                renameFolderInput.close(result: newText ?? "")
             },
             actionCancel: {_ in
                 renameFolderInput.close(result: "")
@@ -712,6 +713,9 @@ struct LCAppSettingsView: View {
                 errorShow = true
                 return
             }
+            defer {
+                url.stopAccessingSecurityScopedResource()
+            }
             let path = url.path
             let fm = FileManager.default
             let _ = try fm.contentsOfDirectory(atPath: path)
@@ -765,11 +769,9 @@ struct LCAppSettingsView: View {
                     return
                 }
                 
-//                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                    if container!.bookmarkResolved {
-                        container!.makeLCContainerInfoPlist(appIdentifier: appInfo.bundleIdentifier()!, keychainGroupId: freeKeyChainGroup)
-                    }
-//                }
+                if container!.bookmarkResolved {
+                    container!.makeLCContainerInfoPlist(appIdentifier: appInfo.bundleIdentifier()!, keychainGroupId: freeKeyChainGroup)
+                }
             }
             model.uiContainers.append(container!)
             appInfo.containers = model.uiContainers;

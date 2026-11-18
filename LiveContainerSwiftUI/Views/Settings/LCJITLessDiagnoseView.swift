@@ -394,21 +394,26 @@ struct LCJITLessDiagnoseView : View {
         if !certificateDataFound {
             errorInfo = "lc.settings.error.certNotImported".loc
             errorShow = true
-            return;
+            return
         }
 
         isJITLessTestInProgress = true
-        LCUtils.validateJITLessSetup { success, error in
+        let currentStoreName = storeName
+        Task { @MainActor in
+            let (success, errorMessage): (Bool, String?) = await withCheckedContinuation { continuation in
+                LCUtils.validateJITLessSetup { success, error in
+                    continuation.resume(returning: (success, error?.localizedDescription))
+                }
+            }
             if success {
                 successInfo = "lc.jitlessSetup.success".loc
                 successShow = true
             } else {
-                errorInfo = "lc.jitlessSetup.error.testLibLoadFailed %@ %@ %@".localizeWithFormat(storeName, storeName, storeName) + "\n" + (error?.localizedDescription ?? "")
+                errorInfo = "lc.jitlessSetup.error.testLibLoadFailed %@ %@ %@".localizeWithFormat(currentStoreName, currentStoreName, currentStoreName) + "\n" + (errorMessage ?? "")
                 errorShow = true
             }
             isJITLessTestInProgress = false
         }
-    
     }
     
     func getHelp() {
@@ -418,7 +423,12 @@ struct LCJITLessDiagnoseView : View {
     func validateCertificate() {
         certificateStatus = -1
         certificateValidateUntil = nil
-        LCUtils.validateCertificate { status, date, ou, error in
+        Task { @MainActor in
+            let (status, date, ou, error): (Int32, Date?, String?, String?) = await withCheckedContinuation { continuation in
+                _ = LCUtils.validateCertificate { status, date, ou, error in
+                    continuation.resume(returning: (status, date, ou, error))
+                }
+            }
             if let error {
                 errorInfo = error.loc
                 errorShow = true

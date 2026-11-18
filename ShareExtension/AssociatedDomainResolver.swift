@@ -39,9 +39,16 @@ enum AssociatedDomainResolver {
         }
     }
 
+    private static let resolverSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 4
+        config.timeoutIntervalForResource = 5
+        return URLSession(configuration: config)
+    }()
+
     private static func fetchBundleIDs(from url: URL) async -> [String] {
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await resolverSession.data(from: url)
             let association = try JSONDecoder().decode(SiteAssociation.self, from: data)
             return association.applinks?.details.flatMap { $0.bundleIDs } ?? []
         } catch {
@@ -50,11 +57,11 @@ enum AssociatedDomainResolver {
     }
 }
 
-private struct SiteAssociation: Decodable {
+private struct SiteAssociation: Decodable, Sendable {
     let applinks: AppLinks?
 }
 
-private struct AppLinks: Decodable {
+private struct AppLinks: Decodable, Sendable {
     let details: [SiteAssociationDetailItem]
 
     enum CodingKeys: String, CodingKey {
@@ -81,7 +88,7 @@ private struct AppLinks: Decodable {
     }
 }
 
-private struct SiteAssociationDetailItem: Decodable {
+private struct SiteAssociationDetailItem: Decodable, Sendable {
     var appID: String?
     let appIDs: [String]?
 
