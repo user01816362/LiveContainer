@@ -30,16 +30,43 @@ struct LCLabeledTextRow: View {
     }
 }
 
-struct LCLabeledNumberRow<T: Numeric & LosslessStringConvertible>: View {
+struct LCLabeledIntRow: View {
     let label: String
-    @Binding var value: T
-    var keyboardType: UIKeyboardType = .numberPad
+    @Binding var value: Int
 
     var body: some View {
         HStack {
             Text(label)
             TextField(label, value: $value, format: .number)
-                .keyboardType(keyboardType)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+}
+
+struct LCLabeledInt64Row: View {
+    let label: String
+    @Binding var value: Int64
+
+    var body: some View {
+        HStack {
+            Text(label)
+            TextField(label, value: $value, format: .number)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+}
+
+struct LCLabeledDoubleRow: View {
+    let label: String
+    @Binding var value: Double
+
+    var body: some View {
+        HStack {
+            Text(label)
+            TextField(label, value: $value, format: .number)
+                .keyboardType(.decimalPad)
                 .multilineTextAlignment(.trailing)
         }
     }
@@ -247,9 +274,9 @@ struct LCContainerAdvancedHardwareSection: View {
             LCLabeledTextRow(label: "Host Name", placeholder: "iPhone-18-Pro-Max", text: $container.spoofHostName, onCommit: { _ = onSave() })
             LCLabeledTextRow(label: "Board Config (hw.model)", placeholder: "V64AP", text: $container.spoofBoardModel, onCommit: { _ = onSave() })
             LCLabeledTextRow(label: "Kernel Version", placeholder: "Darwin Kernel Version 26.2.0", text: $container.spoofKernelVersion, onCommit: { _ = onSave() })
-            LCLabeledNumberRow(label: "Boot Time (Unix)", value: $container.spoofBootTime, keyboardType: .numberPad)
-            LCLabeledNumberRow(label: "CPU Type", value: $container.spoofCPUType, keyboardType: .numberPad)
-            LCLabeledNumberRow(label: "CPU Subtype", value: $container.spoofCPUSubtype, keyboardType: .numberPad)
+            LCLabeledInt64Row(label: "Boot Time (Unix)", value: $container.spoofBootTime)
+            LCLabeledIntRow(label: "CPU Type", value: $container.spoofCPUType)
+            LCLabeledIntRow(label: "CPU Subtype", value: $container.spoofCPUSubtype)
             Stepper("Processor Cores: \(container.spoofProcessorCount)", value: $container.spoofProcessorCount, in: 1...16)
                 .onChange(of: container.spoofProcessorCount) { _, _ in _ = onSave() }
             Picker("Physical Memory", selection: $container.spoofPhysicalMemory) {
@@ -292,14 +319,14 @@ struct LCContainerDisplayGeometrySection: View {
                 .keyboardType(.numberPad)
                 .multilineTextAlignment(.trailing)
         }
-        LCLabeledNumberRow(label: "Screen Scale", value: $container.spoofScreenScale, keyboardType: .decimalPad)
-        LCLabeledNumberRow(label: "Native Scale", value: $container.spoofScreenNativeScale, keyboardType: .decimalPad)
+        LCLabeledDoubleRow(label: "Screen Scale", value: $container.spoofScreenScale)
+        LCLabeledDoubleRow(label: "Native Scale", value: $container.spoofScreenNativeScale)
         Picker("Maximum FPS", selection: $container.spoofMaximumFramesPerSecond) {
             Text("60 Hz").tag(60)
             Text("120 Hz").tag(120)
         }
         .onChange(of: container.spoofMaximumFramesPerSecond) { _, _ in _ = onSave() }
-        LCLabeledNumberRow(label: "Brightness (0–1)", value: $container.spoofScreenBrightness, keyboardType: .decimalPad)
+        LCLabeledDoubleRow(label: "Brightness (0–1)", value: $container.spoofScreenBrightness)
         Picker("Appearance", selection: $container.spoofUserInterfaceStyle) {
             Text("Use System").tag(0)
             Text("Light Mode").tag(1)
@@ -563,14 +590,14 @@ struct LCContainerStorageSection: View {
     var body: some View {
         DisclosureGroup("Storage") {
             LCFeatureToggleRow(title: "Override Capacity", key: "storage.capacity", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Total Capacity (Bytes)", value: $container.spoofStorageTotalCapacity, keyboardType: .numberPad)
-            LCLabeledNumberRow(label: "Available Capacity (Bytes)", value: $container.spoofStorageAvailableCapacity, keyboardType: .numberPad)
+            LCLabeledInt64Row(label: "Total Capacity (Bytes)", value: $container.spoofStorageTotalCapacity)
+            LCLabeledInt64Row(label: "Available Capacity (Bytes)", value: $container.spoofStorageAvailableCapacity)
             LCFeatureToggleRow(title: "Override Volume Identity", key: "storage.identity", container: container, onToggle: { _ = onSave() })
             LCLabeledTextRow(label: "Volume Name", placeholder: "Data", text: $container.spoofStorageVolumeName, onCommit: { _ = onSave() })
             LCLabeledTextRow(label: "Volume UUID", placeholder: "UUID", text: $container.spoofStorageVolumeUUID, onCommit: { _ = onSave() })
             LCFeatureToggleRow(title: "Override Creation Dates", key: "storage.creationDates", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "File Creation (Unix)", value: $container.spoofStorageFileCreationTime, keyboardType: .numberPad)
-            LCLabeledNumberRow(label: "Volume Creation (Unix)", value: $container.spoofStorageVolumeCreationTime, keyboardType: .numberPad)
+            LCLabeledInt64Row(label: "File Creation (Unix)", value: $container.spoofStorageFileCreationTime)
+            LCLabeledInt64Row(label: "Volume Creation (Unix)", value: $container.spoofStorageVolumeCreationTime)
             Button("Save Storage") { _ = onSave() }
         }
         .disabled(!container.spoofStorageCategoryEnabled)
@@ -602,13 +629,13 @@ struct LCContainerAudioRoutesSection: View {
             LCFeatureToggleRow(title: "Hide Available Inputs", key: "audio.availableInputs", container: container, onToggle: { _ = onSave() })
             LCFeatureToggleRow(title: "Hide Current Route Inputs/Outputs", key: "audio.routes", container: container, onToggle: { _ = onSave() })
             LCFeatureToggleRow(title: "Override Output Volume", key: "audio.outputVolume", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Output Volume (0–1)", value: $container.spoofAudioOutputVolume, keyboardType: .decimalPad)
+            LCLabeledDoubleRow(label: "Output Volume (0–1)", value: $container.spoofAudioOutputVolume)
             LCFeatureToggleRow(title: "Override Sample Rate", key: "audio.sampleRate", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Sample Rate (Hz)", value: $container.spoofAudioSampleRate, keyboardType: .decimalPad)
+            LCLabeledDoubleRow(label: "Sample Rate (Hz)", value: $container.spoofAudioSampleRate)
             LCFeatureToggleRow(title: "Override Output Latency", key: "audio.outputLatency", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Output Latency (s)", value: $container.spoofAudioOutputLatency, keyboardType: .decimalPad)
+            LCLabeledDoubleRow(label: "Output Latency (s)", value: $container.spoofAudioOutputLatency)
             LCFeatureToggleRow(title: "Override Input Latency", key: "audio.inputLatency", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Input Latency (s)", value: $container.spoofAudioInputLatency, keyboardType: .decimalPad)
+            LCLabeledDoubleRow(label: "Input Latency (s)", value: $container.spoofAudioInputLatency)
             LCFeatureToggleRow(title: "Override Other Audio Playing", key: "audio.otherPlaying", container: container, onToggle: { _ = onSave() })
             Toggle("Other Audio Playing", isOn: $container.spoofAudioOtherPlaying)
                 .onChange(of: container.spoofAudioOtherPlaying) { _, _ in _ = onSave() }
@@ -632,7 +659,7 @@ struct LCContainerGraphicsMetalSection: View {
             LCFeatureToggleRow(title: "Override GPU Name", key: "graphics.name", container: container, onToggle: { _ = onSave() })
             LCLabeledTextRow(label: "GPU Name", placeholder: "Apple A20 Pro GPU", text: $container.spoofGPUName, onCommit: { _ = onSave() })
             LCFeatureToggleRow(title: "Override Recommended Working Set", key: "graphics.workingSet", container: container, onToggle: { _ = onSave() })
-            LCLabeledNumberRow(label: "Working Set (Bytes)", value: $container.spoofGPUWorkingSetSize, keyboardType: .numberPad)
+            LCLabeledInt64Row(label: "Working Set (Bytes)", value: $container.spoofGPUWorkingSetSize)
             LCFeatureToggleRow(title: "Report Ray Tracing Support", key: "graphics.rayTracing", container: container, onToggle: { _ = onSave() })
             Toggle("Ray Tracing Result", isOn: $container.spoofGraphicsSupportsRayTracing)
                 .onChange(of: container.spoofGraphicsSupportsRayTracing) { _, _ in _ = onSave() }
