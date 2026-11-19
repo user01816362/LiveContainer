@@ -21,34 +21,32 @@ struct LCAppBanner: UIViewControllerRepresentable {
     var delegate: LCAppBannerDelegate
 
     @ObservedObject var model: LCAppModel
-    @ObservedObject private var sourcesVM = AltStoreSourcesViewModel.shared
+    var updateCandidate: LCAppUpdateCandidate?
     @EnvironmentObject private var downloadManager: LCDownloadManager
 
     @AppStorage("dynamicColors", store: LCUtils.appGroupUserDefault) private var dynamicColors = true
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) private var darkModeIcon = false
 
-    init(appModel: LCAppModel, delegate: LCAppBannerDelegate) {
+    init(appModel: LCAppModel, delegate: LCAppBannerDelegate, updateCandidate: LCAppUpdateCandidate? = nil) {
         _model = ObservedObject(wrappedValue: appModel)
         self.delegate = delegate
+        self.updateCandidate = updateCandidate
     }
 
-    private func currentUpdateAndDownload() -> (LCAppUpdateCandidate?, LCDownloadTaskItem?) {
-        let candidate = sourcesVM.updateCandidate(for: model)
-        let dl = (model.appInfo.relativeBundlePath.flatMap { downloadManager.activeTask(forBundleId: $0) })
+    private func currentDownload() -> LCDownloadTaskItem? {
+        (model.appInfo.relativeBundlePath.flatMap { downloadManager.activeTask(forBundleId: $0) })
             ?? downloadManager.activeTask(forBundleId: model.bundleIdentifier)
-        return (candidate, dl)
     }
 
     func makeUIViewController(context: Context) -> UIViewController {
-        let (candidate, dl) = currentUpdateAndDownload()
-        return LCAppBannerViewController(
+        LCAppBannerViewController(
             delegate: delegate,
             config: LCAppBannerConfiguration(
                 model: model,
                 dynamicColors: dynamicColors,
                 darkModeIcon: darkModeIcon,
-                updateCandidate: candidate,
-                activeDownload: dl
+                updateCandidate: updateCandidate,
+                activeDownload: currentDownload()
             )
         )
     }
@@ -57,13 +55,12 @@ struct LCAppBanner: UIViewControllerRepresentable {
         guard let viewController = uiViewController as? LCAppBannerViewController else {
             return
         }
-        let (candidate, dl) = currentUpdateAndDownload()
         viewController.update(
             model: model,
             dynamicColors: dynamicColors,
             darkModeIcon: darkModeIcon,
-            updateCandidate: candidate,
-            activeDownload: dl
+            updateCandidate: updateCandidate,
+            activeDownload: currentDownload()
         )
     }
 

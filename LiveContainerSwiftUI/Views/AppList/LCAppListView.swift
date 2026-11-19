@@ -176,7 +176,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     private var visibleAppsSection: some View {
         LazyVStack {
             ForEach(filteredApps, id: \.self) { app in
-                LCAppBanner(appModel: app, delegate: self)
+                LCAppBanner(appModel: app, delegate: self, updateCandidate: sourcesVM.updateCandidate(for: app))
             }
             .transition(.scale)
         }
@@ -195,7 +195,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
 
                 ForEach(filteredHiddenApps, id: \.self) { app in
-                    LCAppBanner(appModel: app, delegate: self)
+                    LCAppBanner(appModel: app, delegate: self, updateCandidate: sourcesVM.updateCandidate(for: app))
                 }
                 .transition(.scale)
             }
@@ -219,7 +219,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
             ForEach(filteredHiddenApps, id: \.self) { app in
                 if sharedModel.isHiddenAppUnlocked {
-                    LCAppBanner(appModel: app, delegate: self)
+                    LCAppBanner(appModel: app, delegate: self, updateCandidate: sourcesVM.updateCandidate(for: app))
                 } else {
                     LCAppSkeletonBanner()
                 }

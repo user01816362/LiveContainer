@@ -219,16 +219,50 @@ final class AltStoreSourcesViewModel: ObservableObject {
     @Published private(set) var availableUpdates: [LCAppUpdateCandidate] = []
     @Published var isRefreshingAll = false
     private let defaultsKey = "LCAltStoreSourceURLs"
-    private let cacheDirectoryName = "AltStoreSourceCache"
     private var hasLoadedSources = false
+    private var updateCandidatesByAppId: [String: LCAppUpdateCandidate] = [:]
 
     func loadSourcesIfNeeded() {
         guard !hasLoadedSources else { return }
         hasLoadedSources = true
-        loadStoredSources()
-        recomputeAvailableUpdates()
-        Task {
-            await refreshAllSources()
+
+        let defaults = UserDefaults.standard
+        let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
+        let urls = stored.compactMap { URL(string: $0) }
+        guard !urls.isEmpty else { return }
+
+        // Populate placeholders immediately on MainActor with zero blocking I/O
+        self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
+
+        // Decode cached repositories off-thread in background utility task
+        Task.detached(priority: .utility) { [weak self] in
+            var loaded: [URL: AltStoreSource] = [:]
+            for url in urls {
+                if let data = Self.cachedData(for: url),
+                   let cachedSource = try? AltStoreSourceLoader.decode(from: data, baseURL: url) {
+                    loaded[url] = cachedSource
+                }
+            }
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                var updated = self.sources
+                var hasAnyChanges = false
+                for i in updated.indices {
+                    if let source = loaded[updated[i].url] {
+                        updated[i].source = source
+                        hasAnyChanges = true
+                    }
+                }
+                if hasAnyChanges {
+                    self.sources = updated
+                    self.recomputeAvailableUpdates()
+                }
+
+                Task { [weak self] in
+                    await self?.refreshAllSources()
+                }
+            }
         }
     }
 
@@ -251,7 +285,7 @@ final class AltStoreSourcesViewModel: ObservableObject {
     func removeSource(_ item: SourceItem) {
         sources.removeAll { $0.id == item.id }
         persistSources()
-        removeCache(for: item.url)
+        Self.removeCache(for: item.url)
         recomputeAvailableUpdates()
     }
 
@@ -267,14 +301,12 @@ final class AltStoreSourcesViewModel: ObservableObject {
         }
         isRefreshingAll = true
         let urlsToFetch = sources.map { $0.url }
-        for index in sources.indices {
-            sources[index].isLoading = true
-            sources[index].error = nil
+        var initialSources = sources
+        for index in initialSources.indices {
+            initialSources[index].isLoading = true
+            initialSources[index].error = nil
         }
-
-        let previousHashes: [URL: Data] = Dictionary(uniqueKeysWithValues: urlsToFetch.compactMap { url in
-            cachedData(for: url).map { (url, $0) }
-        })
+        sources = initialSources
 
         await withTaskGroup(of: (URL, Result<(AltStoreSource, Data), Error>).self) { group in
             for url in urlsToFetch {
@@ -288,27 +320,36 @@ final class AltStoreSourcesViewModel: ObservableObject {
                 }
             }
 
+            var updatedSources = sources
+            var didChangeAnySource = false
+
             for await (url, result) in group {
-                guard let idx = sources.firstIndex(where: { $0.url == url }) else { continue }
+                guard let idx = updatedSources.firstIndex(where: { $0.url == url }) else { continue }
                 switch result {
                 case .success(let (source, data)):
-                    if previousHashes[url] != data {
-                        sources[idx].source = source
-                        storeCache(data, for: url)
-                    } else if sources[idx].source == nil {
-                        sources[idx].source = source
+                    let prevData = Self.cachedData(for: url)
+                    if prevData != data {
+                        updatedSources[idx].source = source
+                        Self.storeCache(data, for: url)
+                        didChangeAnySource = true
+                    } else if updatedSources[idx].source == nil {
+                        updatedSources[idx].source = source
+                        didChangeAnySource = true
                     }
-                    sources[idx].isLoading = false
-                    sources[idx].error = nil
+                    updatedSources[idx].isLoading = false
+                    updatedSources[idx].error = nil
                 case .failure(let error):
-                    sources[idx].isLoading = false
-                    sources[idx].error = error.localizedDescription
+                    updatedSources[idx].isLoading = false
+                    updatedSources[idx].error = error.localizedDescription
                 }
             }
-        }
 
-        isRefreshingAll = false
-        recomputeAvailableUpdates()
+            sources = updatedSources
+            isRefreshingAll = false
+            if didChangeAnySource {
+                recomputeAvailableUpdates()
+            }
+        }
     }
 
     private func refreshSource(url: URL) async {
@@ -317,7 +358,7 @@ final class AltStoreSourcesViewModel: ObservableObject {
         }
         sources[index].isLoading = true
         sources[index].error = nil
-        let previousData = cachedData(for: url)
+        let previousData = Self.cachedData(for: url)
         do {
             let (source, data) = try await AltStoreSourceLoader.load(from: url)
             guard let sourceIndex = sources.firstIndex(where: { $0.url == url }) else {
@@ -329,7 +370,7 @@ final class AltStoreSourcesViewModel: ObservableObject {
             }
             sources[sourceIndex].source = source
             sources[sourceIndex].isLoading = false
-            storeCache(data, for: url)
+            Self.storeCache(data, for: url)
         } catch {
             if let sourceIndex = sources.firstIndex(where: { $0.url == url }) {
                 sources[sourceIndex].error = error.localizedDescription
@@ -407,11 +448,12 @@ final class AltStoreSourcesViewModel: ObservableObject {
         }
 
         availableUpdates = candidates
+        updateCandidatesByAppId = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     func updateCandidate(for app: LCAppModel) -> LCAppUpdateCandidate? {
         let key = app.appInfo.relativeBundlePath ?? app.bundleIdentifier
-        return availableUpdates.first { $0.id == key }
+        return updateCandidatesByAppId[key]
     }
 
     func updateCandidate(for sourceApp: AltStoreSourceApp, in sourceURL: URL) -> LCAppUpdateCandidate? {
@@ -477,20 +519,6 @@ final class AltStoreSourcesViewModel: ObservableObject {
 
     // MARK: - Persistence & Cache
 
-    private func loadStoredSources() {
-        let defaults = UserDefaults.standard
-        let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
-        let urls = stored.compactMap { URL(string: $0) }
-        self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
-        for index in sources.indices {
-            let url = sources[index].url
-            if let data = cachedData(for: url),
-               let cachedSource = try? AltStoreSourceLoader.decode(from: data, baseURL: url) {
-                sources[index].source = cachedSource
-            }
-        }
-    }
-
     private func persistSources() {
         let urls = sources.map { $0.url.absoluteString }
         UserDefaults.standard.set(urls, forKey: defaultsKey)
@@ -515,23 +543,27 @@ final class AltStoreSourcesViewModel: ObservableObject {
 }
 
 private extension AltStoreSourcesViewModel {
-    func cachedData(for url: URL) -> Data? {
+    private static let cacheDirectoryName = "AltStoreSourceCache"
+
+    nonisolated static func cachedData(for url: URL) -> Data? {
         guard let fileURL = cacheFileURL(for: url) else { return nil }
         return try? Data(contentsOf: fileURL)
     }
 
-    func storeCache(_ data: Data, for url: URL) {
-        guard let fileURL = cacheFileURL(for: url) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+    nonisolated static func storeCache(_ data: Data, for url: URL) {
+        Task.detached(priority: .background) {
+            guard let fileURL = cacheFileURL(for: url) else { return }
+            try? data.write(to: fileURL, options: .atomic)
+        }
     }
 
-    func cacheFileURL(for url: URL) -> URL? {
+    nonisolated static func cacheFileURL(for url: URL) -> URL? {
         guard let directory = ensureCacheDirectory() else { return nil }
         let fileName = cacheFileName(for: url)
         return directory.appendingPathComponent(fileName)
     }
 
-    func ensureCacheDirectory() -> URL? {
+    nonisolated static func ensureCacheDirectory() -> URL? {
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let directory = caches.appendingPathComponent(cacheDirectoryName, isDirectory: true)
         if !FileManager.default.fileExists(atPath: directory.path) {
@@ -544,14 +576,14 @@ private extension AltStoreSourcesViewModel {
         return directory
     }
 
-    func cacheFileName(for url: URL) -> String {
+    nonisolated static func cacheFileName(for url: URL) -> String {
         let data = Data(url.absoluteString.utf8)
         let digest = SHA256.hash(data: data)
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return "\(hex).json"
     }
 
-    func removeCache(for url: URL) {
+    nonisolated static func removeCache(for url: URL) {
         guard let fileURL = cacheFileURL(for: url) else { return }
         try? FileManager.default.removeItem(at: fileURL)
     }
