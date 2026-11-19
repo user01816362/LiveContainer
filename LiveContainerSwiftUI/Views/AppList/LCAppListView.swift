@@ -150,7 +150,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         .font(.title2)
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("\(sourcesVM.availableUpdates.count) App Updates Ready")
+                        Text("lc.appBanner.updatesReady %lld".localizeWithFormat(sourcesVM.availableUpdates.count))
                             .font(.subheadline.weight(.semibold))
                         Text(sourcesVM.availableUpdates.map(\.installedApp.displayName).joined(separator: ", "))
                             .font(.caption)
@@ -158,7 +158,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                             .lineLimit(1)
                     }
                     Spacer()
-                    Button("Update All") {
+                    Button("lc.appBanner.updateAll".loc) {
                         sourcesVM.enqueueUpdateAll()
                     }
                     .buttonStyle(.glassProminent)

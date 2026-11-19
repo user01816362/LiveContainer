@@ -64,8 +64,11 @@ final class LCAppBannerRootView: UIView {
         configureLabel(remarkLabel, font: .systemFont(ofSize: 10))
         configureLabel(containerLabel, font: .systemFont(ofSize: 8))
 
-        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         nameLabel.setContentHuggingPriority(.required, for: .horizontal)
+        versionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        remarkLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        containerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         nameSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         nameSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         nameStack.translatesAutoresizingMaskIntoConstraints = false
@@ -93,17 +96,21 @@ final class LCAppBannerRootView: UIView {
 
         runControl.translatesAutoresizingMaskIntoConstraints = false
         updateButton.translatesAutoresizingMaskIntoConstraints = false
+        updateButton.clipsToBounds = true
         var updateConfig = UIButton.Configuration.filled()
         updateConfig.cornerStyle = .capsule
-        updateConfig.buttonSize = .small
-        updateConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        updateConfig.buttonSize = .mini
+        updateConfig.contentInsets = NSDirectionalEdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8)
         updateButton.configuration = updateConfig
+        updateButton.setContentHuggingPriority(.required, for: .horizontal)
+        updateButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         updateButton.isHidden = true
 
         trailingControlsStack.translatesAutoresizingMaskIntoConstraints = false
-        trailingControlsStack.axis = .horizontal
-        trailingControlsStack.alignment = .center
-        trailingControlsStack.spacing = 8
+        trailingControlsStack.axis = .vertical
+        trailingControlsStack.alignment = .trailing
+        trailingControlsStack.distribution = .fill
+        trailingControlsStack.spacing = 4
         trailingControlsStack.addArrangedSubview(updateButton)
         trailingControlsStack.addArrangedSubview(runControl)
 
@@ -129,8 +136,10 @@ final class LCAppBannerRootView: UIView {
 
             trailingControlsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             trailingControlsStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            trailingControlsStack.widthAnchor.constraint(equalToConstant: 70),
             runControl.widthAnchor.constraint(equalToConstant: 70),
-            runControl.heightAnchor.constraint(equalToConstant: 32)
+            runControl.heightAnchor.constraint(equalToConstant: 28),
+            updateButton.heightAnchor.constraint(equalToConstant: 24)
         ])
     }
 
@@ -189,8 +198,8 @@ final class LCAppBannerRootView: UIView {
             var config = updateButton.configuration ?? UIButton.Configuration.filled()
             config.baseBackgroundColor = accentColor.withAlphaComponent(0.85)
             config.baseForegroundColor = .white
-            config.image = UIImage(systemName: "arrow.down.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
-            config.imagePadding = 4
+            config.image = UIImage(systemName: "arrow.down.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .bold))
+            config.imagePadding = 3
             let pct = Int((activeDownload.progress * 100).rounded())
             config.title = pct > 0 ? "\(pct)%" : "…"
             updateButton.configuration = config
@@ -199,9 +208,9 @@ final class LCAppBannerRootView: UIView {
             var config = updateButton.configuration ?? UIButton.Configuration.filled()
             config.baseBackgroundColor = .systemBlue
             config.baseForegroundColor = .white
-            config.image = UIImage(systemName: "arrow.down.circle.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
-            config.imagePadding = 4
-            config.title = "Update"
+            config.image = UIImage(systemName: "arrow.down.circle.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .bold))
+            config.imagePadding = 3
+            config.title = "lc.appBanner.update".loc
             updateButton.configuration = config
             updateButton.isHidden = false
         } else {
@@ -361,7 +370,7 @@ final class LCAppBannerRunControl: UIControl {
     private var progress = 0.0
 
     override var intrinsicContentSize: CGSize {
-        CGSize(width: 70, height: 32)
+        CGSize(width: 70, height: 28)
     }
 
     override init(frame: CGRect) {
@@ -382,7 +391,7 @@ final class LCAppBannerRunControl: UIControl {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.text = "lc.appBanner.run".loc
         titleLabel.textColor = .white
-        titleLabel.font = .systemFont(ofSize: 16, weight: .bold)
+        titleLabel.font = .systemFont(ofSize: 15, weight: .bold)
         titleLabel.textAlignment = .center
         titleLabel.adjustsFontSizeToFitWidth = true
         titleLabel.minimumScaleFactor = 0.1

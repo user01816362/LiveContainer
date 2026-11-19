@@ -328,560 +328,59 @@ struct LCContainerView: View {
                 }
             )
 
-            launchRotationGroup
-            categoryKillSwitchesGroup
-            deviceIdentityGroup
-            systemAndDisplayGroup
-            localeAndTimeZoneGroup
-            batteryAndPowerGroup
-            telephonyGroup
-            networkHeadersGroup
-            accessibilityGroup
-            storageGroup
-            networkEnvironmentGroup
-            audioRoutesGroup
-            graphicsAndMetalGroup
-            webViewFingerprintGroup
-            appAndAccountPrivacyGroup
-            sensorsAndPermissionsGroup
+            LCContainerLaunchRotationSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerKillSwitchesSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerDeviceIdentitySection(
+                container: container,
+                typingIDFV: $typingIDFV,
+                typingSpoofDeviceName: $typingSpoofDeviceName,
+                typingSpoofDeviceModel: $typingSpoofDeviceModel,
+                typingSpoofHardwareModel: $typingSpoofHardwareModel,
+                selectedCatalogVariantId: $selectedCatalogVariantId,
+                onSyncDraftState: { syncDraftStateFromContainer() },
+                onSave: { saveSpoofProfile() }
+            )
+            LCContainerSystemAndDisplaySection(
+                container: container,
+                typingSpoofSystemName: $typingSpoofSystemName,
+                typingSpoofSystemVersion: $typingSpoofSystemVersion,
+                onSave: { saveSpoofProfile() }
+            )
+            LCContainerLocaleSection(
+                container: container,
+                typingSpoofLocaleIdentifier: $typingSpoofLocaleIdentifier,
+                typingSpoofTimeZoneIdentifier: $typingSpoofTimeZoneIdentifier,
+                showLocalePickerSheet: $showLocalePickerSheet,
+                showTimeZonePickerSheet: $showTimeZonePickerSheet,
+                onSave: { saveSpoofProfile() }
+            )
+            LCContainerBatterySection(
+                container: container,
+                typingSpoofBatteryLevel: $typingSpoofBatteryLevel,
+                spoofBatteryStateSelection: $spoofBatteryStateSelection,
+                spoofLowPowerModeEnabled: $spoofLowPowerModeEnabled,
+                onSave: { saveSpoofProfile() }
+            )
+            LCContainerTelephonySection(
+                container: container,
+                typingSpoofSubscriberIdentifier: $typingSpoofSubscriberIdentifier,
+                typingSpoofSubscriberCarrierTokenBase64: $typingSpoofSubscriberCarrierTokenBase64,
+                spoofSubscriberSIMInsertedEnabled: $spoofSubscriberSIMInsertedEnabled,
+                spoofSubscriberSIMInserted: $spoofSubscriberSIMInserted,
+                typingSpoofRadioAccessTechnology: $typingSpoofRadioAccessTechnology,
+                onSave: { saveSpoofProfile() }
+            )
+            LCContainerNetworkHeadersSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerAccessibilitySection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerStorageSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerNetworkEnvSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerAudioRoutesSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerGraphicsMetalSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerWebViewSection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerAppPrivacySection(container: container, onSave: { saveSpoofProfile() })
+            LCContainerSensorsSection(container: container, onSave: { saveSpoofProfile() })
         }
         .disabled(container.blockDeviceInfoReads)
-    }
-
-    // MARK: - Spoof Subgroups
-
-    @ViewBuilder
-    private var launchRotationGroup: some View {
-        Toggle("Rotate Profile Every Launch", isOn: $container.rotateSpoofProfileOnLaunch)
-            .onChange(of: container.rotateSpoofProfileOnLaunch) { _, _ in _ = saveSpoofProfile() }
-        if container.rotateSpoofProfileOnLaunch {
-            HStack {
-                Text("OS Major Versions")
-                TextField("26,27", text: $container.rotateOSMajorVersions)
-                    .multilineTextAlignment(.trailing)
-                    .keyboardType(.numbersAndPunctuation)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            Toggle("Use Real Device Templates", isOn: $container.rotateUsesRealDeviceTemplates)
-                .onChange(of: container.rotateUsesRealDeviceTemplates) { _, _ in _ = saveSpoofProfile() }
-            Text("Enter comma-separated OS major versions. Real Device Templates rotate among verified 2026–2027 iPhone/iPad specs cleanly.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var categoryKillSwitchesGroup: some View {
-        DisclosureGroup("Category Kill Switches") {
-            categoryToggle("Device Identity", isOn: $container.spoofIdentityCategoryEnabled)
-            categoryToggle("System", isOn: $container.spoofSystemCategoryEnabled)
-            categoryToggle("Display", isOn: $container.spoofDisplayCategoryEnabled)
-            categoryToggle("Locale & Time Zone", isOn: $container.spoofLocaleCategoryEnabled)
-            categoryToggle("Battery & Power", isOn: $container.spoofBatteryCategoryEnabled)
-            categoryToggle("Telephony", isOn: $container.spoofTelephonyCategoryEnabled)
-            categoryToggle("Network Headers", isOn: $container.spoofNetworkHeadersCategoryEnabled)
-            categoryToggle("Accessibility", isOn: $container.spoofAccessibilityCategoryEnabled)
-            categoryToggle("Storage", isOn: $container.spoofStorageCategoryEnabled)
-            categoryToggle("Network Environment", isOn: $container.spoofNetworkEnvironmentCategoryEnabled)
-            categoryToggle("Audio Routes", isOn: $container.spoofAudioCategoryEnabled)
-            categoryToggle("Graphics & Metal", isOn: $container.spoofGraphicsCategoryEnabled)
-            categoryToggle("WebView Fingerprint", isOn: $container.spoofWebViewCategoryEnabled)
-            categoryToggle("App & Account Privacy", isOn: $container.spoofAppPrivacyCategoryEnabled)
-            categoryToggle("Sensors & Permissions", isOn: $container.spoofSensorsAndUserDataCategoryEnabled)
-        }
-    }
-
-    @ViewBuilder
-    private var deviceIdentityGroup: some View {
-        DisclosureGroup("Device Identity") {
-            Toggle(isOn: $container.spoofIdentifierForVendor) {
-                Text("lc.container.spoofIdentifierForVendor".loc)
-            }
-            .onChange(of: container.spoofIdentifierForVendor) { _, _ in _ = saveSpoofProfile() }
-
-            if container.spoofIdentifierForVendor {
-                HStack {
-                    Text("Vendor ID (UUID)")
-                    TextField("lc.common.auto".loc, text: $typingIDFV)
-                        .multilineTextAlignment(.trailing)
-                        .onSubmit { _ = saveSpoofProfile() }
-                }
-            }
-
-            HStack {
-                Text("Device Name")
-                TextField("iPhone", text: $typingSpoofDeviceName)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            HStack {
-                Text("Device Model")
-                TextField("iPhone", text: $typingSpoofDeviceModel)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-
-            Picker("Verified Hardware Model", selection: $selectedCatalogVariantId) {
-                Text("Custom / None").tag("")
-                ForEach(LCDeviceModelSpec.GroupKind.allCases) { group in
-                    Section(group.rawValue) {
-                        ForEach(LCDeviceModelSpec.all.filter { $0.groupKind == group }) { spec in
-                            Text(spec.marketingName).tag(spec.variantId)
-                        }
-                    }
-                }
-            }
-            .onChange(of: selectedCatalogVariantId) { _, newVariantId in
-                guard !newVariantId.isEmpty,
-                      let spec = LCDeviceModelSpec.find(variantId: newVariantId) else {
-                    if newVariantId.isEmpty {
-                        container.spoofDeviceVariantId = ""
-                    }
-                    return
-                }
-                container.applyHardwareSpec(spec)
-                syncDraftStateFromContainer()
-                _ = saveSpoofProfile()
-            }
-
-            HStack {
-                Text("Raw hw.machine")
-                TextField("iPhone19,3", text: $typingSpoofHardwareModel)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit {
-                        if let spec = LCDeviceModelSpec.find(hwMachine: typingSpoofHardwareModel),
-                           spec.variantId == selectedCatalogVariantId {
-                            _ = saveSpoofProfile()
-                        } else {
-                            selectedCatalogVariantId = ""
-                            container.spoofDeviceVariantId = ""
-                            _ = saveSpoofProfile()
-                        }
-                    }
-            }
-        }
-        .disabled(!container.spoofIdentityCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var systemAndDisplayGroup: some View {
-        DisclosureGroup("System & Display") {
-            HStack {
-                Text("System Name")
-                TextField("iOS", text: $typingSpoofSystemName)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            HStack {
-                Text("System Version")
-                TextField("27.2", text: $typingSpoofSystemVersion)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            featureToggle("Report Low Data Mode Disabled", "system.lowDataMode")
-
-            DisclosureGroup("Advanced Hardware & Display") {
-                labeledTextRow("Host Name", placeholder: "iPhone-18-Pro-Max", text: $container.spoofHostName)
-                labeledTextRow("Board Config (hw.model)", placeholder: "V64AP", text: $container.spoofBoardModel)
-                labeledTextRow("Kernel Version", placeholder: "Darwin Kernel Version 26.2.0", text: $container.spoofKernelVersion)
-                labeledInt64Row("Boot Time (Unix)", value: $container.spoofBootTime)
-                labeledIntRow("CPU Type", value: $container.spoofCPUType)
-                labeledIntRow("CPU Subtype", value: $container.spoofCPUSubtype)
-                Stepper("Processor Cores: \(container.spoofProcessorCount)", value: $container.spoofProcessorCount, in: 1...16)
-                    .onChange(of: container.spoofProcessorCount) { _, _ in _ = saveSpoofProfile() }
-                Picker("Physical Memory", selection: $container.spoofPhysicalMemory) {
-                    Text("2 GB").tag(Int64(2 * 1_073_741_824))
-                    Text("3 GB").tag(Int64(3 * 1_073_741_824))
-                    Text("4 GB").tag(Int64(4 * 1_073_741_824))
-                    Text("6 GB").tag(Int64(6 * 1_073_741_824))
-                    Text("8 GB").tag(Int64(8 * 1_073_741_824))
-                    Text("12 GB").tag(Int64(12 * 1_073_741_824))
-                    Text("16 GB").tag(Int64(16 * 1_073_741_824))
-                }
-                .onChange(of: container.spoofPhysicalMemory) { _, _ in _ = saveSpoofProfile() }
-
-                Picker("Thermal State", selection: $container.spoofThermalState) {
-                    Text("Nominal").tag(0)
-                    Text("Fair").tag(1)
-                    Text("Serious").tag(2)
-                    Text("Critical").tag(3)
-                }
-                .onChange(of: container.spoofThermalState) { _, _ in _ = saveSpoofProfile() }
-
-                displayGeometrySubgroup
-                Button("Save System & Display") { _ = saveSpoofProfile() }
-            }
-        }
-        .disabled(!container.spoofSystemCategoryEnabled && !container.spoofDisplayCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var displayGeometrySubgroup: some View {
-        HStack {
-            Text("Native Pixels")
-            TextField("Width", value: $container.spoofScreenWidth, format: .number)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.trailing)
-            Text("×")
-            TextField("Height", value: $container.spoofScreenHeight, format: .number)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.trailing)
-        }
-        labeledDoubleRow("Screen Scale", value: $container.spoofScreenScale)
-        labeledDoubleRow("Native Scale", value: $container.spoofScreenNativeScale)
-        Picker("Maximum FPS", selection: $container.spoofMaximumFramesPerSecond) {
-            Text("60 Hz").tag(60)
-            Text("120 Hz").tag(120)
-        }
-        .onChange(of: container.spoofMaximumFramesPerSecond) { _, _ in _ = saveSpoofProfile() }
-        labeledDoubleRow("Brightness (0–1)", value: $container.spoofScreenBrightness)
-        Picker("Appearance", selection: $container.spoofUserInterfaceStyle) {
-            Text("Use System").tag(0)
-            Text("Light Mode").tag(1)
-            Text("Dark Mode").tag(2)
-        }
-        .onChange(of: container.spoofUserInterfaceStyle) { _, _ in _ = saveSpoofProfile() }
-        Picker("Display Gamut", selection: $container.spoofDisplayGamut) {
-            Text("Unspecified").tag(0)
-            Text("sRGB").tag(1)
-            Text("Display P3").tag(2)
-        }
-        .onChange(of: container.spoofDisplayGamut) { _, _ in _ = saveSpoofProfile() }
-        Picker("Horizontal Size Class", selection: $container.spoofHorizontalSizeClass) {
-            Text("Unspecified").tag(0)
-            Text("Compact").tag(1)
-            Text("Regular").tag(2)
-        }
-        .onChange(of: container.spoofHorizontalSizeClass) { _, _ in _ = saveSpoofProfile() }
-        Picker("Vertical Size Class", selection: $container.spoofVerticalSizeClass) {
-            Text("Unspecified").tag(0)
-            Text("Compact").tag(1)
-            Text("Regular").tag(2)
-        }
-        .onChange(of: container.spoofVerticalSizeClass) { _, _ in _ = saveSpoofProfile() }
-        Picker("Text Size", selection: $container.spoofPreferredContentSizeCategory) {
-            Text("Extra Small").tag("UICTContentSizeCategoryXS")
-            Text("Small").tag("UICTContentSizeCategoryS")
-            Text("Medium").tag("UICTContentSizeCategoryM")
-            Text("Large").tag("UICTContentSizeCategoryL")
-            Text("Extra Large").tag("UICTContentSizeCategoryXL")
-            Text("XX Large").tag("UICTContentSizeCategoryXXL")
-            Text("XXX Large").tag("UICTContentSizeCategoryXXXL")
-            Text("Accessibility Medium").tag("UICTContentSizeCategoryAccessibilityM")
-            Text("Accessibility Large").tag("UICTContentSizeCategoryAccessibilityL")
-            Text("Accessibility XL").tag("UICTContentSizeCategoryAccessibilityXL")
-            Text("Accessibility XXL").tag("UICTContentSizeCategoryAccessibilityXXL")
-            Text("Accessibility XXXL").tag("UICTContentSizeCategoryAccessibilityXXXL")
-        }
-        .onChange(of: container.spoofPreferredContentSizeCategory) { _, _ in _ = saveSpoofProfile() }
-        HStack {
-            Text("Safe Area T/B")
-            TextField("Top", value: $container.spoofSafeAreaTop, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-            TextField("Bottom", value: $container.spoofSafeAreaBottom, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-        }
-        HStack {
-            Text("Safe Area L/R")
-            TextField("Left", value: $container.spoofSafeAreaLeft, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-            TextField("Right", value: $container.spoofSafeAreaRight, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-        }
-    }
-
-    @ViewBuilder
-    private var localeAndTimeZoneGroup: some View {
-        DisclosureGroup("Locale & Time Zone") {
-            HStack {
-                Text("Locale ID")
-                TextField("en_US", text: $typingSpoofLocaleIdentifier)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            Button {
-                showLocalePickerSheet = true
-            } label: {
-                HStack {
-                    Text("Browse Locales")
-                    Spacer()
-                    Text(LCContainerProfileCatalog.localeDisplayName(typingSpoofLocaleIdentifier))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            HStack {
-                Text("Time Zone")
-                TextField("America/New_York", text: $typingSpoofTimeZoneIdentifier)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            Button {
-                showTimeZonePickerSheet = true
-            } label: {
-                HStack {
-                    Text("Browse Time Zones")
-                    Spacer()
-                    Text(typingSpoofTimeZoneIdentifier.isEmpty ? "None (Use Host)" : typingSpoofTimeZoneIdentifier)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            featureToggle("Hide Active Keyboard/Input Modes", "locale.inputModes")
-            Button("Save Locale & Time Zone") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofLocaleCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var batteryAndPowerGroup: some View {
-        DisclosureGroup("Battery & Power") {
-            HStack {
-                Text("Battery Level (0–1)")
-                TextField("0.84", text: $typingSpoofBatteryLevel)
-                    .keyboardType(.decimalPad)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            Picker("Battery State", selection: $spoofBatteryStateSelection) {
-                Text("Unknown").tag(UIDevice.BatteryState.unknown.rawValue)
-                Text("Unplugged").tag(UIDevice.BatteryState.unplugged.rawValue)
-                Text("Charging").tag(UIDevice.BatteryState.charging.rawValue)
-                Text("Full").tag(UIDevice.BatteryState.full.rawValue)
-            }
-            .onChange(of: spoofBatteryStateSelection) { _, _ in _ = saveSpoofProfile() }
-            Toggle("Low Power Mode", isOn: $spoofLowPowerModeEnabled)
-                .onChange(of: spoofLowPowerModeEnabled) { _, _ in _ = saveSpoofProfile() }
-            Button("Save Battery") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofBatteryCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var telephonyGroup: some View {
-        DisclosureGroup("Telephony") {
-            HStack {
-                Text("Subscriber ID")
-                TextField("UUID", text: $typingSpoofSubscriberIdentifier)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            HStack {
-                Text("Carrier Token (Base64)")
-                TextField("Optional", text: $typingSpoofSubscriberCarrierTokenBase64)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { _ = saveSpoofProfile() }
-            }
-            Toggle("Spoof SIM Inserted", isOn: $spoofSubscriberSIMInsertedEnabled)
-                .onChange(of: spoofSubscriberSIMInsertedEnabled) { _, _ in _ = saveSpoofProfile() }
-            if spoofSubscriberSIMInsertedEnabled {
-                Toggle("SIM Inserted", isOn: $spoofSubscriberSIMInserted)
-                    .onChange(of: spoofSubscriberSIMInserted) { _, _ in _ = saveSpoofProfile() }
-            }
-            Picker("Radio Tech", selection: $typingSpoofRadioAccessTechnology) {
-                Text("None (Use Host)").tag("")
-                ForEach(availableRadioAccessTechnologies(), id: \.self) { tech in
-                    Text(tech).tag(tech)
-                }
-            }
-            .onChange(of: typingSpoofRadioAccessTechnology) { _, _ in _ = saveSpoofProfile() }
-            Button("Save Telephony") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofTelephonyCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var networkHeadersGroup: some View {
-        DisclosureGroup("Network Headers") {
-            featureToggle("Rewrite User-Agent Headers", "networkHeaders.userAgent")
-            labeledTextRow("Custom User-Agent", placeholder: "Empty = synthesized", text: $container.spoofCustomUserAgent)
-            Button("Save Network Headers") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofNetworkHeadersCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var accessibilityGroup: some View {
-        DisclosureGroup("Accessibility") {
-            Picker("Contrast", selection: $container.spoofAccessibilityContrast) {
-                Text("Normal").tag(0)
-                Text("High").tag(1)
-            }
-            .onChange(of: container.spoofAccessibilityContrast) { _, _ in _ = saveSpoofProfile() }
-            DisclosureGroup("Accessibility Features Reported Off") {
-                featureToggle("VoiceOver", "accessibility.voiceOver")
-                featureToggle("Switch Control", "accessibility.switchControl")
-                featureToggle("Guided Access", "accessibility.guidedAccess")
-                featureToggle("Grayscale", "accessibility.grayscale")
-                featureToggle("Invert Colors", "accessibility.invertColors")
-                featureToggle("Reduce Motion", "accessibility.reduceMotion")
-                featureToggle("Reduce Transparency", "accessibility.reduceTransparency")
-                featureToggle("AssistiveTouch", "accessibility.assistiveTouch")
-                featureToggle("Shake to Undo", "accessibility.shakeToUndo")
-                featureToggle("Bold Text", "accessibility.boldText")
-                featureToggle("Button Shapes", "accessibility.buttonShapes")
-                featureToggle("Darker System Colors", "accessibility.darkerColors")
-                featureToggle("Mono Audio", "accessibility.monoAudio")
-                featureToggle("Speak Screen", "accessibility.speakScreen")
-                featureToggle("Speak Selection", "accessibility.speakSelection")
-                featureToggle("Closed Captions", "accessibility.closedCaptions")
-                featureToggle("Video Autoplay", "accessibility.videoAutoplay")
-                featureToggle("Differentiate Without Color", "accessibility.differentiateWithoutColor")
-                featureToggle("On/Off Switch Labels", "accessibility.onOffLabels")
-            }
-        }
-        .disabled(!container.spoofAccessibilityCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var storageGroup: some View {
-        DisclosureGroup("Storage") {
-            featureToggle("Override Capacity", "storage.capacity")
-            labeledInt64Row("Total Capacity (Bytes)", value: $container.spoofStorageTotalCapacity)
-            labeledInt64Row("Available Capacity (Bytes)", value: $container.spoofStorageAvailableCapacity)
-            featureToggle("Override Volume Identity", "storage.identity")
-            labeledTextRow("Volume Name", placeholder: "Data", text: $container.spoofStorageVolumeName)
-            labeledTextRow("Volume UUID", placeholder: "UUID", text: $container.spoofStorageVolumeUUID)
-            featureToggle("Override Creation Dates", "storage.creationDates")
-            labeledInt64Row("File Creation (Unix)", value: $container.spoofStorageFileCreationTime)
-            labeledInt64Row("Volume Creation (Unix)", value: $container.spoofStorageVolumeCreationTime)
-            Button("Save Storage") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofStorageCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var networkEnvironmentGroup: some View {
-        DisclosureGroup("Network Environment") {
-            featureToggle("Override Host Name", "network.hostName")
-            featureToggle("Hide Network Interfaces", "network.interfaces")
-            featureToggle("Stop Path Monitoring (Off by Default)", "network.pathMonitor")
-            featureToggle("Block Bonjour / Service Discovery", "network.serviceDiscovery")
-            featureToggle("Hide Proxy and VPN Settings", "network.proxy")
-        }
-        .disabled(!container.spoofNetworkEnvironmentCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var audioRoutesGroup: some View {
-        DisclosureGroup("Audio Routes") {
-            featureToggle("Hide Available Inputs", "audio.availableInputs")
-            featureToggle("Hide Current Route Inputs/Outputs", "audio.routes")
-            featureToggle("Override Output Volume", "audio.outputVolume")
-            labeledDoubleRow("Output Volume (0–1)", value: $container.spoofAudioOutputVolume)
-            featureToggle("Override Sample Rate", "audio.sampleRate")
-            labeledDoubleRow("Sample Rate (Hz)", value: $container.spoofAudioSampleRate)
-            featureToggle("Override Output Latency", "audio.outputLatency")
-            labeledDoubleRow("Output Latency (s)", value: $container.spoofAudioOutputLatency)
-            featureToggle("Override Input Latency", "audio.inputLatency")
-            labeledDoubleRow("Input Latency (s)", value: $container.spoofAudioInputLatency)
-            featureToggle("Override Other Audio Playing", "audio.otherPlaying")
-            Toggle("Other Audio Playing", isOn: $container.spoofAudioOtherPlaying)
-                .onChange(of: container.spoofAudioOtherPlaying) { _, _ in _ = saveSpoofProfile() }
-            featureToggle("Override Channel Counts", "audio.channels")
-            Stepper("Output Channels: \(container.spoofAudioOutputChannels)", value: $container.spoofAudioOutputChannels, in: 0...32)
-                .onChange(of: container.spoofAudioOutputChannels) { _, _ in _ = saveSpoofProfile() }
-            Stepper("Input Channels: \(container.spoofAudioInputChannels)", value: $container.spoofAudioInputChannels, in: 0...32)
-                .onChange(of: container.spoofAudioInputChannels) { _, _ in _ = saveSpoofProfile() }
-            Button("Save Audio") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofAudioCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var graphicsAndMetalGroup: some View {
-        DisclosureGroup("Graphics & Metal") {
-            featureToggle("Override GPU Name", "graphics.name")
-            labeledTextRow("GPU Name", placeholder: "Apple A20 Pro GPU", text: $container.spoofGPUName)
-            featureToggle("Override Recommended Working Set", "graphics.workingSet")
-            labeledInt64Row("Working Set (Bytes)", value: $container.spoofGPUWorkingSetSize)
-            featureToggle("Report Ray Tracing Support", "graphics.rayTracing")
-            Toggle("Ray Tracing Result", isOn: $container.spoofGraphicsSupportsRayTracing)
-                .onChange(of: container.spoofGraphicsSupportsRayTracing) { _, _ in _ = saveSpoofProfile() }
-            featureToggle("Report All Metal Families", "graphics.allFamilies")
-            Toggle("Metal Families Result", isOn: $container.spoofGraphicsSupportsAllFamilies)
-                .onChange(of: container.spoofGraphicsSupportsAllFamilies) { _, _ in _ = saveSpoofProfile() }
-            Button("Save Graphics") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofGraphicsCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var webViewFingerprintGroup: some View {
-        DisclosureGroup("WebView Fingerprint") {
-            featureToggle("Override Navigator and User-Agent", "web.navigator")
-            featureToggle("Override Screen and Device Pixel Ratio", "web.screen")
-            featureToggle("Override Time Zone", "web.timeZone")
-            featureToggle("Override WebGL (WebGL1 + WebGL2)", "web.webGL")
-            labeledTextRow("WebGL Vendor", placeholder: "Apple Inc.", text: $container.spoofWebGLVendor)
-            labeledTextRow("WebGL Renderer", placeholder: "Apple GPU", text: $container.spoofWebGLRenderer)
-            featureToggle("Override Canvas Output", "web.canvas")
-            HStack {
-                labeledTextRow("Canvas & Audio Farbling Seed", placeholder: "0xA53F91C2", text: $container.spoofWebCanvasSeed)
-                Button {
-                    container.spoofWebCanvasSeed = String(format: "0x%08X", UInt32.random(in: 1...UInt32.max))
-                    _ = saveSpoofProfile()
-                } label: {
-                    Image(systemName: "die.face.5")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Randomize Canvas Farbling Seed")
-            }
-            Stepper("Color Depth: \(container.spoofWebColorDepth)", value: $container.spoofWebColorDepth, in: 1...64)
-                .onChange(of: container.spoofWebColorDepth) { _, _ in _ = saveSpoofProfile() }
-            Button("Save WebView") { _ = saveSpoofProfile() }
-        }
-        .disabled(!container.spoofWebViewCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var appAndAccountPrivacyGroup: some View {
-        DisclosureGroup("App & Account Privacy") {
-            featureToggle("Hide URL-Scheme App Detection", "app.canOpenURL")
-            featureToggle("Use Neutral Font Families", "app.fonts")
-            featureToggle("Hide Installed Speech Voices", "app.voices")
-            featureToggle("Hide iCloud Account Identity", "app.iCloud")
-            featureToggle("Use Isolated General Pasteboard", "app.pasteboard")
-        }
-        .disabled(!container.spoofAppPrivacyCategoryEnabled)
-    }
-
-    @ViewBuilder
-    private var sensorsAndPermissionsGroup: some View {
-        DisclosureGroup("Sensors & Permissions (Deny/Hide)") {
-            featureToggle("Accelerometer Unavailable", "sensors.accelerometer")
-            featureToggle("Gyroscope Unavailable", "sensors.gyroscope")
-            featureToggle("Magnetometer Unavailable", "sensors.magnetometer")
-            featureToggle("Device Motion Unavailable", "sensors.deviceMotion")
-            featureToggle("Pedometer Unavailable", "sensors.pedometer")
-            featureToggle("Altimeter Unavailable", "sensors.altimeter")
-            featureToggle("Deny Location Status", "permissions.location")
-            featureToggle("Deny Camera & Microphone Status", "permissions.capture")
-            featureToggle("Deny Photos Status", "permissions.photos")
-            featureToggle("Deny Contacts Status", "permissions.contacts")
-            featureToggle("Deny Calendars & Reminders Status", "permissions.events")
-            featureToggle("Deny Media Library Status", "permissions.media")
-            featureToggle("Deny Bluetooth Status", "permissions.bluetooth")
-        }
-        .disabled(!container.spoofSensorsAndUserDataCategoryEnabled)
     }
 
     // MARK: - Container Management & Unavailable Bookmark Sections
@@ -937,67 +436,6 @@ struct LCContainerView: View {
             } label: {
                 Text("lc.container.removeContainer".loc)
             }
-        }
-    }
-
-    // MARK: - Field Helpers
-
-    private func categoryToggle(_ title: String, isOn: Binding<Bool>) -> some View {
-        Toggle(title, isOn: isOn)
-            .onChange(of: isOn.wrappedValue) { _, _ in _ = saveSpoofProfile() }
-    }
-
-    private func featureBinding(_ key: String) -> Binding<Bool> {
-        Binding(
-            get: { container.isSpoofFeatureEnabled(key) },
-            set: { value in
-                var overrides = container.spoofFeatureOverrides
-                overrides[key] = value
-                container.spoofFeatureOverrides = overrides
-                _ = saveSpoofProfile()
-            }
-        )
-    }
-
-    private func featureToggle(_ title: String, _ key: String) -> some View {
-        Toggle(title, isOn: featureBinding(key))
-    }
-
-    private func labeledTextRow(_ label: String, placeholder: String, text: Binding<String>) -> some View {
-        HStack {
-            Text(label)
-            TextField(placeholder, text: text)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .multilineTextAlignment(.trailing)
-                .onSubmit { _ = saveSpoofProfile() }
-        }
-    }
-
-    private func labeledIntRow(_ label: String, value: Binding<Int>) -> some View {
-        HStack {
-            Text(label)
-            TextField(label, value: value, format: .number)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.trailing)
-        }
-    }
-
-    private func labeledInt64Row(_ label: String, value: Binding<Int64>) -> some View {
-        HStack {
-            Text(label)
-            TextField(label, value: value, format: .number)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.trailing)
-        }
-    }
-
-    private func labeledDoubleRow(_ label: String, value: Binding<Double>) -> some View {
-        HStack {
-            Text(label)
-            TextField(label, value: value, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
         }
     }
 
@@ -1395,18 +833,6 @@ struct LCContainerView: View {
             return zone.identifier
         }
         return nil
-    }
-
-    func availableRadioAccessTechnologies() -> [String] {
-        [
-            "CTRadioAccessTechnologyNR",
-            "CTRadioAccessTechnologyNRNSA",
-            "CTRadioAccessTechnologyLTE",
-            "CTRadioAccessTechnologyWCDMA",
-            "CTRadioAccessTechnologyHSDPA",
-            "CTRadioAccessTechnologyHSUPA",
-            "CTRadioAccessTechnologyCDMAEVDORevA"
-        ]
     }
 
     func currentSysctlString(_ name: String) -> String {

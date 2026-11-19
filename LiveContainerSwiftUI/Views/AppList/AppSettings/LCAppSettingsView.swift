@@ -119,13 +119,11 @@ struct LCAppSettingsView: View {
             }
             
             Section {
-                List{
-                    ForEach(model.uiContainers.indices, id:\.self) { i in
-                        NavigationLink {
-                            LCContainerView(container: model.uiContainers[i], uiDefaultDataFolder: $model.uiDefaultDataFolder, delegate: self)
-                        } label: {
-                            Text(model.uiContainers[i].name)
-                        }
+                ForEach(model.uiContainers.indices, id:\.self) { i in
+                    NavigationLink {
+                        LCContainerView(container: model.uiContainers[i], uiDefaultDataFolder: $model.uiDefaultDataFolder, delegate: self)
+                    } label: {
+                        Text(model.uiContainers[i].name)
                     }
                 }
                 if(model.uiContainers.count < SharedModel.keychainAccessGroupCount) {

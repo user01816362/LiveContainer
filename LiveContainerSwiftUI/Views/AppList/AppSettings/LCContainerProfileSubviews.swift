@@ -20,6 +20,16 @@ enum LCContainerProfileCatalog {
         $0.localizedStandardCompare($1) == .orderedAscending
     }
 
+    static let availableRadioAccessTechnologies: [String] = [
+        "CTRadioAccessTechnologyNR",
+        "CTRadioAccessTechnologyNRNSA",
+        "CTRadioAccessTechnologyLTE",
+        "CTRadioAccessTechnologyWCDMA",
+        "CTRadioAccessTechnologyHSDPA",
+        "CTRadioAccessTechnologyHSUPA",
+        "CTRadioAccessTechnologyCDMAEVDORevA"
+    ]
+
     static func localeDisplayName(_ identifier: String) -> String {
         if identifier.isEmpty { return "None (Use Host)" }
         let localized = Locale.current.localizedString(forIdentifier: identifier) ?? identifier
