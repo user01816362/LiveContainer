@@ -543,7 +543,7 @@ final class AltStoreSourcesViewModel: ObservableObject {
 }
 
 private extension AltStoreSourcesViewModel {
-    private static let cacheDirectoryName = "AltStoreSourceCache"
+    nonisolated private static let cacheDirectoryName = "AltStoreSourceCache"
 
     nonisolated static func cachedData(for url: URL) -> Data? {
         guard let fileURL = cacheFileURL(for: url) else { return nil }
