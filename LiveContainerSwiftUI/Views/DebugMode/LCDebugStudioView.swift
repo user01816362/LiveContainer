@@ -68,7 +68,7 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> UIViewController {
-        guard let vc = AppSceneViewController(bundleId: relativeBundlePath, dataUUID: dataUUID, delegate: context.coordinator) else {
+        guard let vc = AppSceneViewController(bundleId: relativeBundlePath, dataUUID: dataUUID, debugMode: true, delegate: context.coordinator) else {
             return UIViewController()
         }
         return vc
@@ -101,8 +101,21 @@ struct LCDebugStudioView: View {
     @State private var isInspectorOpen = true
     @State private var selectedTab: LCDebugInspectorTab = .console
 
+    private enum LogStreamFilter: String, CaseIterable, Identifiable {
+        case all = "All"
+        case stdio = "Stdio"
+        case nslog = "NSLog"
+        case oslog = "OSLog"
+        case webview = "Web"
+        case errors = "Errors"
+
+        var id: String { rawValue }
+    }
+
     @State private var logSearch = ""
+    @State private var logFilter: LogStreamFilter = .all
     @State private var networkSearch = ""
+    @State private var eventSearch = ""
     @State private var classSearch = ""
     @State private var hideSystemDylibs = true
     @State private var copiedBanner: String? = nil
@@ -132,6 +145,14 @@ struct LCDebugStudioView: View {
 
                 if let macURL = manager.macLANURLString {
                     macNetworkBanner(url: macURL)
+                        .padding(.horizontal, 12)
+                }
+
+                if let connError = manager.connectionError {
+                    connectionStatusBanner(message: connError, isError: true)
+                        .padding(.horizontal, 12)
+                } else if readyRelativePath != nil && !manager.isConnected {
+                    connectionStatusBanner(message: manager.isConnecting ? "Connecting to JIT-Less Debug Agent…" : "Waiting for Debug Agent…", isError: false)
                         .padding(.horizontal, 12)
                 }
 
@@ -212,9 +233,7 @@ struct LCDebugStudioView: View {
                         telemetryPill("\(String(format: "%.0f", manager.cpuPercent))%")
                         telemetryPill("\(String(format: "%.0f", manager.memoryMB))M")
                         telemetryPill("\(manager.fps)FPS")
-                        if manager.isJIT {
-                            telemetryPill("JIT", tint: .green)
-                        }
+                        telemetryPill(manager.isJIT ? "JIT" : "JIT-Less", tint: manager.isJIT ? .green : .mint)
                     }
                 }
 
@@ -272,6 +291,34 @@ struct LCDebugStudioView: View {
             .padding(.horizontal, 5)
             .padding(.vertical, 2)
             .background(.white.opacity(0.08), in: .capsule)
+    }
+
+    private func connectionStatusBanner(message: String, isError: Bool) -> some View {
+        HStack(spacing: 8) {
+            if isError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            } else {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.cyan)
+            }
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(isError ? .orange : .secondary)
+                .lineLimit(2)
+            Spacer()
+            if isError {
+                Button("Reconnect") {
+                    manager.reconnect()
+                }
+                .buttonStyle(.glass)
+                .controlSize(.mini)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: .capsule)
     }
 
     private func macNetworkBanner(url: String) -> some View {
@@ -388,7 +435,7 @@ struct LCDebugStudioView: View {
                     Button {
                         Task { await manager.attachJIT(for: appModel) }
                     } label: {
-                        Label("Attach JIT", systemImage: "bolt.fill")
+                        Label("JIT (Optional)", systemImage: "bolt.fill")
                     }
                     .buttonStyle(.glass)
 
@@ -436,6 +483,8 @@ struct LCDebugStudioView: View {
             return "Console (\(manager.logs.count))"
         case .network:
             return "Network (\(manager.networkEntries.count))"
+        case .events:
+            return "Events (\(manager.uiEvents.count))"
         default:
             return tab.rawValue
         }
@@ -478,6 +527,8 @@ struct LCDebugStudioView: View {
                 consolePanel
             case .network:
                 networkPanel
+            case .events:
+                eventsPanel
             case .hierarchy:
                 hierarchyPanel
             case .dylibs:
@@ -494,12 +545,22 @@ struct LCDebugStudioView: View {
 
     private var consolePanel: some View {
         VStack(spacing: 6) {
-            HStack {
-                TextField("Filter stdout / stderr…", text: $logSearch)
+            HStack(spacing: 6) {
+                TextField("Filter stdout / NSLog / OSLog / Web…", text: $logSearch)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
+                Button {
+                    Task { await manager.refreshStatusAndSnapshots() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.glass)
+                .controlSize(.mini)
                 Button("Copy") {
-                    let allText = filteredLogs.map { "[\($0.stream)] \($0.text)" }.joined(separator: "\n")
+                    let allText = filteredLogs.map {
+                        let sub = ($0.subsystem?.isEmpty == false) ? ":\($0.subsystem!)" : ""
+                        return "[\($0.stream)\(sub)] \($0.text)"
+                    }.joined(separator: "\n")
                     copyWithFeedback(allText, message: "Copied Console Logs")
                 }
                 .buttonStyle(.glass)
@@ -510,34 +571,94 @@ struct LCDebugStudioView: View {
                 .buttonStyle(.glass)
                 .controlSize(.mini)
             }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(LogStreamFilter.allCases) { filter in
+                        Button(filter.rawValue) {
+                            logFilter = filter
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(logFilter == filter ? Color.blue.opacity(0.75) : Color.white.opacity(0.08), in: .capsule)
+                        .foregroundStyle(.white)
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
-                    ForEach(filteredLogs) { entry in
-                        HStack(alignment: .top, spacing: 6) {
-                            Text(entry.stream.uppercased())
-                                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                .foregroundStyle(entry.stream == "stderr" ? .red : .cyan)
-                            Text(entry.text)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
+                    if filteredLogs.isEmpty {
+                        Text(manager.isConnected ? "No matching logs yet. Output from print(), NSLog, OSLog, WKWebView, and crashes will stream here live." : "Connecting to guest Debug Agent…")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                    } else {
+                        ForEach(filteredLogs) { entry in
+                            HStack(alignment: .top, spacing: 6) {
+                                Text(entry.stream.uppercased())
+                                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(logStreamColor(entry))
+                                if let sub = entry.subsystem, !sub.isEmpty {
+                                    Text(sub)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Text(entry.text)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(entry.isErrorLike ? .red : .white)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }
         }
     }
 
+    private func logStreamColor(_ entry: LCDebugLogEntry) -> Color {
+        if entry.isErrorLike { return .red }
+        switch entry.stream {
+        case "nslog": return .yellow
+        case "oslog": return .mint
+        case "webview": return .purple
+        case "debug": return .orange
+        default: return .cyan
+        }
+    }
+
     private var filteredLogs: [LCDebugLogEntry] {
         let q = logSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return manager.logs }
-        return manager.logs.filter { $0.text.localizedCaseInsensitiveContains(q) }
+        return manager.logs.filter { entry in
+            switch logFilter {
+            case .all: break
+            case .stdio:
+                guard entry.stream == "stdout" || entry.stream == "stderr" else { return false }
+            case .nslog:
+                guard entry.stream == "nslog" else { return false }
+            case .oslog:
+                guard entry.stream == "oslog" else { return false }
+            case .webview:
+                guard entry.stream == "webview" else { return false }
+            case .errors:
+                guard entry.isErrorLike else { return false }
+            }
+            guard !q.isEmpty else { return true }
+            return entry.text.localizedCaseInsensitiveContains(q)
+                || entry.stream.localizedCaseInsensitiveContains(q)
+                || (entry.subsystem?.localizedCaseInsensitiveContains(q) ?? false)
+                || (entry.category?.localizedCaseInsensitiveContains(q) ?? false)
+        }
     }
 
     private var networkPanel: some View {
         VStack(spacing: 6) {
             HStack {
-                TextField("Filter URL / Method…", text: $networkSearch)
+                TextField("Filter URL / Method / Source…", text: $networkSearch)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                 Button("Clear") {
@@ -550,7 +671,7 @@ struct LCDebugStudioView: View {
                 DisclosureGroup {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text("\(item.bytes) B · \(item.mimeType)")
+                            Text("\(item.displaySource) · \(item.bytes) B · \(item.mimeType)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -560,10 +681,29 @@ struct LCDebugStudioView: View {
                             .buttonStyle(.glass)
                             .controlSize(.mini)
                         }
-                        if !item.responseBodyPreview.isEmpty {
-                            Text(item.responseBodyPreview)
+                        if !item.requestHeaders.isEmpty {
+                            Text("Request Headers:\n\(formatHeaders(item.requestHeaders))")
                                 .font(.system(size: 10, design: .monospaced))
-                                .lineLimit(8)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        if !item.requestBodyPreview.isEmpty {
+                            Text("Request Body:\n\(item.requestBodyPreview)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.yellow)
+                                .lineLimit(6)
+                                .textSelection(.enabled)
+                        }
+                        if !item.responseHeaders.isEmpty {
+                            Text("Response Headers:\n\(formatHeaders(item.responseHeaders))")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        if !item.responseBodyPreview.isEmpty {
+                            Text("Response:\n\(item.responseBodyPreview)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .lineLimit(10)
                                 .textSelection(.enabled)
                         }
                     }
@@ -574,7 +714,7 @@ struct LCDebugStudioView: View {
                             .foregroundStyle(.cyan)
                         Text("\(item.statusCode)")
                             .font(.caption2.bold().monospaced())
-                            .foregroundStyle((200...299).contains(item.statusCode) ? .green : .red)
+                            .foregroundStyle((200...299).contains(item.statusCode) ? .green : (item.statusCode == 101 ? .cyan : .red))
                         Text(item.url)
                             .font(.caption.monospaced())
                             .lineLimit(1)
@@ -590,11 +730,79 @@ struct LCDebugStudioView: View {
         }
     }
 
+    private func formatHeaders(_ headers: [String: String]) -> String {
+        headers.keys.sorted().map { "\($0): \(headers[$0] ?? "")" }.joined(separator: "\n")
+    }
+
     private var filteredNetwork: [LCDebugNetworkEntry] {
         let q = networkSearch.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return manager.networkEntries }
         return manager.networkEntries.filter {
-            $0.url.localizedCaseInsensitiveContains(q) || $0.method.localizedCaseInsensitiveContains(q)
+            $0.url.localizedCaseInsensitiveContains(q)
+                || $0.method.localizedCaseInsensitiveContains(q)
+                || $0.displaySource.localizedCaseInsensitiveContains(q)
+        }
+    }
+
+    private var eventsPanel: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                TextField("Filter touches, tabs, VCs, windows…", text: $eventSearch)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button(manager.isNotificationMonitorEnabled ? "Notifs ON" : "Notifs") {
+                    Task { await manager.toggleNotificationMonitor() }
+                }
+                .buttonStyle(.glassProminent)
+                .tint(manager.isNotificationMonitorEnabled ? .blue : .secondary.opacity(0.35))
+                .controlSize(.mini)
+                Button("Clear") {
+                    Task { await manager.clearUIEvents() }
+                }
+                .buttonStyle(.glass)
+                .controlSize(.mini)
+            }
+            List(filteredUIEvents) { ev in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(ev.kind.uppercased())
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(eventKindColor(ev.kind))
+                        Text(ev.title)
+                            .font(.caption.bold().monospaced())
+                            .lineLimit(1)
+                    }
+                    Text("\(ev.detail)\(ev.viewController.isEmpty ? "" : " · VC: \(ev.viewController)")\(ev.window.isEmpty ? "" : " · \(ev.window)")")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+        }
+    }
+
+    private func eventKindColor(_ kind: String) -> Color {
+        switch kind {
+        case "touch": return .cyan
+        case "tab": return .green
+        case "nav": return .mint
+        case "modal": return .orange
+        case "window": return .yellow
+        case "notification": return .purple
+        default: return .blue
+        }
+    }
+
+    private var filteredUIEvents: [LCDebugUIEventEntry] {
+        let q = eventSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return manager.uiEvents }
+        return manager.uiEvents.filter {
+            $0.title.localizedCaseInsensitiveContains(q)
+                || $0.detail.localizedCaseInsensitiveContains(q)
+                || $0.kind.localizedCaseInsensitiveContains(q)
+                || $0.viewController.localizedCaseInsensitiveContains(q)
         }
     }
 
@@ -787,6 +995,7 @@ struct LCDebugStudioView: View {
     private func triggerTabLoad(_ tab: LCDebugInspectorTab) {
         Task {
             switch tab {
+            case .events: await manager.loadEvents()
             case .hierarchy: await manager.loadHierarchy()
             case .dylibs:
                 await manager.loadDylibs()
@@ -848,6 +1057,7 @@ struct LCDebugStudioView: View {
             return
         }
 
+        LCDebugStudioManager.clearStaleSessionMetadata()
         UserDefaults.lcShared().set(appModel.bundleIdentifier, forKey: "LCDebugPendingBundleID")
         UserDefaults.lcShared().set(relPath, forKey: "LCDebugPendingRelativePath")
         statusText = "Launching Debug Process…"

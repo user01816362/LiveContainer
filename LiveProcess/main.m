@@ -64,12 +64,23 @@ int LiveProcessMain(int argc, char *argv[]) {
     if(lpHome) setenv("LP_HOME_PATH", lpHome, 1);
     const char *overrideHomePath = [appInfo[@"lcHomePath"] fileSystemRepresentation];
     if(overrideHomePath) setenv("LC_HOME_PATH", overrideHomePath, 1);
+    if([appInfo[@"debugMode"] boolValue]) {
+        setenv("LC_DEBUG_MODE", "1", 1);
+    }
+    if([appInfo[@"debugStudioHosted"] boolValue]) {
+        setenv("LC_DEBUG_STUDIO_HOSTED", "1", 1);
+    }
     // Pass selected app info to user defaults
     NSUserDefaults *lcUserDefaults = NSUserDefaults.standardUserDefaults;
     [lcUserDefaults setObject:appInfo[@"hostUrlScheme"] forKey:@"hostUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"launchAppUrlScheme"] forKey:@"launchAppUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"selected"] forKey:@"selected"];
     [lcUserDefaults setObject:appInfo[@"selectedContainer"] forKey:@"selectedContainer"];
+    if([appInfo[@"debugMode"] boolValue]) {
+        [lcUserDefaults setBool:YES forKey:@"LCDebugLaunchRequested"];
+    } else {
+        [lcUserDefaults removeObjectForKey:@"LCDebugLaunchRequested"];
+    }
     
     bool access = false;
     NSArray* bookmarks = appInfo[@"bookmarks"];

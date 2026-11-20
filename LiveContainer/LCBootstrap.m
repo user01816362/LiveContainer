@@ -693,6 +693,18 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         appExecPath = strdup(selected32bitLayerBundle.executablePath.UTF8String);
         overwriteExecPath(appExecPath);
     }
+    NSString *pendingDebugBundleId = [lcSharedDefaults stringForKey:@"LCDebugPendingBundleID"];
+    NSString *pendingDebugRelPath = [lcSharedDefaults stringForKey:@"LCDebugPendingRelativePath"];
+    const char *envDebugMode = getenv("LC_DEBUG_MODE");
+    BOOL debugModeActive = (envDebugMode && envDebugMode[0] == '1') ||
+        [lcUserDefaults boolForKey:@"LCDebugLaunchRequested"] ||
+        [guestAppInfo[@"LCDebugModeEnabled"] boolValue] ||
+        (pendingDebugBundleId.length > 0 && ([pendingDebugBundleId isEqualToString:appBundle.bundleIdentifier] || [pendingDebugBundleId isEqualToString:lcGuestAppId])) ||
+        (pendingDebugRelPath.length > 0 && [pendingDebugRelPath isEqualToString:selectedApp]);
+    if (debugModeActive) {
+        setenv("LC_DEBUG_MODE", "1", 1);
+    }
+
     if(![guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
         tweakLoaderLoaded = true;
     }
@@ -724,18 +736,26 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return appError;
     }
     
-    NSString *pendingDebugBundleId = [lcSharedDefaults stringForKey:@"LCDebugPendingBundleID"];
-    NSString *pendingDebugRelPath = [lcSharedDefaults stringForKey:@"LCDebugPendingRelativePath"];
-    BOOL debugModeActive = [guestAppInfo[@"LCDebugModeEnabled"] boolValue] ||
-        (pendingDebugBundleId.length > 0 && ([pendingDebugBundleId isEqualToString:appBundle.bundleIdentifier] || [pendingDebugBundleId isEqualToString:lcGuestAppId])) ||
-        (pendingDebugRelPath.length > 0 && [pendingDebugRelPath isEqualToString:selectedApp]);
+    // Verify whether TweakLoader actually loaded via guest Mach-O LC_LOAD_DYLIB;
+    // unpatched binaries or dontInjectTweakLoader need explicit dlopen when debugging.
+    BOOL tweakLoaderSymbolPresent = (dlsym(RTLD_DEFAULT, "LCDebugAgentInitIfNeeded") != NULL);
     if(([guestAppInfo[@"dontInjectTweakLoader"] boolValue] && ![guestAppInfo[@"dontLoadTweakLoader"] boolValue]) ||
-       (debugModeActive && !tweakLoaderLoaded)) {
+       (debugModeActive && !tweakLoaderSymbolPresent)) {
         tweakLoaderLoaded = true;
-        if([guestAppInfo[@"hideLiveContainer"] boolValue]) {
-            dlopen([lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/TweakLoader.dylib"].UTF8String, RTLD_LAZY|RTLD_GLOBAL);
-        } else {
-            dlopen("@loader_path/../TweakLoader.dylib", RTLD_LAZY|RTLD_GLOBAL);
+        NSString *tweakLoaderRelative = isLiveProcess ? @"../../Frameworks/TweakLoader.dylib" : @"Frameworks/TweakLoader.dylib";
+        NSString *tweakLoaderFullPath = [[lcMainBundle.bundlePath stringByAppendingPathComponent:tweakLoaderRelative] stringByStandardizingPath];
+        void *tlHandle = NULL;
+        if([guestAppInfo[@"hideLiveContainer"] boolValue] || debugModeActive) {
+            tlHandle = dlopen(tweakLoaderFullPath.UTF8String, RTLD_LAZY|RTLD_GLOBAL);
+        }
+        if (!tlHandle) {
+            tlHandle = dlopen("@loader_path/../TweakLoader.dylib", RTLD_LAZY|RTLD_GLOBAL);
+        }
+        if (debugModeActive) {
+            void (*initDebugAgent)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "LCDebugAgentInitIfNeeded");
+            if (initDebugAgent) {
+                initDebugAgent();
+            }
         }
     }
     
@@ -794,7 +814,16 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     return [NSString stringWithFormat:@"App returned from its main function with code %d.", ret];
 }
 
+__attribute__((visibility("default")))
+kern_return_t LCRebindGlobalSymbol(void *replacee, void *replacement) {
+    return litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, replacee, replacement, nil);
+}
+
 static void exceptionHandler(NSException *exception) {
+    void (*recordDebugException)(NSException *) = (void (*)(NSException *))dlsym(RTLD_DEFAULT, "LCDebugAgentRecordUncaughtException");
+    if (recordDebugException) {
+        recordDebugException(exception);
+    }
     NSString *error = [NSString stringWithFormat:@"%@\nCall stack: %@", exception.reason, exception.callStackSymbols];
     if(isLiveProcess) {
         NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];

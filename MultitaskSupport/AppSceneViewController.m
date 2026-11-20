@@ -50,6 +50,10 @@ static UIScreen *LCFallbackActiveScreen(void) {
 
 
 - (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID delegate:(id<AppSceneViewControllerDelegate>)delegate {
+    return [self initWithBundleId:bundleId dataUUID:dataUUID debugMode:NO delegate:delegate];
+}
+
+- (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID debugMode:(BOOL)debugMode delegate:(id<AppSceneViewControllerDelegate>)delegate {
     self = [super initWithNibName:nil bundle:nil];
     self.delegate = delegate;
     self.dataUUID = dataUUID;
@@ -80,6 +84,8 @@ static UIScreen *LCFallbackActiveScreen(void) {
         @"selectedContainer": _dataUUID,
         @"bookmarks": bookmarks,
         @"lcHomePath": NSHomeDirectory(),
+        @"debugMode": @(debugMode),
+        @"debugStudioHosted": @(debugMode),
     }.mutableCopy;
     
     NSString* launchAppUrlScheme = [NSUserDefaults.standardUserDefaults stringForKey:@"launchAppUrlScheme"];

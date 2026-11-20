@@ -33,6 +33,7 @@ NS_SWIFT_UI_ACTOR
 @property(nonatomic, null_unspecified) _UIScenePresenter *presenter;
 @property(nonatomic, null_unspecified) _UISceneHostingController *hostingController;
 - (instancetype _Null_unspecified)initWithBundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID delegate:(id<AppSceneViewControllerDelegate> _Null_unspecified)delegate;
+- (instancetype _Null_unspecified)initWithBundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID debugMode:(BOOL)debugMode delegate:(id<AppSceneViewControllerDelegate> _Null_unspecified)delegate;
 - (void)setBackgroundNotificationEnabled:(bool)enabled;
 - (void)updateFrameWithSettingsBlock:(void (^ _Null_unspecified)(UIMutableApplicationSceneSettings * _Null_unspecified settings))block;
 - (void)updateSettingsWithBlock:(void (^ _Null_unspecified)(UIMutableApplicationSceneSettings * _Null_unspecified settings))block;

@@ -14,12 +14,26 @@ struct LCDebugLogEntry: Identifiable, Decodable, Hashable, Sendable {
     let id: String
     let timestamp: Double?
     let stream: String
+    let level: String?
+    let subsystem: String?
+    let category: String?
     let text: String
+
+    var effectiveLevel: String {
+        if let level, !level.isEmpty { return level }
+        if stream == "stderr" || stream == "crash" { return "error" }
+        return "info"
+    }
+
+    var isErrorLike: Bool {
+        stream == "stderr" || stream == "crash" || effectiveLevel == "error" || effectiveLevel == "fault"
+    }
 }
 
 struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable, Sendable {
     let id: String
     let timestamp: Double?
+    let source: String?
     let method: String
     let url: String
     let statusCode: Int
@@ -32,11 +46,31 @@ struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable, Sendable {
     let responseBodyPreview: String
     let curl: String
     let error: String
+
+    var displaySource: String {
+        switch source?.lowercased() {
+        case "webview": return "WebView"
+        case "websocket": return "WebSocket"
+        default: return "URLSession"
+        }
+    }
+}
+
+struct LCDebugUIEventEntry: Identifiable, Decodable, Hashable, Sendable {
+    let id: String
+    let timestamp: Double?
+    let kind: String
+    let title: String
+    let detail: String
+    let target: String
+    let viewController: String
+    let window: String
 }
 
 struct LCDebugSelectedView: Decodable, Hashable, Sendable {
     let viewClass: String
     let viewController: String
+    let windowClass: String?
     let frame: String
     let bounds: String
     let accessibilityIdentifier: String
@@ -46,10 +80,14 @@ struct LCDebugSelectedView: Decodable, Hashable, Sendable {
     let tag: Int
     let backgroundColor: String
     let subviewCount: Int
+    let constraintsCount: Int?
+    let isSwiftUI: Bool?
+    let responderChain: [String]?
 
     enum CodingKeys: String, CodingKey {
         case viewClass = "class"
         case viewController
+        case windowClass
         case frame
         case bounds
         case accessibilityIdentifier
@@ -59,6 +97,9 @@ struct LCDebugSelectedView: Decodable, Hashable, Sendable {
         case tag
         case backgroundColor
         case subviewCount
+        case constraintsCount
+        case isSwiftUI
+        case responderChain
     }
 }
 
@@ -69,6 +110,7 @@ struct LCDebugStatusSnapshot: Decodable, Sendable {
     let lanPort: Int?
     let lanEnabled: Bool?
     let lanIP: String?
+    let authToken: String?
     let cpuPercent: Double?
     let memoryMB: Double?
     let fps: Int?
@@ -76,6 +118,7 @@ struct LCDebugStatusSnapshot: Decodable, Sendable {
     let isJIT: Bool?
     let xrayEnabled: Bool?
     let tapInspectEnabled: Bool?
+    let notificationMonitorEnabled: Bool?
     let selectedView: LCDebugSelectedView?
 }
 
@@ -136,7 +179,6 @@ struct LCDebugSandboxSummary: Decodable, Sendable {
         files = (try? container.decode([LCDebugSandboxFile].self, forKey: .files)) ?? []
         keychainItems = (try? container.decode([LCDebugKeychainItem].self, forKey: .keychainItems)) ?? []
 
-        // Coerce arbitrary JSON values in userDefaults into readable strings.
         if let rawDict = try? container.decode([String: LCDebugAnyCodable].self, forKey: .userDefaults) {
             var coerced: [String: String] = [:]
             for (k, v) in rawDict {
@@ -198,6 +240,7 @@ struct LCDebugFridaInfo: Decodable, Sendable {
 enum LCDebugInspectorTab: String, CaseIterable, Identifiable, Sendable {
     case console = "Console"
     case network = "Network"
+    case events = "UI & Events"
     case hierarchy = "Hierarchy"
     case dylibs = "Dylibs & ObjC"
     case sandbox = "Sandbox & Keys"
@@ -209,6 +252,7 @@ enum LCDebugInspectorTab: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .console: return "terminal.fill"
         case .network: return "network"
+        case .events: return "cursorarrow.click.2"
         case .hierarchy: return "square.3.layers.3d"
         case .dylibs: return "shippingbox.fill"
         case .sandbox: return "folder.fill"
@@ -217,9 +261,16 @@ enum LCDebugInspectorTab: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+private struct LCDebugSessionFilePayload: Decodable, Sendable {
+    let pid: Int
+    let localPort: Int
+    let authToken: String?
+}
+
 @MainActor
 final class LCDebugStudioManager: ObservableObject {
     @Published var isConnected = false
+    @Published var isConnecting = false
     @Published var connectionError: String? = nil
     @Published var pid: Int = 0
     @Published var localPort: Int = 0
@@ -234,10 +285,12 @@ final class LCDebugStudioManager: ObservableObject {
     @Published var isJIT = false
     @Published var isXRayEnabled = false
     @Published var isTapInspectEnabled = false
+    @Published var isNotificationMonitorEnabled = false
     @Published var selectedView: LCDebugSelectedView? = nil
 
     @Published var logs: [LCDebugLogEntry] = []
     @Published var networkEntries: [LCDebugNetworkEntry] = []
+    @Published var uiEvents: [LCDebugUIEventEntry] = []
     @Published var hierarchyText: String = ""
     @Published var dylibs: [LCDebugDylibEntry] = []
     @Published var objcClasses: [String] = []
@@ -246,6 +299,7 @@ final class LCDebugStudioManager: ObservableObject {
     @Published var fridaInfo: LCDebugFridaInfo? = nil
     @Published var jitStatusBanner: String? = nil
 
+    private var expectedPID: Int32 = 0
     private var connectionTask: Task<Void, Never>? = nil
     private var sseTask: Task<Void, Never>? = nil
     private let session: URLSession
@@ -255,7 +309,7 @@ final class LCDebugStudioManager: ObservableObject {
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 0
         self.session = URLSession(configuration: config)
-        self.isMacLANEnabled = LCUtils.appGroupUserDefault.bool(forKey: "LCDebugLANEnabled")
+        self.isMacLANEnabled = UserDefaults.lcShared().bool(forKey: "LCDebugLANEnabled")
     }
 
     var macLANURLString: String? {
@@ -275,60 +329,134 @@ final class LCDebugStudioManager: ObservableObject {
         session.invalidateAndCancel()
     }
 
+    static func clearStaleSessionMetadata(forPID pid: Int32 = 0) {
+        UserDefaults.lcShared().removeObject(forKey: "LCDebugActiveSession")
+        if pid > 0, let fileURL = sessionFileURL(forPID: Int(pid)) {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
+    }
+
+    private static func sessionFileURL(forPID pid: Int) -> URL? {
+        guard pid > 0, let groupURL = LCSharedUtils.appGroupPath() else { return nil }
+        return groupURL
+            .appendingPathComponent("Library/Caches/LCDebugSessions", isDirectory: true)
+            .appendingPathComponent("pid-\(pid).json")
+    }
+
+    private func discoverSession(expectedPID: Int32) -> (pid: Int, port: Int, token: String)? {
+        // 1. Prefer deterministic per-PID session file written by the exact target process
+        if expectedPID > 0,
+           let fileURL = Self.sessionFileURL(forPID: Int(expectedPID)),
+           let data = try? Data(contentsOf: fileURL),
+           let payload = try? JSONDecoder().decode(LCDebugSessionFilePayload.self, from: data),
+           payload.pid == Int(expectedPID),
+           payload.localPort > 0 {
+            return (payload.pid, payload.localPort, payload.authToken ?? "")
+        }
+
+        // 2. Fallback to App Group UserDefaults (strict PID match when expectedPID > 0)
+        if let info = UserDefaults.lcShared().dictionary(forKey: "LCDebugActiveSession"),
+           let port = info["localPort"] as? Int, port > 0 {
+            let sessionPID = info["pid"] as? Int ?? 0
+            let token = info["authToken"] as? String ?? ""
+            if expectedPID > 0 {
+                if sessionPID == Int(expectedPID) {
+                    return (sessionPID, port, token)
+                }
+            } else if sessionPID > 0 {
+                return (sessionPID, port, token)
+            }
+        }
+        return nil
+    }
+
     func startConnecting(expectedPID: Int32) {
-        disconnect()
-        connectionError = nil
+        disconnect(clearPersistedSession: false)
+        self.expectedPID = expectedPID
+        self.connectionError = nil
+        self.isConnecting = true
         if expectedPID > 0 {
             self.pid = Int(expectedPID)
         }
 
         connectionTask = Task { [weak self] in
             guard let self else { return }
-            let deadline = Date().addingTimeInterval(20)
+            let deadline = Date().addingTimeInterval(25)
             while !Task.isCancelled && Date() < deadline {
-                if let info = UserDefaults.lcShared().dictionary(forKey: "LCDebugActiveSession"),
-                   let port = info["localPort"] as? Int, port > 0 {
-                    let sessionPID = info["pid"] as? Int ?? 0
-                    if expectedPID <= 0 || sessionPID == Int(expectedPID) || sessionPID > 0 {
-                        self.localPort = port
-                        self.pid = sessionPID
-                        self.authToken = info["authToken"] as? String ?? ""
-                        await self.bootstrapConnection()
+                if let discovered = self.discoverSession(expectedPID: expectedPID) {
+                    self.localPort = discovered.port
+                    self.pid = discovered.pid
+                    self.authToken = discovered.token
+                    if await self.bootstrapConnection() {
+                        self.isConnecting = false
                         return
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(250))
             }
             if !Task.isCancelled && !self.isConnected {
-                self.connectionError = "Timed out waiting for Debug Agent in guest process."
+                self.isConnecting = false
+                self.connectionError = "Timed out connecting to Debug Agent (PID \(expectedPID)). Tap Reconnect to retry."
             }
         }
     }
 
-    func disconnect() {
+    func reconnect() {
+        startConnecting(expectedPID: expectedPID)
+    }
+
+    func disconnect(clearPersistedSession: Bool = true) {
         connectionTask?.cancel()
         connectionTask = nil
         sseTask?.cancel()
         sseTask = nil
         isConnected = false
+        isConnecting = false
+        if clearPersistedSession {
+            Self.clearStaleSessionMetadata(forPID: expectedPID > 0 ? expectedPID : Int32(pid))
+        }
     }
 
-    private func bootstrapConnection() async {
-        await refreshStatusAndSnapshots()
+    private func bootstrapConnection() async -> Bool {
+        guard let base = baseURL else { return false }
+        guard let status: LCDebugStatusSnapshot = await fetchJSON(url: base.appendingPathComponent("api/status")) else {
+            return false
+        }
+        if expectedPID > 0, let actualPID = status.pid, actualPID != Int(expectedPID) {
+            return false
+        }
+        apply(status: status)
         isConnected = true
+        connectionError = nil
+
+        if let initialLogs: [LCDebugLogEntry] = await fetchJSON(url: base.appendingPathComponent("api/logs")) {
+            self.logs = initialLogs
+        }
+        if let initialNet: [LCDebugNetworkEntry] = await fetchJSON(url: base.appendingPathComponent("api/network")) {
+            self.networkEntries = initialNet
+        }
+        if let initialEvents: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
+            self.uiEvents = initialEvents
+        }
         startSSEStream()
+        return true
     }
 
     func refreshStatusAndSnapshots() async {
         guard let base = baseURL else { return }
         if let status: LCDebugStatusSnapshot = await fetchJSON(url: base.appendingPathComponent("api/status")) {
             apply(status: status)
+            isConnected = true
+            connectionError = nil
         }
         if let initialLogs: [LCDebugLogEntry] = await fetchJSON(url: base.appendingPathComponent("api/logs")) {
             self.logs = initialLogs
         }
         if let initialNet: [LCDebugNetworkEntry] = await fetchJSON(url: base.appendingPathComponent("api/network")) {
             self.networkEntries = initialNet
+        }
+        if let initialEvents: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
+            self.uiEvents = initialEvents
         }
     }
 
@@ -339,32 +467,63 @@ final class LCDebugStudioManager: ObservableObject {
 
         sseTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                var req = authorizedRequest(url: streamURL)
-                req.timeoutInterval = 3600
-                let (bytes, _) = try await self.session.bytes(for: req)
-                var currentEvent = "message"
-                var dataLines: [String] = []
-
-                for try await line in bytes.lines {
-                    if Task.isCancelled { break }
-                    if line.isEmpty {
-                        if !dataLines.isEmpty {
-                            let joined = dataLines.joined(separator: "\n")
-                            self.handleSSEEvent(name: currentEvent, jsonString: joined)
-                        }
-                        currentEvent = "message"
-                        dataLines.removeAll(keepingCapacity: true)
-                    } else if line.hasPrefix("event:") {
-                        currentEvent = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                    } else if line.hasPrefix("data:") {
-                        dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+            while !Task.isCancelled {
+                do {
+                    var req = authorizedRequest(url: streamURL)
+                    req.timeoutInterval = 3600
+                    let (bytes, response) = try await self.session.bytes(for: req)
+                    if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                        throw URLError(.badServerResponse)
                     }
-                }
-            } catch {
-                if !Task.isCancelled {
+
+                    self.isConnected = true
+                    self.connectionError = nil
+
+                    var currentEvent = "message"
+                    var dataLines: [String] = []
+                    var lineBuffer: [UInt8] = []
+                    lineBuffer.reserveCapacity(512)
+
+                    // IMPORTANT: Read raw bytes instead of `bytes.lines`, because Swift's
+                    // AsyncLineSequence strips empty lines (\n\n) that delimit SSE frames!
+                    for try await byte in bytes {
+                        if Task.isCancelled { break }
+                        if byte == 0x0A { // '\n'
+                            if lineBuffer.last == 0x0D { // strip '\r'
+                                lineBuffer.removeLast()
+                            }
+                            let line = String(decoding: lineBuffer, as: UTF8.self)
+                            lineBuffer.removeAll(keepingCapacity: true)
+
+                            if line.isEmpty {
+                                if !dataLines.isEmpty {
+                                    let joined = dataLines.joined(separator: "\n")
+                                    self.handleSSEEvent(name: currentEvent, jsonString: joined)
+                                }
+                                currentEvent = "message"
+                                dataLines.removeAll(keepingCapacity: true)
+                            } else if line.hasPrefix("event:") {
+                                currentEvent = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                            } else if line.hasPrefix("data:") {
+                                var payload = String(line.dropFirst(5))
+                                if payload.hasPrefix(" ") {
+                                    payload.removeFirst()
+                                }
+                                dataLines.append(payload)
+                            }
+                        } else {
+                            lineBuffer.append(byte)
+                        }
+                    }
+                } catch {
+                    if Task.isCancelled { break }
                     self.isConnected = false
+                    self.connectionError = "Live stream disconnected. Reconnecting…"
                 }
+
+                if Task.isCancelled { break }
+                try? await Task.sleep(for: .seconds(1))
+                await self.refreshStatusAndSnapshots()
             }
         }
     }
@@ -380,15 +539,22 @@ final class LCDebugStudioManager: ObservableObject {
         case "log":
             if let entry = try? decoder.decode(LCDebugLogEntry.self, from: data) {
                 logs.append(entry)
-                if logs.count > 600 {
-                    logs.removeFirst(logs.count - 600)
+                if logs.count > 2000 {
+                    logs.removeFirst(logs.count - 2000)
                 }
             }
         case "network":
             if let entry = try? decoder.decode(LCDebugNetworkEntry.self, from: data) {
                 networkEntries.insert(entry, at: 0)
-                if networkEntries.count > 200 {
-                    networkEntries.removeLast(networkEntries.count - 200)
+                if networkEntries.count > 500 {
+                    networkEntries.removeLast(networkEntries.count - 500)
+                }
+            }
+        case "uievent":
+            if let entry = try? decoder.decode(LCDebugUIEventEntry.self, from: data) {
+                uiEvents.insert(entry, at: 0)
+                if uiEvents.count > 500 {
+                    uiEvents.removeLast(uiEvents.count - 500)
                 }
             }
         case "tap":
@@ -406,6 +572,7 @@ final class LCDebugStudioManager: ObservableObject {
         if let lanP = status.lanPort { lanPort = lanP }
         if let lanEn = status.lanEnabled { isMacLANEnabled = lanEn }
         if let ip = status.lanIP { lanIP = ip }
+        if let token = status.authToken, !token.isEmpty { authToken = token }
         if let cpu = status.cpuPercent { cpuPercent = cpu }
         if let mem = status.memoryMB { memoryMB = mem }
         if let f = status.fps { fps = f }
@@ -413,6 +580,7 @@ final class LCDebugStudioManager: ObservableObject {
         if let jit = status.isJIT { isJIT = jit }
         if let xr = status.xrayEnabled { isXRayEnabled = xr }
         if let ti = status.tapInspectEnabled { isTapInspectEnabled = ti }
+        if let nm = status.notificationMonitorEnabled { isNotificationMonitorEnabled = nm }
         if let sv = status.selectedView { selectedView = sv }
     }
 
@@ -420,7 +588,7 @@ final class LCDebugStudioManager: ObservableObject {
 
     func setMacLAN(enabled: Bool) async {
         isMacLANEnabled = enabled
-        LCUtils.appGroupUserDefault.set(enabled, forKey: "LCDebugLANEnabled")
+        UserDefaults.lcShared().set(enabled, forKey: "LCDebugLANEnabled")
         await postAction(["action": "set_lan", "enabled": enabled])
         await refreshStatusOnly()
     }
@@ -432,6 +600,11 @@ final class LCDebugStudioManager: ObservableObject {
 
     func toggleTapInspect() async {
         await postAction(["action": "toggle_tap_inspect"])
+        await refreshStatusOnly()
+    }
+
+    func toggleNotificationMonitor() async {
+        await postAction(["action": "toggle_notifications"])
         await refreshStatusOnly()
     }
 
@@ -449,10 +622,22 @@ final class LCDebugStudioManager: ObservableObject {
         await postAction(["action": "clear_network"])
     }
 
+    func clearUIEvents() async {
+        uiEvents.removeAll()
+        await postAction(["action": "clear_events"])
+    }
+
     func refreshStatusOnly() async {
         guard let base = baseURL else { return }
         if let status: LCDebugStatusSnapshot = await fetchJSON(url: base.appendingPathComponent("api/status")) {
             apply(status: status)
+        }
+    }
+
+    func loadEvents() async {
+        guard let base = baseURL else { return }
+        if let list: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
+            uiEvents = list
         }
     }
 
@@ -525,7 +710,7 @@ final class LCDebugStudioManager: ObservableObject {
             let safeName = appModel.displayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? appModel.displayName
             if let url = URL(string: "stosdebug://enableJIT?bundleId=\(bundleId)&appName=\(safeName)&pid=\(pid)&forcePID=true\(encoded)") {
                 await UIApplication.shared.open(url)
-                jitStatusBanner = "Requested JIT via StosDebug for PID \(pid)."
+                jitStatusBanner = "Requested optional JIT via StosDebug for PID \(pid)."
             }
             return
         }
@@ -533,7 +718,7 @@ final class LCDebugStudioManager: ObservableObject {
             let encoded = script.map { "&script-data=\($0)" } ?? ""
             if let url = URL(string: "stikjit://enable-jit?bundle-id=\(bundleId)&pid=\(pid)\(encoded)") {
                 await UIApplication.shared.open(url)
-                jitStatusBanner = "Requested JIT via StikDebug for PID \(pid)."
+                jitStatusBanner = "Requested optional JIT via StikDebug for PID \(pid)."
             }
             return
         }
@@ -552,7 +737,10 @@ final class LCDebugStudioManager: ObservableObject {
 
     private func fetchJSON<T: Decodable>(url: URL) async -> T? {
         do {
-            let (data, _) = try await session.data(for: authorizedRequest(url: url))
+            let (data, response) = try await session.data(for: authorizedRequest(url: url))
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                return nil
+            }
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
             return nil
