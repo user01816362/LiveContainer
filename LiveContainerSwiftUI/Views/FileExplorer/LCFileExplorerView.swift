@@ -31,6 +31,7 @@ struct LCFileExplorerView: View {
     @State private var showNewFolderAlert = false
     @State private var newFolderName = ""
     @State private var shareURL: URL?
+    @State private var inspectedBinaryItem: LCInspectedBinaryItem?
     @State private var pathCopiedToast = false
 
     init(
@@ -211,6 +212,15 @@ struct LCFileExplorerView: View {
         )) { wrapper in
             ActivityViewController(activityItems: [wrapper.url])
         }
+        .navigationDestination(item: $inspectedBinaryItem) { item in
+            LCBinaryInspectorView(
+                binaryURL: item.url,
+                title: item.title,
+                bundleRootURL: item.bundleURL,
+                rootURL: root.rootURL,
+                needsSecurityScope: root.needsSecurityScope
+            )
+        }
         .task(id: directoryURL) {
             await reload()
         }
@@ -249,9 +259,17 @@ struct LCFileExplorerView: View {
             }
         }
         .contextMenu {
-            if let machOURL = entry.machOExecutableURL, let onInspectBinary {
+            if let machOURL = entry.machOExecutableURL {
                 Button("Inspect & Dump Binary", systemImage: "cpu.fill") {
-                    onInspectBinary(machOURL)
+                    if let onInspectBinary {
+                        onInspectBinary(machOURL)
+                    } else {
+                        inspectedBinaryItem = LCInspectedBinaryItem(
+                            url: machOURL,
+                            title: entry.name,
+                            bundleURL: entry.isDirectory ? entry.url : nil
+                        )
+                    }
                 }
             }
             Button("Copy Path", systemImage: "doc.on.doc") {
@@ -362,6 +380,13 @@ struct LCFileExplorerView: View {
 private struct LCShareURLWrapper: Identifiable {
     var id: String { url.path }
     let url: URL
+}
+
+private struct LCInspectedBinaryItem: Identifiable, Hashable {
+    var id: String { url.path }
+    let url: URL
+    let title: String
+    let bundleURL: URL?
 }
 
 private struct LCFileExplorerPathHeader: View {

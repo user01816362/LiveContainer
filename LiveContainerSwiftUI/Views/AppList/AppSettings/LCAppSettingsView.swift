@@ -105,11 +105,21 @@ struct LCAppSettingsView: View {
                 }
                 
                 if let bundlePath = appInfo.bundlePath() {
+                    let bundleURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
+                    NavigationLink {
+                        LCBinaryInspectorView(
+                            bundleURL: bundleURL,
+                            title: appInfo.displayName() ?? "Binary Inspector"
+                        )
+                    } label: {
+                        Label("Inspect App Binaries", systemImage: "cpu.fill")
+                    }
+
                     NavigationLink {
                         LCFileExplorerView(
                             root: LCFileExplorerRoot(
                                 title: appInfo.displayName() ?? "App Bundle",
-                                rootURL: URL(fileURLWithPath: bundlePath, isDirectory: true),
+                                rootURL: bundleURL,
                                 isReadOnly: sharedModel.multiLCStatus == 2,
                                 readOnlyReason: sharedModel.multiLCStatus == 2 ? "Secondary LiveContainer" : nil
                             )

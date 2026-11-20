@@ -249,6 +249,32 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
 
         let dataExportDisabled: UIMenuElement.Attributes = model.uiSelectedContainer == nil ? [.disabled] : []
         sectionChildren.append(UIMenu(
+            title: "Inspect & Files",
+            image: UIImage(systemName: "cpu.fill"),
+            children: [
+                UIAction(
+                    title: "Inspect Binary & Dump",
+                    image: UIImage(systemName: "doc.text.magnifyingglass")
+                ) { [weak self] _ in
+                    self?.openBinaryInspector()
+                },
+                UIAction(
+                    title: "Browse App Bundle",
+                    image: UIImage(systemName: "folder.fill")
+                ) { [weak self] _ in
+                    self?.openAppBundleExplorer()
+                },
+                UIAction(
+                    title: "Browse Container Data",
+                    image: UIImage(systemName: "externaldrive.fill"),
+                    attributes: dataExportDisabled
+                ) { [weak self] _ in
+                    self?.openContainerExplorer()
+                }
+            ]
+        ))
+
+        sectionChildren.append(UIMenu(
             title: "Export",
             image: UIImage(systemName: "square.and.arrow.up"),
             children: [
@@ -334,6 +360,50 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
 
     private func openSettings() {
         delegate.openNavigationView(view: AnyView(LCAppSettingsView(model: configuration.model)))
+    }
+
+    private func openBinaryInspector() {
+        let appInfo = configuration.model.appInfo
+        guard let bundlePath = appInfo.bundlePath() else {
+            showError("Cannot locate app bundle path.")
+            return
+        }
+        let bundleURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
+        let title = appInfo.displayName() ?? configuration.model.displayName
+        delegate.openNavigationView(view: AnyView(
+            LCBinaryInspectorView(bundleURL: bundleURL, title: title)
+        ))
+    }
+
+    private func openAppBundleExplorer() {
+        let appInfo = configuration.model.appInfo
+        guard let bundlePath = appInfo.bundlePath() else {
+            showError("Cannot locate app bundle path.")
+            return
+        }
+        let isSecondary = DataManager.shared.model.multiLCStatus == 2
+        let root = LCFileExplorerRoot(
+            title: appInfo.displayName() ?? configuration.model.displayName,
+            rootURL: URL(fileURLWithPath: bundlePath, isDirectory: true),
+            isReadOnly: isSecondary,
+            readOnlyReason: isSecondary ? "Secondary LiveContainer" : nil
+        )
+        delegate.openNavigationView(view: AnyView(LCFileExplorerView(root: root)))
+    }
+
+    private func openContainerExplorer() {
+        guard let container = configuration.model.uiSelectedContainer else {
+            return
+        }
+        let inUse = LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) != nil
+        let root = LCFileExplorerRoot(
+            title: container.name,
+            rootURL: container.containerURL,
+            needsSecurityScope: container.storageBookMark != nil,
+            isReadOnly: inUse,
+            readOnlyReason: inUse ? "Container is Running" : nil
+        )
+        delegate.openNavigationView(view: AnyView(LCFileExplorerView(root: root)))
     }
 
     private func openVersionHistory() {

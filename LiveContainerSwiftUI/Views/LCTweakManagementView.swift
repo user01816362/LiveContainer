@@ -25,6 +25,24 @@ private struct LCTweakTransferRequest: Identifiable, Sendable {
     let operation: LCTweakTransferOperation
 }
 
+private struct LCTweakInspectTarget: Identifiable, Hashable, Sendable {
+    var id: String { executableURL.path }
+    let executableURL: URL
+    let bundleURL: URL?
+    let title: String
+}
+
+private struct LCTweakBrowseTarget: Identifiable, Hashable, Sendable {
+    var id: String { folderURL.path }
+    let folderURL: URL
+    let title: String
+}
+
+private struct LCTweakShareURL: Identifiable {
+    var id: String { url.path }
+    let url: URL
+}
+
 private struct LCTweakDestinationMode {
     let onClose: () -> Void
     let onSelect: (URL) -> Void
@@ -72,6 +90,9 @@ private struct LCManagedTweakFolderView: View {
     @State private var choosingTweak = false
     @State private var isTweakSigning = false
     @State private var transferRequest: LCTweakTransferRequest?
+    @State private var inspectedTweakTarget: LCTweakInspectTarget?
+    @State private var browsedFolderTarget: LCTweakBrowseTarget?
+    @State private var sharedTweakURL: URL?
 
     @StateObject private var newFolderInput = InputHelper()
     @StateObject private var renameFileInput = InputHelper()
@@ -223,6 +244,27 @@ private struct LCManagedTweakFolderView: View {
                 }
             )
         }
+        .sheet(item: Binding(
+            get: { sharedTweakURL.map { LCTweakShareURL(url: $0) } },
+            set: { if $0 == nil { sharedTweakURL = nil } }
+        )) { item in
+            ActivityViewController(activityItems: [item.url])
+        }
+        .navigationDestination(item: $inspectedTweakTarget) { target in
+            LCBinaryInspectorView(
+                binaryURL: target.executableURL,
+                title: target.title,
+                bundleRootURL: target.bundleURL
+            )
+        }
+        .navigationDestination(item: $browsedFolderTarget) { target in
+            LCFileExplorerView(
+                root: LCFileExplorerRoot(
+                    title: target.title,
+                    rootURL: target.folderURL
+                )
+            )
+        }
     }
 
     @ViewBuilder
@@ -252,11 +294,33 @@ private struct LCManagedTweakFolderView: View {
                         }
                     }
                 } else if tweakItem.isFramework {
-                    Label(tweakItem.displayName, systemImage: "shippingbox.fill")
-                    Spacer()
+                    Button {
+                        if !isDestinationMode {
+                            openBinaryInspector(for: tweakItem)
+                        }
+                    } label: {
+                        HStack {
+                            Label(tweakItem.displayName, systemImage: "shippingbox.fill")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 } else if tweakItem.isTweak {
-                    Label(tweakItem.displayName, systemImage: "building.columns.fill")
-                    Spacer()
+                    Button {
+                        if !isDestinationMode {
+                            openBinaryInspector(for: tweakItem)
+                        }
+                    } label: {
+                        HStack {
+                            Label(tweakItem.displayName, systemImage: "building.columns.fill")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 } else {
                     Label(tweakItem.displayName, systemImage: "document.fill")
                     Spacer()
@@ -281,6 +345,43 @@ private struct LCManagedTweakFolderView: View {
         }
         .contextMenu {
             if !isDestinationMode {
+                if tweakItem.isTweak || tweakItem.isFramework {
+                    Button {
+                        openBinaryInspector(for: tweakItem)
+                    } label: {
+                        Label("Inspect & Dump Binary", systemImage: "cpu.fill")
+                    }
+                }
+
+                if tweakItem.isFolder {
+                    Button {
+                        browsedFolderTarget = LCTweakBrowseTarget(
+                            folderURL: tweakItem.fileURL,
+                            title: tweakItem.displayName
+                        )
+                    } label: {
+                        Label(tweakItem.isFramework ? "Browse Framework Files" : "Browse Folder", systemImage: "folder.fill")
+                    }
+                }
+
+                if (tweakItem.isTweak || tweakItem.isFramework) && LCSharedUtils.certificatePassword() != nil {
+                    Button {
+                        Task { await signAllTweaks() }
+                    } label: {
+                        Label("Re-sign", systemImage: "signature")
+                    }
+                }
+
+                if !tweakItem.isFolder {
+                    Button {
+                        sharedTweakURL = tweakItem.fileURL
+                    } label: {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }
+                }
+
+                Divider()
+
                 Button {
                     transferRequest = LCTweakTransferRequest(sourceURL: tweakItem.fileURL, operation: .copy)
                 } label: {
@@ -305,6 +406,18 @@ private struct LCManagedTweakFolderView: View {
             } label: {
                 Label("lc.common.delete".loc, systemImage: "trash")
             }
+        }
+    }
+
+    private func openBinaryInspector(for tweakItem: LCManagedTweakItem) {
+        if let execURL = LCBoundedFileReader.resolveMachOExecutableURL(for: tweakItem.fileURL) {
+            inspectedTweakTarget = LCTweakInspectTarget(
+                executableURL: execURL,
+                bundleURL: tweakItem.isFramework ? tweakItem.fileURL : nil,
+                title: tweakItem.displayName
+            )
+        } else {
+            show("Unable to locate a valid Mach-O binary inside '\(tweakItem.displayName)'.")
         }
     }
 

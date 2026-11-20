@@ -20,6 +20,7 @@ struct LCFilePreviewView: View {
     @State private var forceHexMode = false
     @State private var stagedShareURL: URL?
     @State private var shareErrorMessage: String?
+    @State private var inspectedBinaryURL: URL?
 
     var body: some View {
         Group {
@@ -73,7 +74,7 @@ struct LCFilePreviewView: View {
                     )
                 case .machOBinary, .binary, .archive, .directory, .bundle:
                     VStack(spacing: 0) {
-                        if let machOURL = entry.machOExecutableURL, let onInspectBinary {
+                        if let machOURL = entry.machOExecutableURL {
                             HStack(spacing: 10) {
                                 Image(systemName: "cpu.fill")
                                     .foregroundStyle(.blue)
@@ -86,7 +87,11 @@ struct LCFilePreviewView: View {
                                 }
                                 Spacer()
                                 Button("Analyze") {
-                                    onInspectBinary(machOURL)
+                                    if let onInspectBinary {
+                                        onInspectBinary(machOURL)
+                                    } else {
+                                        inspectedBinaryURL = machOURL
+                                    }
                                 }
                                 .buttonStyle(.glassProminent)
                                 .controlSize(.small)
@@ -129,6 +134,14 @@ struct LCFilePreviewView: View {
             set: { if $0 == nil { stagedShareURL = nil } }
         )) { item in
             ActivityViewController(activityItems: [item.url])
+        }
+        .navigationDestination(item: $inspectedBinaryURL) { url in
+            LCBinaryInspectorView(
+                binaryURL: url,
+                title: entry.name,
+                rootURL: rootURL,
+                needsSecurityScope: needsSecurityScope
+            )
         }
         .alert("Share Failed", isPresented: Binding(
             get: { shareErrorMessage != nil },
