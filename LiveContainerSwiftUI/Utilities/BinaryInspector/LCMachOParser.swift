@@ -48,78 +48,92 @@ enum LCMachOParser {
     // MARK: - Bundle Target Discovery
 
     /// Lists all inspectable Mach-O binaries inside an app bundle (main executable,
-    /// embedded `.framework`s, `.dylib`s, and `PlugIns/*.appex` executables).
-    static func listBundleTargets(bundleURL: URL) -> [LCMachOTargetItem] {
-        var targets: [LCMachOTargetItem] = []
-        var seenPaths = Set<String>()
-        let rootPrefix = bundleURL.path.hasSuffix("/") ? bundleURL.path : bundleURL.path + "/"
+    /// embedded `.framework`s, `.dylib`s, and `PlugIns/*.appex` executables),
+    /// including `.disabled`-suffixed tweak payloads.
+    static func listBundleTargets(
+        bundleURL: URL,
+        rootURL: URL? = nil,
+        needsSecurityScope: Bool = false
+    ) -> [LCMachOTargetItem] {
+        let scopeRoot = rootURL ?? bundleURL
+        let result = try? LCFileExplorerService.withSecurityScope(rootURL: scopeRoot, needsSecurityScope: needsSecurityScope) {
+            var targets: [LCMachOTargetItem] = []
+            var seenPaths = Set<String>()
+            let rootPrefix = bundleURL.path.hasSuffix("/") ? bundleURL.path : bundleURL.path + "/"
 
-        if let mainExec = LCBoundedFileReader.resolveMachOExecutableURL(for: bundleURL) {
-            seenPaths.insert(mainExec.standardizedFileURL.path)
-            targets.append(LCMachOTargetItem(
-                id: "main:\(mainExec.path)",
-                displayName: mainExec.lastPathComponent,
-                relativePath: mainExec.lastPathComponent,
-                executableURL: mainExec,
-                bundleURL: bundleURL,
-                kind: .appExecutable
-            ))
-        }
+            if let mainExec = LCBoundedFileReader.resolveMachOExecutableURL(for: bundleURL) {
+                seenPaths.insert(mainExec.standardizedFileURL.path)
+                targets.append(LCMachOTargetItem(
+                    id: "main:\(mainExec.path)",
+                    displayName: mainExec.lastPathComponent,
+                    relativePath: mainExec.lastPathComponent,
+                    executableURL: mainExec,
+                    bundleURL: bundleURL,
+                    kind: .appExecutable
+                ))
+            }
 
-        let fm = FileManager.default
-        if let enumerator = fm.enumerator(
-            at: bundleURL,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for case let itemURL as URL in enumerator {
-                let values = try? itemURL.resourceValues(forKeys: [.isDirectoryKey])
-                let isDir = values?.isDirectory ?? false
-                let ext = itemURL.pathExtension.lowercased()
+            let fm = FileManager.default
+            if let enumerator = fm.enumerator(
+                at: bundleURL,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let itemURL as URL in enumerator {
+                    if Task.isCancelled { break }
+                    let values = try? itemURL.resourceValues(forKeys: [.isDirectoryKey])
+                    let isDir = values?.isDirectory ?? false
+                    var baseName = itemURL.lastPathComponent
+                    if baseName.hasSuffix(".disabled") {
+                        baseName = String(baseName.dropLast(".disabled".count))
+                    }
+                    let ext = (baseName as NSString).pathExtension.lowercased()
 
-                if isDir && (ext == "framework" || ext == "appex") {
-                    if let execURL = LCBoundedFileReader.resolveMachOExecutableURL(for: itemURL) {
-                        let key = execURL.standardizedFileURL.path
+                    if isDir && (ext == "framework" || ext == "appex") {
+                        if let execURL = LCBoundedFileReader.resolveMachOExecutableURL(for: itemURL) {
+                            let key = execURL.standardizedFileURL.path
+                            if seenPaths.insert(key).inserted {
+                                let rel = itemURL.path.hasPrefix(rootPrefix)
+                                    ? String(itemURL.path.dropFirst(rootPrefix.count))
+                                    : itemURL.lastPathComponent
+                                targets.append(LCMachOTargetItem(
+                                    id: "\(ext):\(rel)",
+                                    displayName: itemURL.lastPathComponent,
+                                    relativePath: rel,
+                                    executableURL: execURL,
+                                    bundleURL: itemURL,
+                                    kind: ext == "framework" ? .framework : .plugin
+                                ))
+                            }
+                        }
+                        if ext == "framework" {
+                            enumerator.skipDescendants()
+                        }
+                        continue
+                    }
+
+                    if !isDir && ext == "dylib" && LCBoundedFileReader.isMachOFile(at: itemURL) {
+                        let key = itemURL.standardizedFileURL.path
                         if seenPaths.insert(key).inserted {
                             let rel = itemURL.path.hasPrefix(rootPrefix)
                                 ? String(itemURL.path.dropFirst(rootPrefix.count))
                                 : itemURL.lastPathComponent
                             targets.append(LCMachOTargetItem(
-                                id: "\(ext):\(rel)",
+                                id: "dylib:\(rel)",
                                 displayName: itemURL.lastPathComponent,
                                 relativePath: rel,
-                                executableURL: execURL,
-                                bundleURL: itemURL,
-                                kind: ext == "framework" ? .framework : .plugin
+                                executableURL: itemURL,
+                                bundleURL: bundleURL,
+                                kind: .dylib
                             ))
                         }
                     }
-                    if ext == "framework" {
-                        enumerator.skipDescendants()
-                    }
-                    continue
-                }
-
-                if !isDir && ext == "dylib" && LCBoundedFileReader.isMachOFile(at: itemURL) {
-                    let key = itemURL.standardizedFileURL.path
-                    if seenPaths.insert(key).inserted {
-                        let rel = itemURL.path.hasPrefix(rootPrefix)
-                            ? String(itemURL.path.dropFirst(rootPrefix.count))
-                            : itemURL.lastPathComponent
-                        targets.append(LCMachOTargetItem(
-                            id: "dylib:\(rel)",
-                            displayName: itemURL.lastPathComponent,
-                            relativePath: rel,
-                            executableURL: itemURL,
-                            bundleURL: bundleURL,
-                            kind: .dylib
-                        ))
-                    }
                 }
             }
-        }
 
-        return targets
+            return targets
+        }
+        return result ?? []
     }
 
     // MARK: - Top-Level Entry Point
@@ -227,6 +241,10 @@ enum LCMachOParser {
                 let (sliceEnd, ov) = sliceOffset.addingReportingOverflow(sliceSize)
                 guard !ov, sliceSize >= 28, sliceEnd <= reader.fileSize else { continue }
                 let sliceMagic = try reader.readUInt32(offset: sliceOffset, bigEndian: false)
+                guard sliceMagic == 0xfeedface || sliceMagic == 0xcefaedfe
+                        || sliceMagic == 0xfeedfacf || sliceMagic == 0xcffaedfe else {
+                    continue
+                }
                 let is64 = (sliceMagic == 0xfeedfacf || sliceMagic == 0xcffaedfe)
                 let isSwapped = (sliceMagic == 0xcefaedfe || sliceMagic == 0xcffaedfe)
                 slices.append(LCMachOArchitectureSlice(
@@ -363,6 +381,7 @@ enum LCMachOParser {
                     let path = strOffset < cmdSlice.count ? cmdSlice.lcReadCString(at: strOffset, maxLength: cmdSlice.count - strOffset) : ""
                     let kind = dylibKind(for: rawCmd)
                     dylibs.append(LCMachODylibDependency(
+                        index: dylibs.count,
                         path: path,
                         kind: kind,
                         currentVersion: curVer,
@@ -542,7 +561,9 @@ enum LCMachOParser {
         if let csOff = codeSigDataOffset, let csSz = codeSigDataSize, csSz > 0 {
             codeSign = parseCodeSignature(
                 reader: reader,
-                absOffset: slice.fileOffset + csOff,
+                sliceOffset: slice.fileOffset,
+                sliceSize: slice.size,
+                relativeOffset: csOff,
                 size: csSz,
                 binaryURL: reader.url,
                 probeKernelSignature: !needsSecurityScope && (slice.architectureName == "arm64" || slice.architectureName == "arm64e"),
@@ -564,8 +585,10 @@ enum LCMachOParser {
         let (usesARC, hasStackCanary) = probeHardeningSymbols(
             reader: reader,
             sliceOffset: slice.fileOffset,
+            sliceSize: slice.size,
             strtabOffset: strtabOffset,
-            strtabSize: strtabSize
+            strtabSize: strtabSize,
+            importedSymbols: fixupsDecoder.importedSymbols
         )
 
         // Annotate linked dylibs with LiveContainer resolution health
@@ -737,17 +760,27 @@ enum LCMachOParser {
 
     // MARK: - Code Signature & Entitlements Parser
 
+    private static let csSlotAlternateCodeDirectoryBase: UInt32 = 0x1000
+    private static let csSlotAlternateCodeDirectoryMax: UInt32 = 0x1005
+
     private static func parseCodeSignature(
         reader: LCBoundedFileReader,
-        absOffset: UInt64,
+        sliceOffset: UInt64,
+        sliceSize: UInt64,
+        relativeOffset: UInt64,
         size: UInt64,
         binaryURL: URL,
         probeKernelSignature: Bool,
         diagnostics: inout [String]
     ) -> LCMachOCodeSignInfo {
         guard size >= 12, size <= UInt64(LCBoundedFileReader.maxSingleReadBytes),
-              let data = try? reader.readData(offset: absOffset, count: Int(size)) else {
-            diagnostics.append("LC_CODE_SIGNATURE blob exceeds bounds or safe read cap.")
+              let data = try? reader.readSliceData(
+                  sliceOffset: sliceOffset,
+                  sliceSize: sliceSize,
+                  relativeOffset: relativeOffset,
+                  count: Int(size)
+              ) else {
+            diagnostics.append("LC_CODE_SIGNATURE blob exceeds slice bounds or safe read cap.")
             return .unsigned
         }
 
@@ -761,6 +794,7 @@ enum LCMachOParser {
         var teamIdentifier: String?
         var cdHashHex: String?
         var hashTypeName: String?
+        var selectedHashRank: UInt8 = 0
         var csFlags: UInt32 = 0
         var entitlementsXML: String?
         var entitlementsSummary: [(key: String, value: String)] = []
@@ -780,26 +814,41 @@ enum LCMachOParser {
             let blobLen = Int(readU32(data, at: blobOffset + 4, bigEndian: true))
             guard blobLen >= 8, blobOffset + blobLen <= data.count else { continue }
 
-            if slotType == csSlotCodeDirectory && blobMagic == csMagicCodeDirectory && blobLen >= 44 {
+            let isCodeDirSlot = slotType == csSlotCodeDirectory
+                || (slotType >= csSlotAlternateCodeDirectoryBase && slotType < csSlotAlternateCodeDirectoryMax)
+
+            if isCodeDirSlot && blobMagic == csMagicCodeDirectory && blobLen >= 44 {
                 let version = readU32(data, at: blobOffset + 8, bigEndian: true)
-                csFlags = readU32(data, at: blobOffset + 12, bigEndian: true)
+                let flags = readU32(data, at: blobOffset + 12, bigEndian: true)
                 let identOffset = Int(readU32(data, at: blobOffset + 20, bigEndian: true))
                 let hashType = data[blobOffset + 37]
-                hashTypeName = codeSignHashName(hashType)
+                // Prefer SHA-256 / SHA-384 alternate CodeDirectory over SHA-1 primary
+                let hashRank: UInt8 = (hashType == 2 || hashType == 3) ? 3 : (hashType == 4 ? 4 : 1)
+                if hashRank >= selectedHashRank {
+                    selectedHashRank = hashRank
+                    csFlags = flags
+                    hashTypeName = codeSignHashName(hashType)
 
-                if identOffset > 0 && blobOffset + identOffset < blobOffset + blobLen {
-                    identifier = data.lcReadCString(at: blobOffset + identOffset, maxLength: blobLen - identOffset)
-                }
-                if version >= 0x20200, blobLen >= 52 {
-                    let teamOffset = Int(readU32(data, at: blobOffset + 48, bigEndian: true))
-                    if teamOffset > 0 && blobOffset + teamOffset < blobOffset + blobLen {
-                        let rawTeam = data.lcReadCString(at: blobOffset + teamOffset, maxLength: blobLen - teamOffset)
-                        if !rawTeam.isEmpty { teamIdentifier = rawTeam }
+                    if identOffset > 0 && blobOffset + identOffset < blobOffset + blobLen {
+                        identifier = data.lcReadCString(at: blobOffset + identOffset, maxLength: blobLen - identOffset)
+                    }
+                    if version >= 0x20200, blobLen >= 52 {
+                        let teamOffset = Int(readU32(data, at: blobOffset + 48, bigEndian: true))
+                        if teamOffset > 0 && blobOffset + teamOffset < blobOffset + blobLen {
+                            let rawTeam = data.lcReadCString(at: blobOffset + teamOffset, maxLength: blobLen - teamOffset)
+                            if !rawTeam.isEmpty { teamIdentifier = rawTeam }
+                        }
+                    }
+                    let cdSlice = data[blobOffset..<(blobOffset + blobLen)]
+                    switch hashType {
+                    case 1:
+                        cdHashHex = Insecure.SHA1.hash(data: cdSlice).map { String(format: "%02x", $0) }.joined()
+                    case 4:
+                        cdHashHex = SHA384.hash(data: cdSlice).prefix(20).map { String(format: "%02x", $0) }.joined()
+                    default:
+                        cdHashHex = SHA256.hash(data: cdSlice).prefix(20).map { String(format: "%02x", $0) }.joined()
                     }
                 }
-                let cdSlice = data[blobOffset..<(blobOffset + blobLen)]
-                let digest = SHA256.hash(data: cdSlice)
-                cdHashHex = digest.prefix(20).map { String(format: "%02x", $0) }.joined()
             } else if slotType == csSlotEntitlements && blobMagic == csMagicEntitlements && blobLen > 8 {
                 let xmlData = Data(data[(blobOffset + 8)..<(blobOffset + blobLen)])
                 entitlementsXML = String(data: xmlData, encoding: .utf8)
@@ -820,7 +869,7 @@ enum LCMachOParser {
         let isAdHoc = (csFlags & 0x0002) != 0
         let kernelValid: Bool?
         if probeKernelSignature {
-            kernelValid = checkCodeSignature((binaryURL.path as NSString).utf8String)
+            kernelValid = binaryURL.path.withCString { checkCodeSignature($0) }
         } else {
             kernelValid = nil
         }
@@ -849,20 +898,36 @@ enum LCMachOParser {
     private static func probeHardeningSymbols(
         reader: LCBoundedFileReader,
         sliceOffset: UInt64,
+        sliceSize: UInt64,
         strtabOffset: UInt64?,
-        strtabSize: UInt32
+        strtabSize: UInt32,
+        importedSymbols: [String]
     ) -> (usesARC: Bool, hasStackCanary: Bool) {
-        guard let strtabOffset, strtabSize > 0 else { return (false, false) }
-        let readLen = Int(min(UInt64(strtabSize), 2 * 1024 * 1024))
-        guard let data = try? reader.readUpTo(offset: sliceOffset + strtabOffset, maxCount: readLen) else {
-            return (false, false)
+        var usesARC = importedSymbols.contains { $0 == "_objc_release" || $0 == "_objc_retain" || $0 == "_objc_storeStrong" }
+        var hasCanary = importedSymbols.contains { $0 == "___stack_chk_fail" || $0 == "___stack_chk_guard" }
+        if usesARC && hasCanary {
+            return (true, true)
         }
-        let arcMarker = Data("_objc_release".utf8)
-        let canaryMarker = Data("___stack_chk_fail".utf8)
-        return (
-            data.range(of: arcMarker) != nil,
-            data.range(of: canaryMarker) != nil
-        )
+        guard let strtabOffset, strtabSize > 0, strtabOffset < sliceSize else {
+            return (usesARC, hasCanary)
+        }
+        let availableInSlice = sliceSize - strtabOffset
+        let readLen = Int(min(UInt64(strtabSize), min(availableInSlice, 4 * 1024 * 1024)))
+        guard let data = try? reader.readSliceData(
+            sliceOffset: sliceOffset,
+            sliceSize: sliceSize,
+            relativeOffset: strtabOffset,
+            count: readLen
+        ) else {
+            return (usesARC, hasCanary)
+        }
+        if !usesARC {
+            usesARC = data.range(of: Data("_objc_release".utf8)) != nil
+        }
+        if !hasCanary {
+            hasCanary = data.range(of: Data("___stack_chk_fail".utf8)) != nil
+        }
+        return (usesARC, hasCanary)
     }
 
     private static func evaluateDylibDependencies(
@@ -882,6 +947,7 @@ enum LCMachOParser {
             if path.hasPrefix("/var/jb/") || path.hasPrefix("/Library/MobileSubstrate/")
                 || path.contains("CydiaSubstrate") || path.contains("libellekit") || path.contains("libhooker") {
                 return LCMachODylibDependency(
+                    index: dep.index,
                     path: path,
                     kind: dep.kind,
                     currentVersion: dep.currentVersion,
@@ -891,8 +957,8 @@ enum LCMachOParser {
                 )
             }
 
-            // Skip Apple system frameworks / usr libraries
-            if path.hasPrefix("/System/") || path.hasPrefix("/usr/lib/") {
+            // Skip Apple system frameworks, usr libraries, and iOS dyld-shared-cache Swift stdlib shims
+            if path.hasPrefix("/System/") || path.hasPrefix("/usr/lib/") || path.hasPrefix("@rpath/libswift") {
                 return dep
             }
 
@@ -913,9 +979,13 @@ enum LCMachOParser {
                         binaryDir.appendingPathComponent(tail),
                     ]
                     for rp in rpaths {
-                        if rp.hasPrefix("@executable_path/") {
+                        if rp == "@executable_path" {
+                            candidates.append(bundleRootURL.appendingPathComponent(tail))
+                        } else if rp.hasPrefix("@executable_path/") {
                             let rpTail = String(rp.dropFirst("@executable_path/".count))
                             candidates.append(bundleRootURL.appendingPathComponent(rpTail).appendingPathComponent(tail))
+                        } else if rp == "@loader_path" {
+                            candidates.append(binaryDir.appendingPathComponent(tail))
                         } else if rp.hasPrefix("@loader_path/") {
                             let rpTail = String(rp.dropFirst("@loader_path/".count))
                             candidates.append(binaryDir.appendingPathComponent(rpTail).appendingPathComponent(tail))
@@ -931,6 +1001,7 @@ enum LCMachOParser {
                     if !exists {
                         let isWeak = dep.kind == .weak
                         return LCMachODylibDependency(
+                            index: dep.index,
                             path: path,
                             kind: dep.kind,
                             currentVersion: dep.currentVersion,
@@ -1090,9 +1161,10 @@ enum LCMachOParser {
     }
 
     private static func readFixedString(_ data: Data, at offset: Int, maxLen: Int) -> String {
-        guard offset >= 0, offset < data.count else { return "" }
-        let end = min(data.count, offset + maxLen)
-        let slice = data[offset..<end]
+        guard offset >= 0, offset < data.count, maxLen > 0 else { return "" }
+        let safeLen = min(maxLen, data.count - offset)
+        let start = data.startIndex + offset
+        let slice = data[start..<(start + safeLen)]
         if let zero = slice.firstIndex(of: 0) {
             return String(decoding: slice[..<zero], as: UTF8.self)
         }

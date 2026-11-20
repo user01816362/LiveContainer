@@ -91,22 +91,23 @@ struct LCSQLiteViewerView: View {
         let root = rootURL
         let scope = needsSecurityScope
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await lcRunOffMain {
                 try LCFileExplorerService.loadSQLiteTables(
                     at: targetURL,
                     rootURL: root,
                     needsSecurityScope: scope
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 tables = loaded
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 }
 
@@ -286,7 +287,7 @@ private struct LCSQLiteTableRowsView: View {
         let currentOffset = offset
         let limit = pageSize
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await lcRunOffMain {
                 try LCFileExplorerService.loadSQLitePage(
                     at: targetURL,
                     rootURL: root,
@@ -295,15 +296,16 @@ private struct LCSQLiteTableRowsView: View {
                     offset: currentOffset,
                     limit: limit
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 page = loaded
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 }

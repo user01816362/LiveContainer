@@ -395,6 +395,12 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         guard let container = configuration.model.uiSelectedContainer else {
             return
         }
+        if container.storageBookMark != nil && container.resolvedContainerURL == nil {
+            showError(container.bookmarkResolved
+                ? "lc.container.externalStorageUnavailable".loc
+                : "lc.container.bookmarkResolveInProgress".loc)
+            return
+        }
         let inUse = LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) != nil
         let root = LCFileExplorerRoot(
             title: container.name,

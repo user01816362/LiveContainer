@@ -29,6 +29,7 @@ struct LCDataManagementView : View {
     @State var errorInfo = ""
     @State var successShow = false
     @State var successInfo = ""
+    @State private var browsedExplorerRoot: LCFileExplorerRoot?
     
     @EnvironmentObject private var sharedModel : SharedModel
     
@@ -99,38 +100,46 @@ struct LCDataManagementView : View {
             Section("Built-In File Explorer") {
                 ForEach(folderPaths, id:\.desc) { path in
                     HStack(spacing: 10) {
-                        NavigationLink {
-                            LCFileExplorerView(
-                                root: LCFileExplorerRoot(
-                                    title: path.desc,
-                                    rootURL: path.path,
-                                    isReadOnly: path.desc == "LiveContainer Bundle",
-                                    readOnlyReason: path.desc == "LiveContainer Bundle" ? "Signed App Bundle" : nil
-                                )
+                        Button {
+                            browsedExplorerRoot = LCFileExplorerRoot(
+                                title: path.desc,
+                                rootURL: path.path,
+                                isReadOnly: path.desc == "LiveContainer Bundle",
+                                readOnlyReason: path.desc == "LiveContainer Bundle" ? "Signed App Bundle" : nil
                             )
                         } label: {
-                            Label(path.desc, systemImage: "folder.fill")
+                            HStack {
+                                Label(path.desc, systemImage: "folder.fill")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+
                         if filzaInstalled {
                             Button {
                                 openInFilza(path: path.path)
                             } label: {
                                 Text("Filza")
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.borderless)
                         }
                         Button {
                             copy(text: path.path.path)
                         } label: {
                             Image(systemName: "doc.on.doc")
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderless)
                     }
                 }
             }
         }
         .navigationTitle("lc.settings.dataManagement".loc)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(item: $browsedExplorerRoot) { root in
+            LCFileExplorerView(root: root)
+        }
         .alert("lc.common.error".loc, isPresented: $errorShow){
         } message: {
             Text(errorInfo)

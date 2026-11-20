@@ -37,7 +37,7 @@ enum LCBinaryDeepDiveSubtab: String, CaseIterable, Identifiable, Sendable {
 /// `.app` / `.framework` bundle (enabling seamless switching between the main
 /// executable, embedded frameworks, dylibs, and app extensions).
 struct LCBinaryInspectorView: View {
-    let initialURL: URL
+    let initialURL: URL?
     let bundleRootURL: URL?
     let rootURL: URL?
     let needsSecurityScope: Bool
@@ -85,32 +85,39 @@ struct LCBinaryInspectorView: View {
         self.displayTitle = title ?? binaryURL.lastPathComponent
     }
 
+    /// Initializes the inspector for a bundle directory without doing synchronous
+    /// disk I/O inside `init` (executable resolution happens off-main-actor on appear).
     init(
         bundleURL: URL,
         title: String? = nil,
         rootURL: URL? = nil,
         needsSecurityScope: Bool = false
     ) {
-        self.initialURL = LCBoundedFileReader.resolveMachOExecutableURL(for: bundleURL) ?? bundleURL
+        self.initialURL = nil
         self.bundleRootURL = bundleURL
         self.rootURL = rootURL
         self.needsSecurityScope = needsSecurityScope
         self.displayTitle = title ?? bundleURL.lastPathComponent
     }
 
-    private var activeBinaryURL: URL {
+    private var activeBinaryURL: URL? {
         selectedTargetURL ?? initialURL
     }
 
     private var loadTaskKey: String {
-        "\(activeBinaryURL.path)#\(selectedSliceIndex.map(String.init) ?? "auto")"
+        "\(activeBinaryURL?.path ?? bundleRootURL?.path ?? "none")#\(selectedSliceIndex.map(String.init) ?? "auto")"
+    }
+
+    private var loadedSliceKey: String {
+        guard let ctx = sliceContext else { return "none" }
+        return "\(ctx.overview.fileURL.path)#\(ctx.overview.selectedSlice.index)"
     }
 
     var body: some View {
         VStack(spacing: 0) {
             LCBinaryInspectorControlBar(
                 targets: targets,
-                activeBinaryURL: activeBinaryURL,
+                activeBinaryURL: activeBinaryURL ?? bundleRootURL ?? URL(fileURLWithPath: "/"),
                 slices: sliceContext?.overview.slices ?? [],
                 selectedSlice: sliceContext?.overview.selectedSlice,
                 activeTab: $activeTab,
@@ -190,7 +197,7 @@ struct LCBinaryInspectorView: View {
                         }
                         .disabled(context.overview.header.isEncrypted)
 
-                        Button("Export Full Headers Archive (.zip)", systemImage: "doc.zipper") {
+                        Button(context.overview.header.isEncrypted ? "Export Analysis Archive (.zip)" : "Export Full Headers Archive (.zip)", systemImage: "doc.zipper") {
                             Task { await performExport(.headersZip, context: context) }
                         }
 
@@ -235,7 +242,7 @@ struct LCBinaryInspectorView: View {
         .task(id: loadTaskKey) {
             await loadOverview()
         }
-        .task(id: "\(loadTaskKey)|\(activeTab.rawValue)|\(deepDiveSubtab.rawValue)") {
+        .task(id: "\(loadedSliceKey)|\(activeTab.rawValue)|\(deepDiveSubtab.rawValue)") {
             guard sliceContext != nil else { return }
             if activeTab == .headers {
                 await loadHeadersIfNeeded(force: false)
@@ -253,13 +260,25 @@ struct LCBinaryInspectorView: View {
 
     private func loadBundleTargetsIfNeeded() async {
         guard let bundleRootURL else { return }
-        let discovered = await Task.detached(priority: .userInitiated) {
-            LCMachOParser.listBundleTargets(bundleURL: bundleRootURL)
-        }.value
+        let sRoot = rootURL
+        let scope = needsSecurityScope
+        let discovered = (try? await lcRunOffMain {
+            LCMachOParser.listBundleTargets(
+                bundleURL: bundleRootURL,
+                rootURL: sRoot,
+                needsSecurityScope: scope
+            )
+        }) ?? []
         if !Task.isCancelled {
             targets = discovered
-            if selectedTargetURL == nil, let first = discovered.first {
-                selectedTargetURL = first.executableURL
+            if selectedTargetURL == nil {
+                if let initialURL {
+                    if let matched = discovered.first(where: { $0.executableURL.standardizedFileURL == initialURL.standardizedFileURL }) {
+                        selectedTargetURL = matched.executableURL
+                    }
+                } else if let first = discovered.first {
+                    selectedTargetURL = first.executableURL
+                }
             }
         }
     }
@@ -267,7 +286,8 @@ struct LCBinaryInspectorView: View {
     private func loadOverview() async {
         isLoadingOverview = true
         overviewError = nil
-        // Clear lazy caches when target or slice changes
+        // Clear sliceContext & lazy caches immediately so secondary tabs never analyze stale context
+        sliceContext = nil
         objcDump = nil
         swiftMetadata = nil
         headersError = nil
@@ -276,32 +296,49 @@ struct LCBinaryInspectorView: View {
         stringsResult = nil
         stringsError = nil
 
-        let targetURL = activeBinaryURL
+        let explicitTarget = activeBinaryURL
         let sliceIdx = selectedSliceIndex
         let bRoot = bundleRootURL
         let sRoot = rootURL
         let scope = needsSecurityScope
 
         do {
-            let parsed = try await Task.detached(priority: .userInitiated) {
-                try LCMachOParser.parseSliceContext(
+            let parsed = try await lcRunOffMain { () throws -> LCMachOParsedSliceContext in
+                let targetURL: URL
+                if let explicitTarget {
+                    targetURL = explicitTarget
+                } else if let bRoot {
+                    let scopeRoot = sRoot ?? bRoot
+                    let resolved = try LCFileExplorerService.withSecurityScope(rootURL: scopeRoot, needsSecurityScope: scope) {
+                        LCBoundedFileReader.resolveMachOExecutableURL(for: bRoot)
+                    }
+                    guard let resolved else {
+                        throw LCMachOInspectorError.notMachOFile
+                    }
+                    targetURL = resolved
+                } else {
+                    throw LCMachOInspectorError.notMachOFile
+                }
+
+                return try LCMachOParser.parseSliceContext(
                     at: targetURL,
                     sliceIndex: sliceIdx,
                     bundleRootURL: bRoot,
                     rootURL: sRoot,
                     needsSecurityScope: scope
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 sliceContext = parsed
+                isLoadingOverview = false
             }
         } catch {
             if !Task.isCancelled {
                 sliceContext = nil
                 overviewError = error.localizedDescription
+                isLoadingOverview = false
             }
         }
-        isLoadingOverview = false
     }
 
     private func loadHeadersIfNeeded(force: Bool) async {
@@ -320,21 +357,22 @@ struct LCBinaryInspectorView: View {
         let scope = needsSecurityScope
 
         do {
-            let (dump, swift) = try await Task.detached(priority: .userInitiated) {
+            let (dump, swift) = try await lcRunOffMain {
                 let d = try LCMachOObjCDumper.dumpMetadata(context: context, rootURL: sRoot, needsSecurityScope: scope)
                 let s = try LCMachOSwiftParser.parseMetadata(context: context, rootURL: sRoot, needsSecurityScope: scope)
                 return (d, s)
-            }.value
+            }
             if !Task.isCancelled {
                 objcDump = dump
                 swiftMetadata = swift
+                isLoadingHeaders = false
             }
         } catch {
             if !Task.isCancelled {
                 headersError = error.localizedDescription
+                isLoadingHeaders = false
             }
         }
-        isLoadingHeaders = false
     }
 
     private func loadSymbolsIfNeeded() async {
@@ -345,18 +383,19 @@ struct LCBinaryInspectorView: View {
         let scope = needsSecurityScope
 
         do {
-            let result = try await Task.detached(priority: .userInitiated) {
+            let result = try await lcRunOffMain {
                 try LCMachOSymbolsParser.parseSymbols(context: context, rootURL: sRoot, needsSecurityScope: scope)
-            }.value
+            }
             if !Task.isCancelled {
                 symbolsResult = result
+                isLoadingSymbols = false
             }
         } catch {
             if !Task.isCancelled {
                 symbolsError = error.localizedDescription
+                isLoadingSymbols = false
             }
         }
-        isLoadingSymbols = false
     }
 
     private func loadStringsIfNeeded() async {
@@ -371,18 +410,19 @@ struct LCBinaryInspectorView: View {
         let scope = needsSecurityScope
 
         do {
-            let result = try await Task.detached(priority: .userInitiated) {
+            let result = try await lcRunOffMain {
                 try LCMachOStringsParser.extractStrings(context: context, rootURL: sRoot, needsSecurityScope: scope)
-            }.value
+            }
             if !Task.isCancelled {
                 stringsResult = result
+                isLoadingStrings = false
             }
         } catch {
             if !Task.isCancelled {
                 stringsError = error.localizedDescription
+                isLoadingStrings = false
             }
         }
-        isLoadingStrings = false
     }
 
     // MARK: - Export Actions
@@ -391,6 +431,7 @@ struct LCBinaryInspectorView: View {
         isExporting = true
         defer { isExporting = false }
 
+        let expectedKey = loadedSliceKey
         let sRoot = rootURL
         let scope = needsSecurityScope
         var currentObjC = objcDump
@@ -399,23 +440,27 @@ struct LCBinaryInspectorView: View {
         do {
             if (format == .combinedHeader || format == .headersZip) && !context.overview.header.isEncrypted {
                 if currentObjC == nil {
-                    currentObjC = try await Task.detached(priority: .userInitiated) {
+                    currentObjC = try await lcRunOffMain {
                         try LCMachOObjCDumper.dumpMetadata(context: context, rootURL: sRoot, needsSecurityScope: scope)
-                    }.value
-                    objcDump = currentObjC
+                    }
+                    if loadedSliceKey == expectedKey {
+                        objcDump = currentObjC
+                    }
                 }
                 if currentSwift == nil {
-                    currentSwift = try await Task.detached(priority: .userInitiated) {
+                    currentSwift = try await lcRunOffMain {
                         try LCMachOSwiftParser.parseMetadata(context: context, rootURL: sRoot, needsSecurityScope: scope)
-                    }.value
-                    swiftMetadata = currentSwift
+                    }
+                    if loadedSliceKey == expectedKey {
+                        swiftMetadata = currentSwift
+                    }
                 }
             }
 
             let finalObjC = currentObjC
             let finalSwift = currentSwift
             let overview = context.overview
-            let url = try await Task.detached(priority: .userInitiated) { () throws -> URL in
+            let url = try await lcRunOffMain { () throws -> URL in
                 switch format {
                 case .combinedHeader:
                     guard let finalObjC else {
@@ -430,7 +475,7 @@ struct LCBinaryInspectorView: View {
                 case .jsonReport:
                     return try LCMachOExportService.exportJSONReport(overview: overview, objcDump: finalObjC, swiftMetadata: finalSwift)
                 }
-            }.value
+            }
 
             exportedShareURL = url
         } catch {
@@ -444,9 +489,9 @@ struct LCBinaryInspectorView: View {
         let sRoot = rootURL ?? url
         let scope = needsSecurityScope
         do {
-            let shareable = try await Task.detached(priority: .userInitiated) {
+            let shareable = try await lcRunOffMain {
                 try LCFileExplorerService.stageFileForSharing(at: url, rootURL: sRoot, needsSecurityScope: scope)
-            }.value
+            }
             exportedShareURL = shareable
         } catch {
             exportErrorMessage = error.localizedDescription

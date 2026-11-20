@@ -136,9 +136,9 @@ struct LCMachOChainedFixupsDecoder: Sendable {
     private static let ptr32Cache: UInt16 = 4
     private static let ptr32Firmware: UInt16 = 5
     private static let ptr64Offset: UInt16 = 6
-    private static let ptrArm64eOffset: UInt16 = 7        // DYLD_CHAINED_PTR_ARM64E_USERLAND
+    private static let ptrArm64eOffset: UInt16 = 7        // DYLD_CHAINED_PTR_ARM64E_OFFSET / KERNEL
     private static let ptr64KernelCache: UInt16 = 8
-    private static let ptrArm64eKernel: UInt16 = 9
+    private static let ptrArm64eUserland: UInt16 = 9      // DYLD_CHAINED_PTR_ARM64E_USERLAND
     private static let ptrArm64eFirmware: UInt16 = 10
     private static let ptrArm64eUserland24: UInt16 = 12
 
@@ -176,10 +176,14 @@ struct LCMachOChainedFixupsDecoder: Sendable {
         var formats: [Int: UInt16] = [:]
         var imports: [String] = []
 
-        let absOffset = vmMap.sliceOffset + fixupsDataOffset
         guard fixupsDataSize >= 28,
               fixupsDataSize <= UInt64(LCBoundedFileReader.maxSingleReadBytes),
-              let payload = try? reader.readData(offset: absOffset, count: Int(fixupsDataSize)) else {
+              let payload = try? reader.readSliceData(
+                  sliceOffset: vmMap.sliceOffset,
+                  sliceSize: vmMap.sliceSize,
+                  relativeOffset: fixupsDataOffset,
+                  count: Int(fixupsDataSize)
+              ) else {
             self.hasChainedFixups = false
             self.segmentPointerFormats = [:]
             self.defaultPointerFormat = nil
@@ -193,6 +197,7 @@ struct LCMachOChainedFixupsDecoder: Sendable {
         let symbolsOffset = Int(payload.lcReadUInt32(at: 12) ?? 0)
         let importsCount = payload.lcReadUInt32(at: 16) ?? 0
         let importsFormat = payload.lcReadUInt32(at: 20) ?? 0
+        let symbolsFormat = payload.lcReadUInt32(at: 24) ?? 0
 
         // Parse dyld_chained_starts_in_image -> per-segment pointer_format
         if startsOffset > 0, startsOffset + 4 <= payload.count,
@@ -218,7 +223,9 @@ struct LCMachOChainedFixupsDecoder: Sendable {
         if cappedImports < importsCount {
             diag.append("Chained fixups import table truncated to \(cappedImports) of \(importsCount) entries.")
         }
-        if cappedImports > 0, importsOffset > 0, symbolsOffset > 0, symbolsOffset < payload.count {
+        if symbolsFormat != 0 {
+            diag.append("Chained fixups uses compressed symbol format (\(symbolsFormat)); bind symbol names skipped.")
+        } else if cappedImports > 0, importsOffset > 0, symbolsOffset > 0, symbolsOffset < payload.count {
             imports.reserveCapacity(Int(cappedImports))
             for idx in 0..<Int(cappedImports) {
                 let nameOffset: UInt32?
@@ -263,7 +270,7 @@ struct LCMachOChainedFixupsDecoder: Sendable {
 
         self.hasChainedFixups = !formats.isEmpty || !imports.isEmpty
         self.segmentPointerFormats = formats
-        self.defaultPointerFormat = formats.values.first
+        self.defaultPointerFormat = formats.keys.min().flatMap { formats[$0] }
         self.importedSymbols = imports
         self.diagnostics = diag
     }
@@ -360,7 +367,7 @@ struct LCMachOChainedFixupsDecoder: Sendable {
                 return nil
             }
 
-        case Self.ptrArm64e, Self.ptrArm64eOffset, Self.ptrArm64eUserland24, Self.ptrArm64eKernel, Self.ptrArm64eFirmware:
+        case Self.ptrArm64e, Self.ptrArm64eOffset, Self.ptrArm64eUserland, Self.ptrArm64eUserland24, Self.ptrArm64eFirmware:
             let isAuth = (rawValue >> 63) & 1 != 0
             let isBind = (rawValue >> 62) & 1 != 0
             if isBind {
@@ -383,9 +390,9 @@ struct LCMachOChainedFixupsDecoder: Sendable {
                 }
                 return nil
             } else {
-                // dyld_chained_ptr_arm64e_rebase: low 43 bits = target (direct or offset for USERLAND/USERLAND24)
+                // dyld_chained_ptr_arm64e_rebase: low 43 bits = target (vm offset for OFFSET/USERLAND/USERLAND24)
                 let target43 = rawValue & 0x0000_07FF_FFFF_FFFF
-                if format == Self.ptrArm64eOffset || format == Self.ptrArm64eUserland24 {
+                if format == Self.ptrArm64eOffset || format == Self.ptrArm64eUserland || format == Self.ptrArm64eUserland24 {
                     let candidate = vmMap.preferredLoadAddress &+ target43
                     if vmMap.contains(vmAddress: candidate) {
                         return .rebase(vmAddress: candidate)

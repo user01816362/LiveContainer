@@ -70,10 +70,10 @@ struct LCPlistViewerView: View {
                         }
                     }
                     .listStyle(.insetGrouped)
-                    .searchable(text: $searchQuery, prompt: "Search keys or values")
                 }
             }
         }
+        .searchable(text: $searchQuery, prompt: "Search keys or values")
         .navigationTitle(fileURL.lastPathComponent)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -110,22 +110,23 @@ struct LCPlistViewerView: View {
         let root = rootURL
         let scope = needsSecurityScope
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await lcRunOffMain {
                 try LCFileExplorerService.loadPlistDocument(
                     at: targetURL,
                     rootURL: root,
                     needsSecurityScope: scope
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 document = loaded
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 
     private static func filterNodes(_ nodes: [LCPlistNode], query: String) -> [LCPlistNode] {

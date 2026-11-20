@@ -44,7 +44,7 @@ enum LCMachOExportService {
             try entXML.write(to: packageDir.appendingPathComponent("Entitlements.plist"), atomically: true, encoding: .utf8)
         }
 
-        // Write ObjC headers
+        // Write ObjC headers (with case-insensitive collision deduplication & cancellation checks)
         if let objcDump {
             let classesDir = packageDir.appendingPathComponent("Classes", isDirectory: true)
             let protocolsDir = packageDir.appendingPathComponent("Protocols", isDirectory: true)
@@ -52,41 +52,49 @@ enum LCMachOExportService {
 
             if !objcDump.classes.isEmpty {
                 try fm.createDirectory(at: classesDir, withIntermediateDirectories: true)
+                var seenNames = Set<String>()
                 for cls in objcDump.classes {
+                    try Task.checkCancellation()
                     let header = LCMachOObjCDumper.renderHeader(for: cls)
-                    let fileName = "\(sanitizeFilename(cls.name)).h"
+                    let fileName = uniqueFilename(stem: sanitizeFilename(cls.name), ext: "h", seenLowercased: &seenNames)
                     try header.write(to: classesDir.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
                 }
             }
             if !objcDump.protocols.isEmpty {
                 try fm.createDirectory(at: protocolsDir, withIntermediateDirectories: true)
+                var seenNames = Set<String>()
                 for proto in objcDump.protocols {
+                    try Task.checkCancellation()
                     let header = LCMachOObjCDumper.renderHeader(for: proto)
-                    let fileName = "\(sanitizeFilename(proto.name))-Protocol.h"
+                    let fileName = uniqueFilename(stem: "\(sanitizeFilename(proto.name))-Protocol", ext: "h", seenLowercased: &seenNames)
                     try header.write(to: protocolsDir.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
                 }
             }
             if !objcDump.categories.isEmpty {
                 try fm.createDirectory(at: categoriesDir, withIntermediateDirectories: true)
+                var seenNames = Set<String>()
                 for cat in objcDump.categories {
+                    try Task.checkCancellation()
                     let header = LCMachOObjCDumper.renderHeader(for: cat)
-                    let fileName = "\(sanitizeFilename(cat.className))+\(sanitizeFilename(cat.name)).h"
+                    let fileName = uniqueFilename(stem: "\(sanitizeFilename(cat.className))+\(sanitizeFilename(cat.name))", ext: "h", seenLowercased: &seenNames)
                     try header.write(to: categoriesDir.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
                 }
             }
 
+            try Task.checkCancellation()
             let combined = LCMachOObjCDumper.renderCombinedHeader(binaryName: overview.fileName, dump: objcDump)
             try combined.write(to: packageDir.appendingPathComponent("\(safeBinary)-AllHeaders.h"), atomically: true, encoding: .utf8)
         }
 
         // Write Swift types summary
         if let swiftMetadata, !swiftMetadata.types.isEmpty {
+            try Task.checkCancellation()
             let swiftText = renderSwiftSummary(binaryName: overview.fileName, metadata: swiftMetadata)
             try swiftText.write(to: packageDir.appendingPathComponent("SwiftTypes.swift"), atomically: true, encoding: .utf8)
         }
 
         // Zip directory using Foundation NSFileCoordinator(.forUploading)
-        let destZipURL = try lcExportArtifactFileURL(fileName: "\(safeBinary)-Headers.zip")
+        let destZipURL = try lcExportArtifactFileURL(fileName: "\(safeBinary)-Headers-\(UUID().uuidString.prefix(8)).zip")
         if fm.fileExists(atPath: destZipURL.path) {
             try fm.removeItem(at: destZipURL)
         }
@@ -103,6 +111,9 @@ enum LCMachOExportService {
         }
         if let err = coordinatorError ?? copyError {
             throw LCMachOInspectorError.exportFailed(err.localizedDescription)
+        }
+        guard fm.fileExists(atPath: destZipURL.path) else {
+            throw LCMachOInspectorError.exportFailed("Archive coordinator did not produce a zip file.")
         }
         return destZipURL
     }
@@ -151,7 +162,7 @@ enum LCMachOExportService {
                 "teamIdentifier": overview.codeSign.teamIdentifier ?? "",
                 "cdHash": overview.codeSign.cdHashHex ?? "",
                 "flags": overview.codeSign.flagNames,
-                "entitlements": Dictionary(uniqueKeysWithValues: overview.codeSign.entitlementsSummary.map { ($0.key, $0.value) }),
+                "entitlements": Dictionary(overview.codeSign.entitlementsSummary.map { ($0.key, $0.value) }, uniquingKeysWith: { _, latest in latest }),
             ],
             "compatibilityFindings": overview.compatibilityFindings.map { [
                 "severity": $0.severity.rawValue,
@@ -274,9 +285,24 @@ enum LCMachOExportService {
         return lines.joined(separator: "\n")
     }
 
+    private static func uniqueFilename(stem: String, ext: String, seenLowercased: inout Set<String>) -> String {
+        let base = "\(stem).\(ext)"
+        if seenLowercased.insert(base.lowercased()).inserted {
+            return base
+        }
+        var suffix = 2
+        while true {
+            let candidate = "\(stem)_\(suffix).\(ext)"
+            if seenLowercased.insert(candidate.lowercased()).inserted {
+                return candidate
+            }
+            suffix += 1
+        }
+    }
+
     private static func sanitizeFilename(_ raw: String) -> String {
-        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>").union(.controlCharacters)
         let cleaned = raw.components(separatedBy: invalid).joined(separator: "_")
-        return cleaned.isEmpty ? "Binary" : String(cleaned.prefix(120))
+        return cleaned.isEmpty ? "Binary" : String(cleaned.prefix(100))
     }
 }

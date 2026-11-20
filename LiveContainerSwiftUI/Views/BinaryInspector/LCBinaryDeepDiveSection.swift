@@ -84,7 +84,7 @@ struct LCBinaryDeepDiveSection: View {
                     needsSecurityScope: needsSecurityScope,
                     initialOffset: hexJumpOffset
                 )
-                .id(hexJumpOffset)
+                .id("\(fileURL.path)#\(hexJumpOffset)")
             }
         }
         .searchable(text: $searchQuery, prompt: subtab == .strings ? "Filter strings" : "Filter symbols")

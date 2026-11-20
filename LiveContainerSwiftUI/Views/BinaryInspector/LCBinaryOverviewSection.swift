@@ -14,7 +14,7 @@ import UIKit
 struct LCBinaryOverviewSection: View {
     let overview: LCMachOOverviewResult
 
-    @State private var showRawEntitlements = false
+    @State private var rawEntitlementsItem: LCRawTextItem?
     @State private var copiedFeedback: String?
 
     var body: some View {
@@ -30,7 +30,11 @@ struct LCBinaryOverviewSection: View {
             )
             LCBinaryCodeSignSection(
                 codeSign: overview.codeSign,
-                onOpenRawXML: { showRawEntitlements = true },
+                onOpenRawXML: {
+                    if let xml = overview.codeSign.entitlementsXML {
+                        rawEntitlementsItem = LCRawTextItem(title: "Entitlements XML", text: xml)
+                    }
+                },
                 onCopy: { label, value in
                     UIPasteboard.general.string = value
                     copiedFeedback = label
@@ -47,10 +51,8 @@ struct LCBinaryOverviewSection: View {
             }
         }
         .listStyle(.insetGrouped)
-        .sheet(isPresented: $showRawEntitlements) {
-            if let xml = overview.codeSign.entitlementsXML {
-                LCRawTextSheetView(title: "Entitlements XML", text: xml)
-            }
+        .sheet(item: $rawEntitlementsItem) { item in
+            LCRawTextSheetView(title: item.title, text: item.text)
         }
         .overlay(alignment: .bottom) {
             if let copiedFeedback {
@@ -303,6 +305,12 @@ private struct LCBinaryCodeSignSection: View {
             }
         }
     }
+}
+
+private struct LCRawTextItem: Identifiable {
+    let id = UUID()
+    let title: String
+    let text: String
 }
 
 /// Modal raw monospace viewer with Copy action (used for Entitlements XML and single headers).

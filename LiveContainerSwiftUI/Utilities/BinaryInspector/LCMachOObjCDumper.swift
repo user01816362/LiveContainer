@@ -19,10 +19,10 @@ enum LCMachOObjCDumper {
 
     // objc_class data pointer mask (arm64 / x86_64)
     private static let fastDataMask64: UInt64 = 0x0000_7FFF_FFFF_FFF8
-    // method_list_t entsizeAndFlags bits
+    // method_list_t entsizeAndFlags bits (low 2 bits store isFixedUp / isSorted flags in objc4)
     private static let methodListIsRelative: UInt32 = 0x8000_0000
     private static let methodListHasDirectSelectors: UInt32 = 0x4000_0000
-    private static let methodListEntsizeMask: UInt32 = 0x0000_FFFF
+    private static let methodListEntsizeMask: UInt32 = 0x0000_FFFC
 
     /// Decodes Objective-C classes, protocols, and categories for the given parsed slice.
     static func dumpMetadata(
@@ -33,7 +33,7 @@ enum LCMachOObjCDumper {
         if context.overview.header.isEncrypted {
             throw LCMachOInspectorError.encryptedBinaryCannotDump
         }
-        guard context.overview.selectedSlice.is64Bit else {
+        guard context.overview.selectedSlice.is64Bit, !context.overview.selectedSlice.isByteSwapped else {
             throw LCMachOInspectorError.unsupportedArchitecture(context.overview.selectedSlice.architectureName)
         }
 
@@ -97,8 +97,12 @@ enum LCMachOObjCDumper {
 
         for section in sections {
             guard section.size >= 8, section.size <= UInt64(LCBoundedFileReader.maxSingleReadBytes) else { continue }
-            let absOff = vmMap.sliceOffset + section.fileOffset
-            guard let ptrData = try? reader.readData(offset: absOff, count: Int(section.size)) else { continue }
+            guard let ptrData = try? reader.readSliceData(
+                sliceOffset: vmMap.sliceOffset,
+                sliceSize: vmMap.sliceSize,
+                relativeOffset: section.fileOffset,
+                count: Int(section.size)
+            ) else { continue }
 
             let ptrCount = ptrData.count / 8
             for i in 0..<ptrCount {
@@ -140,12 +144,14 @@ enum LCMachOObjCDumper {
         let rawBits = classData.lcReadUInt64(at: 32) ?? 0
         let isSwiftClass = (rawBits & 0x3) != 0
 
-        let maskedDataBits = rawBits & fastDataMask64
-        guard let roVM = fixups.resolvePointer(rawValue: maskedDataBits, atVMAddress: classVM &+ 32).vmAddress,
-              let roOff = vmMap.fileOffset(forVMAddress: roVM),
+        // Clear only low 3 Swift-class flag bits BEFORE chained-fixup resolution so arm64e auth/bind upper bits stay intact
+        let cleanedDataBits = rawBits & ~UInt64(0x7)
+        guard let resolvedRoVM = fixups.resolvePointer(rawValue: cleanedDataBits, atVMAddress: classVM &+ 32).vmAddress,
+              let roOff = vmMap.fileOffset(forVMAddress: resolvedRoVM & fastDataMask64),
               let roData = try? reader.readData(offset: roOff, count: 72) else {
             return nil
         }
+        let roVM = resolvedRoVM & fastDataMask64
 
         // class_ro_t_64:
         // 0: flags(u32), 4: instanceStart(u32), 8: instanceSize(u32), 12: reserved(u32)
@@ -175,10 +181,11 @@ enum LCMachOObjCDumper {
            metaVM != classVM,
            let metaOff = vmMap.fileOffset(forVMAddress: metaVM),
            let metaData = try? reader.readData(offset: metaOff, count: 40) {
-            let metaRawBits = (metaData.lcReadUInt64(at: 32) ?? 0) & fastDataMask64
-            if let metaRoVM = fixups.resolvePointer(rawValue: metaRawBits, atVMAddress: metaVM &+ 32).vmAddress,
-               let metaRoOff = vmMap.fileOffset(forVMAddress: metaRoVM),
+            let metaRawBits = (metaData.lcReadUInt64(at: 32) ?? 0) & ~UInt64(0x7)
+            if let resolvedMetaRoVM = fixups.resolvePointer(rawValue: metaRawBits, atVMAddress: metaVM &+ 32).vmAddress,
+               let metaRoOff = vmMap.fileOffset(forVMAddress: resolvedMetaRoVM & fastDataMask64),
                let metaRoData = try? reader.readData(offset: metaRoOff, count: 40) {
+                let metaRoVM = resolvedMetaRoVM & fastDataMask64
                 let metaMethodsRaw = metaRoData.lcReadUInt64(at: 32) ?? 0
                 classMethods = parseMethodList(rawPtr: metaMethodsRaw, atVM: metaRoVM &+ 32, isClassMethod: true, reader: reader, vmMap: vmMap, fixups: fixups)
             }
@@ -214,7 +221,12 @@ enum LCMachOObjCDumper {
 
         for section in sections {
             guard section.size >= 8, section.size <= UInt64(LCBoundedFileReader.maxSingleReadBytes) else { continue }
-            guard let ptrData = try? reader.readData(offset: vmMap.sliceOffset + section.fileOffset, count: Int(section.size)) else { continue }
+            guard let ptrData = try? reader.readSliceData(
+                sliceOffset: vmMap.sliceOffset,
+                sliceSize: vmMap.sliceSize,
+                relativeOffset: section.fileOffset,
+                count: Int(section.size)
+            ) else { continue }
 
             let count = ptrData.count / 8
             for i in 0..<count {
@@ -290,7 +302,12 @@ enum LCMachOObjCDumper {
 
         for section in sections {
             guard section.size >= 8, section.size <= UInt64(LCBoundedFileReader.maxSingleReadBytes) else { continue }
-            guard let ptrData = try? reader.readData(offset: vmMap.sliceOffset + section.fileOffset, count: Int(section.size)) else { continue }
+            guard let ptrData = try? reader.readSliceData(
+                sliceOffset: vmMap.sliceOffset,
+                sliceSize: vmMap.sliceSize,
+                relativeOffset: section.fileOffset,
+                count: Int(section.size)
+            ) else { continue }
 
             let count = ptrData.count / 8
             for i in 0..<count {
@@ -613,12 +630,13 @@ enum LCMachOObjCDumper {
                   let data = try? reader.readData(offset: off, count: 40) else {
                 return nil
             }
-            let bits = (data.lcReadUInt64(at: 32) ?? 0) & fastDataMask64
-            guard let roVM = fixups.resolvePointer(rawValue: bits, atVMAddress: classVM &+ 32).vmAddress,
-                  let roOff = vmMap.fileOffset(forVMAddress: roVM),
+            let bits = (data.lcReadUInt64(at: 32) ?? 0) & ~UInt64(0x7)
+            guard let resolvedRoVM = fixups.resolvePointer(rawValue: bits, atVMAddress: classVM &+ 32).vmAddress,
+                  let roOff = vmMap.fileOffset(forVMAddress: resolvedRoVM & fastDataMask64),
                   let nameRaw = try? reader.readUInt64(offset: roOff + 24) else {
                 return nil
             }
+            let roVM = resolvedRoVM & fastDataMask64
             return readCStringPointer(raw: nameRaw, atVM: roVM &+ 24, reader: reader, vmMap: vmMap, fixups: fixups)
         }
     }
@@ -802,7 +820,7 @@ enum LCMachOObjCDumper {
         switch enc {
         case "v": return "\(prefix)void"
         case "B": return "\(prefix)BOOL"
-        case "c": return "\(prefix)BOOL"
+        case "c": return "\(prefix)char"
         case "C": return "\(prefix)unsigned char"
         case "s": return "\(prefix)short"
         case "S": return "\(prefix)unsigned short"

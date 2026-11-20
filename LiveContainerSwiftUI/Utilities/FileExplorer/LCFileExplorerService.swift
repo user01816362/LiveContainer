@@ -9,6 +9,22 @@
 import Foundation
 import SQLite3
 
+/// Runs synchronous throwing work off the MainActor while propagating Swift
+/// structured task cancellation into the detached worker's `Task.isCancelled`.
+func lcRunOffMain<T: Sendable>(
+    priority: TaskPriority = .userInitiated,
+    _ operation: @escaping @Sendable () throws -> T
+) async throws -> T {
+    let task = Task.detached(priority: priority) {
+        try operation()
+    }
+    return try await withTaskCancellationHandler {
+        try await task.value
+    } onCancel: {
+        task.cancel()
+    }
+}
+
 /// Errors surfaced by ``LCFileExplorerService``.
 enum LCFileExplorerError: LocalizedError, Sendable {
     case securityScopeDenied
@@ -39,7 +55,9 @@ enum LCFileExplorerError: LocalizedError, Sendable {
 enum LCFileExplorerService {
     private static let maxPlistBytes: UInt64 = 4 * 1024 * 1024
     private static let maxTextPreviewBytes: Int = 512 * 1024
-    private static let maxImageBytes: UInt64 = 24 * 1024 * 1024
+    private static let maxImageBytes: UInt64 = UInt64(LCBoundedFileReader.maxSingleReadBytes) // 16 MiB
+    private static let maxStageShareBytes: UInt64 = 256 * 1024 * 1024
+    private static let maxPlistDepth: Int = 32
 
     private static let bundleExtensions: Set<String> = ["app", "framework", "appex", "bundle", "xctest", "plugin"]
     private static let plistExtensions: Set<String> = ["plist", "strings", "stringsdict", "entitlements", "mobileprovision"]
@@ -196,8 +214,8 @@ enum LCFileExplorerService {
         if archiveExtensions.contains(ext) { return (.archive, nil) }
         if textExtensions.contains(ext) { return (.text, nil) }
 
-        // Extensionless files (e.g., main app executables, framework binaries) -> 4-byte Mach-O probe
-        if ext.isEmpty, size >= 4, LCBoundedFileReader.isMachOFile(at: url) {
+        // Probe Mach-O magic for extensionless or uncommon-extension executables (e.g. `MyApp.prod`)
+        if size >= 4, LCBoundedFileReader.isMachOFile(at: url) {
             return (.machOBinary, url)
         }
         // SQLite magic check for extensionless DB files ("SQLite format 3\0")
@@ -228,7 +246,16 @@ enum LCFileExplorerService {
             guard reader.fileSize <= maxPlistBytes else {
                 throw LCFileExplorerError.fileTooLargeForViewer(actualBytes: reader.fileSize, maxBytes: maxPlistBytes)
             }
-            let data = try reader.readData(offset: 0, count: Int(reader.fileSize))
+            let rawData = try reader.readData(offset: 0, count: Int(reader.fileSize))
+            // Extract embedded XML plist from CMS-wrapped `.mobileprovision` files
+            let data: Data
+            if url.pathExtension.lowercased() == "mobileprovision",
+               let startRange = rawData.range(of: Data("<plist".utf8)),
+               let endRange = rawData.range(of: Data("</plist>".utf8), in: startRange.lowerBound..<rawData.endIndex) {
+                data = Data(rawData[startRange.lowerBound..<endRange.upperBound])
+            } else {
+                data = rawData
+            }
             var format: PropertyListSerialization.PropertyListFormat = .xml
             let plistObj: Any
             do {
@@ -238,14 +265,18 @@ enum LCFileExplorerService {
             }
 
             let formatLabel: String
-            switch format {
-            case .binary: formatLabel = "Binary Plist"
-            case .xml: formatLabel = "XML Plist"
-            case .openStep: formatLabel = "OpenStep Strings"
-            @unknown default: formatLabel = "Plist"
+            if url.pathExtension.lowercased() == "mobileprovision" {
+                formatLabel = "Provisioning Profile"
+            } else {
+                switch format {
+                case .binary: formatLabel = "Binary Plist"
+                case .xml: formatLabel = "XML Plist"
+                case .openStep: formatLabel = "OpenStep Strings"
+                @unknown default: formatLabel = "Plist"
+                }
             }
 
-            let nodes = buildPlistNodes(from: plistObj, pathPrefix: "root")
+            let nodes = buildPlistNodes(from: plistObj, pathPrefix: "root", depth: 0)
             let rawText: String
             if let xmlData = try? PropertyListSerialization.data(fromPropertyList: plistObj, format: .xml, options: 0),
                let xmlString = String(data: xmlData, encoding: .utf8) {
@@ -258,24 +289,27 @@ enum LCFileExplorerService {
         }
     }
 
-    private static func buildPlistNodes(from object: Any, pathPrefix: String) -> [LCPlistNode] {
+    private static func buildPlistNodes(from object: Any, pathPrefix: String, depth: Int) -> [LCPlistNode] {
+        guard depth < maxPlistDepth else {
+            return [LCPlistNode(id: "\(pathPrefix).maxDepth", key: "…", typeLabel: "Info", valueSummary: "Maximum nesting depth reached", children: nil)]
+        }
         if let dict = object as? [String: Any] {
             return dict.keys.sorted().map { key in
                 let value = dict[key] as Any
-                return makePlistNode(key: key, value: value, path: "\(pathPrefix).\(key)")
+                return makePlistNode(key: key, value: value, path: "\(pathPrefix).\(key)", depth: depth + 1)
             }
         }
         if let array = object as? [Any] {
             return array.enumerated().map { index, value in
-                makePlistNode(key: "[\(index)]", value: value, path: "\(pathPrefix)[\(index)]")
+                makePlistNode(key: "[\(index)]", value: value, path: "\(pathPrefix)[\(index)]", depth: depth + 1)
             }
         }
-        return [makePlistNode(key: "Root", value: object, path: pathPrefix)]
+        return [makePlistNode(key: "Root", value: object, path: pathPrefix, depth: depth + 1)]
     }
 
-    private static func makePlistNode(key: String, value: Any, path: String) -> LCPlistNode {
+    private static func makePlistNode(key: String, value: Any, path: String, depth: Int) -> LCPlistNode {
         if let dict = value as? [String: Any] {
-            let children = buildPlistNodes(from: dict, pathPrefix: path)
+            let children = buildPlistNodes(from: dict, pathPrefix: path, depth: depth)
             return LCPlistNode(
                 id: path,
                 key: key,
@@ -285,7 +319,7 @@ enum LCFileExplorerService {
             )
         }
         if let array = value as? [Any] {
-            let children = buildPlistNodes(from: array, pathPrefix: path)
+            let children = buildPlistNodes(from: array, pathPrefix: path, depth: depth)
             return LCPlistNode(
                 id: path,
                 key: key,
@@ -346,9 +380,20 @@ enum LCFileExplorerService {
                 )
             }
 
-            let decoded = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .isoLatin1)
-                ?? String(decoding: data, as: UTF8.self)
+            // Trim up to 3 trailing incomplete UTF-8 continuation bytes when truncated mid-character
+            var decodable = data
+            if isTruncated {
+                for trim in 0...min(3, data.count) {
+                    let candidate = trim == 0 ? data : data.dropLast(trim)
+                    if String(data: candidate, encoding: .utf8) != nil {
+                        decodable = Data(candidate)
+                        break
+                    }
+                }
+            }
+            let decoded = String(data: decodable, encoding: .utf8)
+                ?? String(data: decodable, encoding: .isoLatin1)
+                ?? String(decoding: decodable, as: UTF8.self)
             return LCFileTextPreview(
                 text: decoded,
                 totalBytes: reader.fileSize,
@@ -394,30 +439,56 @@ enum LCFileExplorerService {
 
     // MARK: - Read-Only SQLite Browser
 
-    private static func quoteSQLiteIdentifier(_ name: String) -> String {
+    private static func quoteSQLiteIdentifier(_ name: String) throws -> String {
+        guard !name.contains("\0") else {
+            throw LCFileExplorerError.sqliteFailed("Invalid table identifier.")
+        }
         let escaped = name.replacingOccurrences(of: "\"", with: "\"\"")
         return "\"\(escaped)\""
     }
 
     private static func openSQLiteReadOnly(at url: URL) throws -> OpaquePointer {
-        var db: OpaquePointer?
-        // Use URI mode with immutable=1 fallback so read-only containers without WAL write permission still open.
+        // Verify regular file with O_NONBLOCK first so FIFOs/sockets with `.db` extension never block
+        _ = try LCBoundedFileReader(url: url)
+
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI
         let encodedPath = url.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? url.path
-        let uri = "file:\(encodedPath)?mode=ro"
-        var rc = sqlite3_open_v2(uri, &db, flags, nil)
-        if rc != SQLITE_OK {
-            if let db { sqlite3_close(db) }
-            db = nil
-            let immutableURI = "file:\(encodedPath)?immutable=1"
-            rc = sqlite3_open_v2(immutableURI, &db, flags, nil)
+
+        func tryOpen(uri: String) -> (db: OpaquePointer?, errorMessage: String?) {
+            var db: OpaquePointer?
+            let rc = sqlite3_open_v2(uri, &db, flags, nil)
+            guard rc == SQLITE_OK, let opened = db else {
+                let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database (code \(rc))"
+                if let db { sqlite3_close(db) }
+                return (nil, msg)
+            }
+            sqlite3_exec(opened, "PRAGMA query_only = ON;", nil, nil, nil)
+            // Probe sqlite_master eagerly so WAL-mode DBs in read-only directories trigger the immutable fallback
+            var probeStmt: OpaquePointer?
+            let prepRC = sqlite3_prepare_v2(opened, "SELECT 1 FROM sqlite_master LIMIT 1;", -1, &probeStmt, nil)
+            if prepRC == SQLITE_OK, let probeStmt {
+                let stepRC = sqlite3_step(probeStmt)
+                sqlite3_finalize(probeStmt)
+                if stepRC == SQLITE_ROW || stepRC == SQLITE_DONE {
+                    return (opened, nil)
+                }
+            } else if let probeStmt {
+                sqlite3_finalize(probeStmt)
+            }
+            let msg = String(cString: sqlite3_errmsg(opened))
+            sqlite3_close(opened)
+            return (nil, msg)
         }
-        guard rc == SQLITE_OK, let openedDB = db else {
-            let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database (code \(rc))"
-            if let db { sqlite3_close(db) }
-            throw LCFileExplorerError.sqliteFailed(msg)
+
+        let roAttempt = tryOpen(uri: "file:\(encodedPath)?mode=ro")
+        if let opened = roAttempt.db {
+            return opened
         }
-        return openedDB
+        let immutableAttempt = tryOpen(uri: "file:\(encodedPath)?immutable=1")
+        if let opened = immutableAttempt.db {
+            return opened
+        }
+        throw LCFileExplorerError.sqliteFailed(immutableAttempt.errorMessage ?? roAttempt.errorMessage ?? "Unable to open database.")
     }
 
     static func loadSQLiteTables(
@@ -437,12 +508,17 @@ enum LCFileExplorerService {
             defer { sqlite3_finalize(stmt) }
 
             var rawTables: [(name: String, sql: String)] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let name = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
-                let sql = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            var stepRC = sqlite3_step(stmt)
+            while stepRC == SQLITE_ROW {
+                let name = readSQLiteTextColumn(stmt: stmt, index: 0)
+                let sql = readSQLiteTextColumn(stmt: stmt, index: 1)
                 if !name.isEmpty {
                     rawTables.append((name, sql))
                 }
+                stepRC = sqlite3_step(stmt)
+            }
+            guard stepRC == SQLITE_DONE else {
+                throw LCFileExplorerError.sqliteFailed(String(cString: sqlite3_errmsg(db)))
             }
 
             return rawTables.map { item in
@@ -452,8 +528,17 @@ enum LCFileExplorerService {
         }
     }
 
+    private static func readSQLiteTextColumn(stmt: OpaquePointer, index: Int32) -> String {
+        guard let ptr = sqlite3_column_text(stmt, index) else { return "" }
+        let byteCount = Int(sqlite3_column_bytes(stmt, index))
+        guard byteCount > 0 else { return "" }
+        let data = Data(bytes: ptr, count: min(byteCount, 4096))
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private static func queryRowCount(db: OpaquePointer, tableName: String) -> Int64 {
-        let sql = "SELECT COUNT(*) FROM \(quoteSQLiteIdentifier(tableName));"
+        guard let quoted = try? quoteSQLiteIdentifier(tableName) else { return -1 }
+        let sql = "SELECT COUNT(*) FROM \(quoted);"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
             return -1
@@ -477,7 +562,8 @@ enum LCFileExplorerService {
             let totalRows = queryRowCount(db: db, tableName: tableName)
             let safeLimit = max(1, min(limit, 200))
             let safeOffset = max(0, offset)
-            let sql = "SELECT * FROM \(quoteSQLiteIdentifier(tableName)) LIMIT \(safeLimit) OFFSET \(safeOffset);"
+            let quotedTable = try quoteSQLiteIdentifier(tableName)
+            let sql = "SELECT * FROM \(quotedTable) LIMIT \(safeLimit) OFFSET \(safeOffset);"
 
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
@@ -491,7 +577,8 @@ enum LCFileExplorerService {
             }
 
             var rows: [[String]] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            var stepRC = sqlite3_step(stmt)
+            while stepRC == SQLITE_ROW {
                 var row: [String] = []
                 row.reserveCapacity(colCount)
                 for idx in 0..<colCount {
@@ -504,7 +591,7 @@ enum LCFileExplorerService {
                     case SQLITE_FLOAT:
                         row.append(String(sqlite3_column_double(stmt, cIdx)))
                     case SQLITE_TEXT:
-                        let text = sqlite3_column_text(stmt, cIdx).map { String(cString: $0) } ?? ""
+                        let text = readSQLiteTextColumn(stmt: stmt, index: cIdx)
                         row.append(text.count > 512 ? String(text.prefix(512)) + "…" : text)
                     case SQLITE_BLOB:
                         let byteCount = sqlite3_column_bytes(stmt, cIdx)
@@ -514,6 +601,10 @@ enum LCFileExplorerService {
                     }
                 }
                 rows.append(row)
+                stepRC = sqlite3_step(stmt)
+            }
+            guard stepRC == SQLITE_DONE else {
+                throw LCFileExplorerError.sqliteFailed(String(cString: sqlite3_errmsg(db)))
             }
 
             return LCSQLitePageResult(
@@ -531,7 +622,7 @@ enum LCFileExplorerService {
 
     static func createFolder(named name: String, in directoryURL: URL, rootURL: URL, needsSecurityScope: Bool) throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("/"), trimmed != ".", trimmed != ".." else {
+        guard !trimmed.isEmpty, !trimmed.contains("/"), !trimmed.contains("\0"), trimmed != ".", trimmed != ".." else {
             throw NSError(domain: "LCFileExplorer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid folder name."])
         }
         try withSecurityScope(rootURL: rootURL, needsSecurityScope: needsSecurityScope) {
@@ -541,8 +632,11 @@ enum LCFileExplorerService {
     }
 
     static func renameItem(at itemURL: URL, to newName: String, rootURL: URL, needsSecurityScope: Bool) throws {
+        guard itemURL.standardizedFileURL != rootURL.standardizedFileURL else {
+            throw NSError(domain: "LCFileExplorer", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot rename the root container directory."])
+        }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("/"), trimmed != ".", trimmed != ".." else {
+        guard !trimmed.isEmpty, !trimmed.contains("/"), !trimmed.contains("\0"), trimmed != ".", trimmed != ".." else {
             throw NSError(domain: "LCFileExplorer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid item name."])
         }
         try withSecurityScope(rootURL: rootURL, needsSecurityScope: needsSecurityScope) {
@@ -552,19 +646,26 @@ enum LCFileExplorerService {
     }
 
     static func deleteItem(at itemURL: URL, rootURL: URL, needsSecurityScope: Bool) throws {
+        guard itemURL.standardizedFileURL != rootURL.standardizedFileURL else {
+            throw NSError(domain: "LCFileExplorer", code: 4, userInfo: [NSLocalizedDescriptionKey: "Cannot delete the root container directory."])
+        }
         try withSecurityScope(rootURL: rootURL, needsSecurityScope: needsSecurityScope) {
             try FileManager.default.removeItem(at: itemURL)
         }
     }
 
     /// Returns a shareable URL for `UIActivityViewController`. For security-scoped
-    /// external containers, copies the file into the app's temporary export directory
-    /// so the share sheet can safely read it after the security scope ends.
+    /// external containers, validates that the target is a regular file within safe
+    /// size bounds before staging a temporary copy in `tmp/LCExports`.
     static func stageFileForSharing(at itemURL: URL, rootURL: URL, needsSecurityScope: Bool) throws -> URL {
         guard needsSecurityScope else {
             return itemURL
         }
         return try withSecurityScope(rootURL: rootURL, needsSecurityScope: true) {
+            let reader = try LCBoundedFileReader(url: itemURL)
+            guard reader.fileSize <= maxStageShareBytes else {
+                throw LCFileExplorerError.fileTooLargeForViewer(actualBytes: reader.fileSize, maxBytes: maxStageShareBytes)
+            }
             let stagingDir = try lcEnsureExportArtifactDirectory()
                 .appendingPathComponent("Share-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)

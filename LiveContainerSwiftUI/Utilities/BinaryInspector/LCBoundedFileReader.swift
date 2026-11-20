@@ -55,7 +55,7 @@ final class LCBoundedFileReader: @unchecked Sendable {
     init(url: URL) throws {
         self.url = url
         let path = url.path
-        let rawFD = open(path, O_RDONLY | O_NONBLOCK)
+        let rawFD = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard rawFD >= 0 else {
             throw LCBoundedFileReaderError.cannotOpen(path: path, errno: errno)
         }
@@ -128,6 +128,29 @@ final class LCBoundedFileReader: @unchecked Sendable {
         return try readData(offset: offset, count: clamped)
     }
 
+    /// Reads `count` bytes at `relativeOffset` inside a Mach-O slice `[sliceOffset, sliceOffset + sliceSize)`,
+    /// guaranteeing overflow-safe bounds enforcement so a malformed slice can never read into neighboring slices.
+    func readSliceData(
+        sliceOffset: UInt64,
+        sliceSize: UInt64,
+        relativeOffset: UInt64,
+        count: Int
+    ) throws -> Data {
+        guard count >= 0 else {
+            throw LCBoundedFileReaderError.outOfBounds(offset: relativeOffset, length: count, fileSize: sliceSize)
+        }
+        if count == 0 { return Data() }
+        let (relEnd, ov1) = relativeOffset.addingReportingOverflow(UInt64(count))
+        guard !ov1, relEnd <= sliceSize else {
+            throw LCBoundedFileReaderError.outOfBounds(offset: relativeOffset, length: count, fileSize: sliceSize)
+        }
+        let (absOffset, ov2) = sliceOffset.addingReportingOverflow(relativeOffset)
+        guard !ov2 else {
+            throw LCBoundedFileReaderError.outOfBounds(offset: sliceOffset, length: count, fileSize: fileSize)
+        }
+        return try readData(offset: absOffset, count: count)
+    }
+
     /// Reads a NUL-terminated UTF-8/ASCII string starting at `offset`, strictly bounded
     /// by `maxLength` and `fileSize`.
     func readCString(offset: UInt64, maxLength: Int = 512) throws -> String {
@@ -177,11 +200,12 @@ final class LCBoundedFileReader: @unchecked Sendable {
             return false
         }
         // Guard against Java `.class` files which share 0xCAFEBABE (FAT_MAGIC big-endian -> 0xBEBAFECA LE).
-        // Real FAT Mach-O binaries have nfat_arch (big-endian bytes 4..7) in 1...64.
+        // Java `.class` files store major version >= 45 in bytes 6..7 (big-endian u32 >= 45 when minor == 0),
+        // whereas universal Mach-O binaries have nfat_arch in 1...32.
         if magic == 0xbebafeca || magic == 0xbfbafeca {
             guard reader.fileSize >= 8,
                   let archCount = try? reader.readUInt32(offset: 4, bigEndian: true),
-                  (1...64).contains(archCount) else {
+                  (1...32).contains(archCount) else {
                 return false
             }
             return true
@@ -233,19 +257,21 @@ final class LCBoundedFileReader: @unchecked Sendable {
 
 extension Data {
     func lcReadUInt16(at offset: Int) -> UInt16? {
-        guard offset >= 0, offset + 2 <= count else { return nil }
+        guard offset >= 0, count - offset >= 2 else { return nil }
         return withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return nil }
             var value: UInt16 = 0
-            memcpy(&value, buf.baseAddress!.advanced(by: offset), 2)
+            memcpy(&value, base.advanced(by: offset), 2)
             return value
         }
     }
 
     func lcReadUInt32(at offset: Int) -> UInt32? {
-        guard offset >= 0, offset + 4 <= count else { return nil }
+        guard offset >= 0, count - offset >= 4 else { return nil }
         return withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return nil }
             var value: UInt32 = 0
-            memcpy(&value, buf.baseAddress!.advanced(by: offset), 4)
+            memcpy(&value, base.advanced(by: offset), 4)
             return value
         }
     }
@@ -255,18 +281,21 @@ extension Data {
     }
 
     func lcReadUInt64(at offset: Int) -> UInt64? {
-        guard offset >= 0, offset + 8 <= count else { return nil }
+        guard offset >= 0, count - offset >= 8 else { return nil }
         return withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return nil }
             var value: UInt64 = 0
-            memcpy(&value, buf.baseAddress!.advanced(by: offset), 8)
+            memcpy(&value, base.advanced(by: offset), 8)
             return value
         }
     }
 
     func lcReadCString(at offset: Int, maxLength: Int = 512) -> String {
-        guard offset >= 0, offset < count else { return "" }
-        let endLimit = Swift.min(count, offset + maxLength)
-        let slice = self[offset..<endLimit]
+        guard offset >= 0, offset < count, maxLength > 0 else { return "" }
+        let safeLen = Swift.min(maxLength, count - offset)
+        let start = startIndex + offset
+        let end = start + safeLen
+        let slice = self[start..<end]
         if let zeroIdx = slice.firstIndex(of: 0) {
             return String(decoding: slice[..<zeroIdx], as: UTF8.self)
         }

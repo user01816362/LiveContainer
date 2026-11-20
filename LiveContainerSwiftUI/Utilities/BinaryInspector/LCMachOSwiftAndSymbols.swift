@@ -31,13 +31,18 @@ enum LCDemangler {
         UnsafeMutablePointer<Int32>?
     ) -> UnsafeMutablePointer<CChar>?
 
+    /// Equivalent to C macro `RTLD_DEFAULT` (`(void *)-2`), which Swift cannot import directly.
+    private static var rtldDefault: UnsafeMutableRawPointer? {
+        UnsafeMutableRawPointer(bitPattern: -2)
+    }
+
     private static let swiftDemangleSym: SwiftDemangleFn? = {
-        guard let ptr = dlsym(RTLD_DEFAULT, "swift_demangle") else { return nil }
+        guard let ptr = dlsym(rtldDefault, "swift_demangle") else { return nil }
         return unsafeBitCast(ptr, to: SwiftDemangleFn.self)
     }()
 
     private static let cxaDemangleSym: CxaDemangleFn? = {
-        guard let ptr = dlsym(RTLD_DEFAULT, "__cxa_demangle") else { return nil }
+        guard let ptr = dlsym(rtldDefault, "__cxa_demangle") else { return nil }
         return unsafeBitCast(ptr, to: CxaDemangleFn.self)
     }()
 
@@ -102,6 +107,9 @@ enum LCMachOSwiftParser {
         if context.overview.header.isEncrypted {
             throw LCMachOInspectorError.encryptedBinaryCannotDump
         }
+        guard !context.overview.selectedSlice.isByteSwapped else {
+            return LCSwiftMetadataResult(types: [], diagnostics: ["Byte-swapped slices are not supported for Swift metadata."], wasTruncated: false)
+        }
 
         let scopeRoot = rootURL ?? context.overview.fileURL
         return try LCFileExplorerService.withSecurityScope(rootURL: scopeRoot, needsSecurityScope: needsSecurityScope) {
@@ -115,7 +123,12 @@ enum LCMachOSwiftParser {
             // 1. __swift5_types: array of 32-bit signed relative pointers to TargetTypeContextDescriptor
             for section in vmMap.sections(named: "__swift5_types") {
                 guard section.size >= 4, section.size <= UInt64(LCBoundedFileReader.maxSingleReadBytes) else { continue }
-                guard let relData = try? reader.readData(offset: vmMap.sliceOffset + section.fileOffset, count: Int(section.size)) else { continue }
+                guard let relData = try? reader.readSliceData(
+                    sliceOffset: vmMap.sliceOffset,
+                    sliceSize: vmMap.sliceSize,
+                    relativeOffset: section.fileOffset,
+                    count: Int(section.size)
+                ) else { continue }
 
                 let count = relData.count / 4
                 for i in 0..<count {
@@ -139,7 +152,12 @@ enum LCMachOSwiftParser {
             var protoCount = 0
             for section in vmMap.sections(named: "__swift5_proto") {
                 guard section.size >= 4, section.size <= UInt64(LCBoundedFileReader.maxSingleReadBytes) else { continue }
-                guard let relData = try? reader.readData(offset: vmMap.sliceOffset + section.fileOffset, count: Int(section.size)) else { continue }
+                guard let relData = try? reader.readSliceData(
+                    sliceOffset: vmMap.sliceOffset,
+                    sliceSize: vmMap.sliceSize,
+                    relativeOffset: section.fileOffset,
+                    count: Int(section.size)
+                ) else { continue }
 
                 let count = relData.count / 4
                 for i in 0..<count {
@@ -206,7 +224,20 @@ enum LCMachOSwiftParser {
         var currentParentRel = data.lcReadInt32(at: 4) ?? 0
         for _ in 0..<4 {
             guard currentParentRel != 0 else { break }
-            let parentVM = addSigned(currentParentBase, offset: currentParentRel)
+            // TargetRelativeContextPointer uses bit 0 to indicate an indirect pointer
+            let isIndirect = (currentParentRel & 1) != 0
+            let alignedRel = currentParentRel & ~1
+            let rawParentVM = addSigned(currentParentBase, offset: alignedRel)
+            let parentVM: UInt64
+            if isIndirect {
+                guard let ptrOff = vmMap.fileOffset(forVMAddress: rawParentVM),
+                      let deref = try? reader.readUInt64(offset: ptrOff) else {
+                    break
+                }
+                parentVM = deref & 0x0000_7FFF_FFFF_FFFF
+            } else {
+                parentVM = rawParentVM
+            }
             guard let pOff = vmMap.fileOffset(forVMAddress: parentVM),
                   let pData = try? reader.readData(offset: pOff, count: 12) else {
                 break
@@ -302,11 +333,22 @@ enum LCMachOSwiftParser {
             if typeNameRel != 0 {
                 let typeVM = addSigned(recVM &+ 4, offset: typeNameRel)
                 if let typeFileOff = vmMap.fileOffset(forVMAddress: typeVM),
-                   let rawMangled = try? reader.readCString(offset: typeFileOff, maxLength: 256),
-                   !rawMangled.isEmpty {
-                    let candidate = "$s" + rawMangled + "D"
-                    let demangled = LCDemangler.demangleIfNeeded(candidate)
-                    typeDisplay = demangled != candidate ? demangled : rawMangled
+                   let rawBytes = try? reader.readUpTo(offset: typeFileOff, maxCount: 256),
+                   !rawBytes.isEmpty {
+                    // Swift symbolic references start with 0x01..0x17 followed by a 4-byte relative offset.
+                    // Avoid misdecoding binary symbolic references as raw UTF-8 strings.
+                    if let firstByte = rawBytes.first, firstByte >= 0x01 && firstByte <= 0x17 {
+                        typeDisplay = resolveSymbolicSwiftType(at: typeVM, bytes: rawBytes, reader: reader, vmMap: vmMap) ?? "SwiftType"
+                    } else if let zeroIdx = rawBytes.firstIndex(of: 0) {
+                        let slice = rawBytes[..<zeroIdx]
+                        if slice.allSatisfy({ $0 >= 0x20 && $0 <= 0x7E }),
+                           let rawMangled = String(data: slice, encoding: .ascii),
+                           !rawMangled.isEmpty {
+                            let candidate = "$s" + rawMangled + "D"
+                            let demangled = LCDemangler.demangleIfNeeded(candidate)
+                            typeDisplay = demangled != candidate ? demangled : rawMangled
+                        }
+                    }
                 }
             }
 
@@ -318,6 +360,41 @@ enum LCMachOSwiftParser {
             ))
         }
         return result
+    }
+
+    private static func resolveSymbolicSwiftType(
+        at typeVM: UInt64,
+        bytes: Data,
+        reader: LCBoundedFileReader,
+        vmMap: LCMachOVMMap
+    ) -> String? {
+        guard bytes.count >= 5, let kind = bytes.first, (kind == 0x01 || kind == 0x02),
+              let rel = bytes.lcReadInt32(at: 1) else {
+            return nil
+        }
+        let targetVM = addSigned(typeVM &+ 1, offset: rel)
+        let descVM: UInt64
+        if kind == 0x02 {
+            guard let ptrOff = vmMap.fileOffset(forVMAddress: targetVM),
+                  let deref = try? reader.readUInt64(offset: ptrOff) else {
+                return nil
+            }
+            descVM = deref & 0x0000_7FFF_FFFF_FFFF
+        } else {
+            descVM = targetVM
+        }
+        guard let descOff = vmMap.fileOffset(forVMAddress: descVM),
+              let descData = try? reader.readData(offset: descOff, count: 12),
+              let nameRel = descData.lcReadInt32(at: 8), nameRel != 0 else {
+            return nil
+        }
+        let nameVM = addSigned(descVM &+ 8, offset: nameRel)
+        guard let nameOff = vmMap.fileOffset(forVMAddress: nameVM),
+              let name = try? reader.readCString(offset: nameOff, maxLength: 128),
+              !name.isEmpty, isPrintableIdentifier(name) else {
+            return nil
+        }
+        return name
     }
 
     private static func addSigned(_ base: UInt64, offset: Int32) -> UInt64 {
@@ -348,17 +425,28 @@ enum LCMachOSymbolsParser {
         return try LCFileExplorerService.withSecurityScope(rootURL: scopeRoot, needsSecurityScope: needsSecurityScope) {
             let reader = try LCBoundedFileReader(url: context.overview.fileURL)
             let sliceOffset = context.overview.selectedSlice.fileOffset
+            let sliceSize = context.overview.selectedSlice.size
             let preferredBase = context.vmMap.preferredLoadAddress
             var symbols: [LCMachOSymbolInfo] = []
             var seenKeys = Set<String>()
             var diagnostics: [String] = []
             var truncated = false
 
+            guard !context.overview.selectedSlice.isByteSwapped else {
+                return LCMachOSymbolsResult(symbols: [], exportCount: 0, symtabCount: 0, wasTruncated: false, diagnostics: ["Byte-swapped slices are not supported for symbol decoding."])
+            }
+
             // 1. LC_DYLD_EXPORTS_TRIE (modern iOS 15–27 exports)
             var exportCount = 0
-            if let expOff = context.exportsTrieOffset, context.exportsTrieSize > 0 {
-                let size = Int(min(UInt64(context.exportsTrieSize), UInt64(LCBoundedFileReader.maxSingleReadBytes)))
-                if let trieData = try? reader.readData(offset: sliceOffset + expOff, count: size) {
+            if let expOff = context.exportsTrieOffset, context.exportsTrieSize > 0, expOff < sliceSize {
+                let avail = sliceSize - expOff
+                let size = Int(min(UInt64(context.exportsTrieSize), min(avail, UInt64(LCBoundedFileReader.maxSingleReadBytes))))
+                if let trieData = try? reader.readSliceData(
+                    sliceOffset: sliceOffset,
+                    sliceSize: sliceSize,
+                    relativeOffset: expOff,
+                    count: size
+                ) {
                     let exports = walkExportsTrie(
                         data: trieData,
                         preferredBase: preferredBase,
@@ -380,19 +468,33 @@ enum LCMachOSymbolsParser {
             if let symOff = context.symtabOffset,
                let strOff = context.strtabOffset,
                context.symtabCount > 0,
-               context.strtabSize > 0 {
+               context.strtabSize > 0,
+               symOff < sliceSize,
+               strOff < sliceSize {
                 let is64 = context.overview.selectedSlice.is64Bit
                 let entrySize = is64 ? 16 : 12
                 let maxByReadCap = LCBoundedFileReader.maxSingleReadBytes / entrySize
-                let countToRead = min(Int(context.symtabCount), min(maxSymtabSymbols, maxByReadCap))
+                let maxBySlice = Int(min((sliceSize - symOff) / UInt64(entrySize), UInt64(Int.max)))
+                let countToRead = min(Int(context.symtabCount), min(maxSymtabSymbols, min(maxByReadCap, maxBySlice)))
                 if countToRead < Int(context.symtabCount) {
                     truncated = true
                     diagnostics.append("Symbol table capped at \(countToRead) of \(context.symtabCount) entries.")
                 }
 
-                let strReadSize = Int(min(UInt64(context.strtabSize), UInt64(LCBoundedFileReader.maxSingleReadBytes)))
-                if let symData = try? reader.readData(offset: sliceOffset + symOff, count: countToRead * entrySize),
-                   let strData = try? reader.readData(offset: sliceOffset + strOff, count: strReadSize) {
+                let strReadSize = Int(min(UInt64(context.strtabSize), min(sliceSize - strOff, UInt64(LCBoundedFileReader.maxSingleReadBytes))))
+                if countToRead > 0, strReadSize > 0,
+                   let symData = try? reader.readSliceData(
+                       sliceOffset: sliceOffset,
+                       sliceSize: sliceSize,
+                       relativeOffset: symOff,
+                       count: countToRead * entrySize
+                   ),
+                   let strData = try? reader.readSliceData(
+                       sliceOffset: sliceOffset,
+                       sliceSize: sliceSize,
+                       relativeOffset: strOff,
+                       count: strReadSize
+                   ) {
                     symbols.reserveCapacity(symbols.count + countToRead)
                     for i in 0..<countToRead {
                         if Task.isCancelled { break }
@@ -476,20 +578,28 @@ enum LCMachOSymbolsParser {
             guard visitedOffsets.insert(frame.offset).inserted else { continue }
 
             var cursor = frame.offset
-            guard let terminalSize = readULEB128(data, cursor: &cursor) else { continue }
-            let childrenStart = cursor + Int(terminalSize)
-            guard childrenStart <= data.count else { continue }
+            guard let rawTerminalSize = readULEB128(data, cursor: &cursor, limit: data.count),
+                  let termSize = Int(exactly: rawTerminalSize),
+                  termSize <= data.count - cursor else {
+                continue
+            }
+            let childrenStart = cursor + termSize
 
-            if terminalSize > 0 && !frame.prefix.isEmpty {
+            if termSize > 0 && !frame.prefix.isEmpty {
                 var termCursor = cursor
-                let flags = readULEB128(data, cursor: &termCursor) ?? 0
+                let flags = readULEB128(data, cursor: &termCursor, limit: childrenStart) ?? 0
                 let kind = flags & 0x03
+                let isReexport = (flags & 0x08) != 0
+                let isStubAndResolver = (flags & 0x10) != 0
                 var address: UInt64 = 0
-                if (flags & 0x08) == 0 { // not re-export
-                    if kind == 2 { // stub & resolver
-                        address = preferredBase &+ (readULEB128(data, cursor: &termCursor) ?? 0)
+                if !isReexport {
+                    let rawVal = readULEB128(data, cursor: &termCursor, limit: childrenStart) ?? 0
+                    if kind == 2 { // EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE (already absolute)
+                        address = rawVal
+                    } else if isStubAndResolver {
+                        address = preferredBase &+ rawVal
                     } else {
-                        address = preferredBase &+ (readULEB128(data, cursor: &termCursor) ?? 0)
+                        address = preferredBase &+ rawVal
                     }
                 }
                 let rawName = frame.prefix
@@ -512,22 +622,29 @@ enum LCMachOSymbolsParser {
 
             for _ in 0..<childCount {
                 guard cursor < data.count else { break }
-                let edgeLabel = data.lcReadCString(at: cursor, maxLength: min(512, data.count - cursor))
-                cursor += edgeLabel.utf8.count + 1
+                // Scan raw bytes for the actual NUL terminator so cursor never desyncs on invalid UTF-8
+                let slice = data[cursor..<data.count]
+                guard let nulIdx = slice.firstIndex(of: 0) else { break }
+                let edgeBytes = slice[..<nulIdx]
+                let edgeLabel = String(decoding: edgeBytes.prefix(512), as: UTF8.self)
+                cursor = nulIdx + 1
                 guard cursor < data.count,
-                      let nextOffset = readULEB128(data, cursor: &cursor) else {
+                      let rawNextOffset = readULEB128(data, cursor: &cursor, limit: data.count),
+                      let nextOff = Int(exactly: rawNextOffset),
+                      nextOff < data.count else {
                     break
                 }
-                stack.append((Int(nextOffset), frame.prefix + edgeLabel, frame.depth + 1))
+                stack.append((nextOff, frame.prefix + edgeLabel, frame.depth + 1))
             }
         }
         return results
     }
 
-    private static func readULEB128(_ data: Data, cursor: inout Int) -> UInt64? {
+    private static func readULEB128(_ data: Data, cursor: inout Int, limit: Int) -> UInt64? {
         var result: UInt64 = 0
         var shift: UInt64 = 0
-        while cursor < data.count && shift < 64 {
+        let safeLimit = min(limit, data.count)
+        while cursor < safeLimit && shift < 64 {
             let byte = data[cursor]
             cursor += 1
             result |= UInt64(byte & 0x7F) << shift
@@ -562,9 +679,8 @@ enum LCMachOStringsParser {
         return try LCFileExplorerService.withSecurityScope(rootURL: scopeRoot, needsSecurityScope: needsSecurityScope) {
             let reader = try LCBoundedFileReader(url: context.overview.fileURL)
             let vmMap = context.vmMap
-            let targetSections = vmMap.sections.filter {
-                $0.sectionName == "__cstring" || ($0.segmentName == "__TEXT" && $0.sectionName == "__ustring")
-            }
+            // Only scan UTF-8/ASCII `__cstring` sections (exclude UTF-16LE `__ustring` from byte NUL splitting)
+            let targetSections = vmMap.sections.filter { $0.sectionName == "__cstring" }
 
             var entries: [LCMachOStringEntry] = []
             var seenValues = Set<String>()
@@ -573,19 +689,26 @@ enum LCMachOStringsParser {
             var scannedTotal: UInt64 = 0
 
             for section in targetSections {
-                guard section.size > 0 else { continue }
+                guard section.size > 0, section.fileOffset < vmMap.sliceSize else { continue }
                 let remainingBudget = maxScanBytes > scannedTotal ? maxScanBytes - scannedTotal : 0
                 if remainingBudget == 0 {
                     truncated = true
                     diagnostics.append("String scan capped at 4 MiB of string data.")
                     break
                 }
-                let toRead = Int(min(section.size, remainingBudget))
+                let availInSlice = vmMap.sliceSize - section.fileOffset
+                let toRead = Int(min(section.size, min(availInSlice, remainingBudget)))
                 if UInt64(toRead) < section.size {
                     truncated = true
                     diagnostics.append("Section \(section.sectionName) partially scanned (capped at 4 MiB).")
                 }
-                guard let data = try? reader.readData(offset: vmMap.sliceOffset + section.fileOffset, count: toRead) else {
+                guard toRead > 0,
+                      let data = try? reader.readSliceData(
+                          sliceOffset: vmMap.sliceOffset,
+                          sliceSize: vmMap.sliceSize,
+                          relativeOffset: section.fileOffset,
+                          count: toRead
+                      ) else {
                     continue
                 }
                 scannedTotal += UInt64(data.count)

@@ -43,13 +43,13 @@ LiveContainerSwiftUI/
 - **App Settings → Browse App Bundle**
 - **Container Settings → Browse Container Files** (supports private, shared App Group, and external security-scoped bookmarked containers; automatically switches to read-only while the container is actively running)
 - **Settings → Data Management → Built-In File Explorer** (Private Container, App Group Container, and read-only LiveContainer Bundle)
-- **Tweaks Tab → Long-Press any folder or `.framework` → Browse Folder / Bundle**
+- **Tweaks Tab → Long-Press any folder or `.framework` → Browse Folder / Browse Framework Files**
 
 ### Built-In Viewers & Safety Guarantees
-- **Property Lists (`.plist`, `.strings`, `.stringsdict`, `.entitlements`)**: Decoded off-main-thread (4 MiB safety cap) into a searchable collapsible tree with one-tap Raw XML toggle.
+- **Property Lists (`.plist`, `.strings`, `.stringsdict`, `.entitlements`, `.mobileprovision`)**: Decoded off-main-thread (4 MiB safety cap) into a searchable collapsible tree with one-tap Raw XML toggle.
 - **JSON, Logs & Source Files**: Bounded 512 KiB preview with automatic pretty-printing for valid JSON and truncation banner for oversized files.
 - **SQLite Databases (`.sqlite`, `.db`, `.storedata`, extensionless SQLite magic)**: Opened strictly read-only (`SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI`) with `?mode=ro` and `?immutable=1` fallback so WAL-mode or read-only containers never fail or mutate on-disk state. Table identifiers are safely quoted and rows paginate in 50-row pages.
-- **Images**: Bounded 24 MiB loader with resolution display.
+- **Images**: Bounded 16 MiB loader with resolution display.
 - **Paginated 4 KiB Hex Peek**: Available for every regular file via `pread(2)` with hex/decimal offset jump.
 - **Special-File & Symlink Protection**: Uses `O_RDONLY | O_NONBLOCK` and `S_ISREG` verification so sockets, FIFOs, or symlink loops can never hang or crash the app.
 
@@ -61,7 +61,7 @@ LiveContainerSwiftUI/
 - **App Long-Press Context Menu → Inspect & Files → Inspect Binary & Dump** (opens with target switcher across main executable, embedded `.framework`s, `.dylib`s, and `PlugIns/*.appex`)
 - **App Settings → Inspect App Binaries**
 - **Tweaks Tab**: Tap any `.dylib` or `.framework` directly, or long-press → **Inspect & Dump Binary** (works for both enabled and `.disabled` tweaks)
-- **Export Dylibs & Frameworks Sheet**: Tap the info icon on any row to inspect before exporting
+- **Export Dylibs & Frameworks Sheet**: Tap the CPU inspect icon on any row to inspect before exporting
 - **File Explorer**: Automatically detects Mach-O binaries via 4-byte magic probe (with Java `.class` exclusion) and offers **Inspect & Dump Binary** in the context menu and preview banner
 
 ### Key Capabilities
@@ -95,4 +95,4 @@ LiveContainerSwiftUI/
 | Swift metadata | Max 15,000 types, 5,000 protocols, 512 fields/type |
 | Symbols & Exports | Max 50,000 exports (depth ≤ 64, visited-offset cycle guard), 100,000 symtab entries |
 | Strings scan | Max 4 MiB scanned, 50,000 unique strings |
-| File Explorer viewers | Plist 4 MiB, Text/JSON 512 KiB, Image 24 MiB, Hex 4 KiB pages, SQLite 50 rows/page |
+| File Explorer viewers | Plist 4 MiB, Text/JSON 512 KiB, Image 16 MiB, Hex 4 KiB pages, SQLite 50 rows/page |

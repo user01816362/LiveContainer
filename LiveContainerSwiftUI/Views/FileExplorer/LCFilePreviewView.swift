@@ -203,7 +203,7 @@ private struct LCTextFileViewer: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
-                        .background(.orange.opacity(0.12))
+                        .background { Color.orange.opacity(0.12) }
                     }
                     ScrollView {
                         Text(preview.text)
@@ -245,23 +245,24 @@ private struct LCTextFileViewer: View {
         let scope = needsSecurityScope
         let pretty = attemptPrettyJSON
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await lcRunOffMain {
                 try LCFileExplorerService.loadTextPreview(
                     at: url,
                     rootURL: root,
                     needsSecurityScope: scope,
                     attemptPrettyJSON: pretty
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 preview = loaded
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 }
 
@@ -312,9 +313,9 @@ private struct LCImageFileViewer: View {
         let root = rootURL
         let scope = needsSecurityScope
         do {
-            let data = try await Task.detached(priority: .userInitiated) {
+            let data = try await lcRunOffMain {
                 try LCFileExplorerService.loadImageData(at: url, rootURL: root, needsSecurityScope: scope)
-            }.value
+            }
             if !Task.isCancelled {
                 if let decoded = UIImage(data: data) {
                     image = decoded
@@ -325,13 +326,14 @@ private struct LCImageFileViewer: View {
                 } else {
                     errorMessage = "Unsupported or corrupted image format."
                 }
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 }
 
@@ -346,10 +348,15 @@ struct LCHexPageViewer: View {
     @State private var currentOffset: UInt64 = 0
     @State private var didInitializeOffset = false
     @State private var page: LCHexPage?
+    @State private var formattedHexText = ""
     @State private var errorMessage: String?
     @State private var isLoading = true
     @State private var jumpOffsetText = ""
     @State private var showJumpAlert = false
+
+    private var pageTaskID: String {
+        "\(fileURL.path)#\(currentOffset)"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -360,7 +367,7 @@ struct LCHexPageViewer: View {
                 ContentUnavailableView("Hex Read Error", systemImage: "exclamationmark.triangle", description: Text(errorMessage))
             } else if let page {
                 ScrollView([.vertical, .horizontal]) {
-                    Text(Self.formatHexDump(data: page.data, baseOffset: page.offset))
+                    Text(formattedHexText)
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
                         .padding(12)
@@ -416,7 +423,7 @@ struct LCHexPageViewer: View {
             }
             Button("lc.common.cancel".loc, role: .cancel) {}
         }
-        .task(id: currentOffset) {
+        .task(id: pageTaskID) {
             if !didInitializeOffset {
                 didInitializeOffset = true
                 if initialOffset > 0 && currentOffset == 0 {
@@ -450,24 +457,27 @@ struct LCHexPageViewer: View {
         let off = currentOffset
         let size = Int(pageSize)
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
-                try LCFileExplorerService.loadHexPage(
+            let (loaded, formatted) = try await lcRunOffMain {
+                let p = try LCFileExplorerService.loadHexPage(
                     at: url,
                     rootURL: root,
                     needsSecurityScope: scope,
                     offset: off,
                     pageSize: size
                 )
-            }.value
+                return (p, LCHexPageViewer.formatHexDump(data: p.data, baseOffset: p.offset))
+            }
             if !Task.isCancelled {
                 page = loaded
+                formattedHexText = formatted
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 
     static func formatHexDump(data: Data, baseOffset: UInt64) -> String {

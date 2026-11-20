@@ -85,11 +85,15 @@ struct LCBinaryHeadersSection: View {
                 case .protocols:
                     LCObjCProtocolsListView(
                         protocols: filteredProtocols,
+                        allClasses: objcDump?.classes ?? [],
+                        allProtocols: objcDump?.protocols ?? [],
                         onShareHeaderFile: onShareHeaderFile
                     )
                 case .categories:
                     LCObjCCategoriesListView(
                         categories: filteredCategories,
+                        allClasses: objcDump?.classes ?? [],
+                        allProtocols: objcDump?.protocols ?? [],
                         onShareHeaderFile: onShareHeaderFile
                     )
                 case .swift:
@@ -183,7 +187,7 @@ private struct LCObjCClassesListView: View {
                 NavigationLink {
                     LCObjCHeaderDetailView(
                         title: "\(cls.name).h",
-                        headerCode: LCMachOObjCDumper.renderHeader(for: cls),
+                        renderHeader: { LCMachOObjCDumper.renderHeader(for: cls) },
                         superclassName: cls.superclassName,
                         protocols: cls.protocols,
                         memberSummary: "\(cls.properties.count) props · \(cls.instanceMethods.count + cls.classMethods.count) methods · \(cls.ivars.count) ivars",
@@ -228,6 +232,8 @@ private struct LCObjCClassesListView: View {
 
 private struct LCObjCProtocolsListView: View {
     let protocols: [LCObjCProtocolInfo]
+    let allClasses: [LCObjCClassInfo]
+    let allProtocols: [LCObjCProtocolInfo]
     let onShareHeaderFile: (URL) -> Void
 
     var body: some View {
@@ -240,12 +246,12 @@ private struct LCObjCProtocolsListView: View {
                         + proto.optionalInstanceMethods.count + proto.optionalClassMethods.count
                     LCObjCHeaderDetailView(
                         title: "\(proto.name)-Protocol.h",
-                        headerCode: LCMachOObjCDumper.renderHeader(for: proto),
+                        renderHeader: { LCMachOObjCDumper.renderHeader(for: proto) },
                         superclassName: nil,
                         protocols: proto.adoptedProtocols,
                         memberSummary: "\(proto.properties.count) props · \(count) methods",
-                        allClasses: [],
-                        allProtocols: protocols,
+                        allClasses: allClasses,
+                        allProtocols: allProtocols,
                         onShareHeaderFile: onShareHeaderFile
                     )
                 } label: {
@@ -266,6 +272,8 @@ private struct LCObjCProtocolsListView: View {
 
 private struct LCObjCCategoriesListView: View {
     let categories: [LCObjCCategoryInfo]
+    let allClasses: [LCObjCClassInfo]
+    let allProtocols: [LCObjCProtocolInfo]
     let onShareHeaderFile: (URL) -> Void
 
     var body: some View {
@@ -276,12 +284,12 @@ private struct LCObjCCategoriesListView: View {
                 NavigationLink {
                     LCObjCHeaderDetailView(
                         title: "\(cat.className)+\(cat.name).h",
-                        headerCode: LCMachOObjCDumper.renderHeader(for: cat),
+                        renderHeader: { LCMachOObjCDumper.renderHeader(for: cat) },
                         superclassName: nil,
                         protocols: cat.protocols,
                         memberSummary: "\(cat.properties.count) props · \(cat.instanceMethods.count + cat.classMethods.count) methods",
-                        allClasses: [],
-                        allProtocols: [],
+                        allClasses: allClasses,
+                        allProtocols: allProtocols,
                         onShareHeaderFile: onShareHeaderFile
                     )
                 } label: {
@@ -400,7 +408,7 @@ private struct LCObjCHierarchyListView: View {
                 NavigationLink {
                     LCObjCHeaderDetailView(
                         title: "\(row.cls.name).h",
-                        headerCode: LCMachOObjCDumper.renderHeader(for: row.cls),
+                        renderHeader: { LCMachOObjCDumper.renderHeader(for: row.cls) },
                         superclassName: row.cls.superclassName,
                         protocols: row.cls.protocols,
                         memberSummary: "\(row.cls.properties.count) props · \(row.cls.instanceMethods.count + row.cls.classMethods.count) methods",
@@ -433,10 +441,11 @@ private struct LCObjCHierarchyListView: View {
     }
 }
 
-/// Objective-C `.h` header viewer with copy, single-file export, and superclass/protocol navigation.
+/// Objective-C `.h` header viewer with lazy rendering, copy, single-file export,
+/// and superclass/protocol cross-navigation.
 private struct LCObjCHeaderDetailView: View {
     let title: String
-    let headerCode: String
+    let renderHeader: @Sendable () -> String
     let superclassName: String?
     let protocols: [String]
     let memberSummary: String
@@ -444,7 +453,9 @@ private struct LCObjCHeaderDetailView: View {
     let allProtocols: [LCObjCProtocolInfo]
     let onShareHeaderFile: (URL) -> Void
 
+    @State private var headerCode = ""
     @State private var copied = false
+    @State private var exportError: String?
 
     private var superclassMatch: LCObjCClassInfo? {
         guard let superclassName else { return nil }
@@ -460,7 +471,7 @@ private struct LCObjCHeaderDetailView: View {
                             NavigationLink {
                                 LCObjCHeaderDetailView(
                                     title: "\(sup.name).h",
-                                    headerCode: LCMachOObjCDumper.renderHeader(for: sup),
+                                    renderHeader: { LCMachOObjCDumper.renderHeader(for: sup) },
                                     superclassName: sup.superclassName,
                                     protocols: sup.protocols,
                                     memberSummary: "\(sup.properties.count) props · \(sup.instanceMethods.count + sup.classMethods.count) methods",
@@ -480,7 +491,7 @@ private struct LCObjCHeaderDetailView: View {
                                 NavigationLink {
                                     LCObjCHeaderDetailView(
                                         title: "\(proto.name)-Protocol.h",
-                                        headerCode: LCMachOObjCDumper.renderHeader(for: proto),
+                                        renderHeader: { LCMachOObjCDumper.renderHeader(for: proto) },
                                         superclassName: nil,
                                         protocols: proto.adoptedProtocols,
                                         memberSummary: "\(proto.properties.count) props",
@@ -531,13 +542,35 @@ private struct LCObjCHeaderDetailView: View {
                 }
 
                 Button {
-                    let stem = (title as NSString).deletingPathExtension
-                    if let url = try? LCMachOExportService.exportSingleHeader(name: stem, content: headerCode) {
-                        onShareHeaderFile(url)
+                    Task {
+                        let stem = (title as NSString).deletingPathExtension
+                        let code = headerCode
+                        do {
+                            let url = try await lcRunOffMain {
+                                try LCMachOExportService.exportSingleHeader(name: stem, content: code)
+                            }
+                            onShareHeaderFile(url)
+                        } catch {
+                            exportError = error.localizedDescription
+                        }
                     }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                 }
+            }
+        }
+        .alert("Export Failed", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("lc.common.ok".loc, role: .cancel) {}
+        } message: {
+            Text(exportError ?? "")
+        }
+        .task(id: title) {
+            if headerCode.isEmpty {
+                let render = renderHeader
+                headerCode = (try? await lcRunOffMain { render() }) ?? ""
             }
         }
         .task(id: copied) {

@@ -21,6 +21,7 @@ struct LCFileExplorerView: View {
     @State private var entries: [LCFileEntry] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var actionErrorMessage: String?
     @State private var searchQuery = ""
     @State private var sortOrder: LCFileSortOrder = .name
     @State private var showHiddenFiles = true
@@ -221,6 +222,14 @@ struct LCFileExplorerView: View {
                 needsSecurityScope: root.needsSecurityScope
             )
         }
+        .alert("Action Failed", isPresented: Binding(
+            get: { actionErrorMessage != nil },
+            set: { if !$0 { actionErrorMessage = nil } }
+        )) {
+            Button("lc.common.ok".loc, role: .cancel) {}
+        } message: {
+            Text(actionErrorMessage ?? "")
+        }
         .task(id: directoryURL) {
             await reload()
         }
@@ -301,22 +310,23 @@ struct LCFileExplorerView: View {
         let rootURL = root.rootURL
         let scope = root.needsSecurityScope
         do {
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await lcRunOffMain {
                 try LCFileExplorerService.listDirectory(
                     at: targetDir,
                     rootURL: rootURL,
                     needsSecurityScope: scope
                 )
-            }.value
+            }
             if !Task.isCancelled {
                 entries = loaded
+                isLoading = false
             }
         } catch {
             if !Task.isCancelled {
                 errorMessage = error.localizedDescription
+                isLoading = false
             }
         }
-        isLoading = false
     }
 
     private func createFolder() async {
@@ -325,12 +335,12 @@ struct LCFileExplorerView: View {
         let rootURL = root.rootURL
         let scope = root.needsSecurityScope
         do {
-            try await Task.detached(priority: .userInitiated) {
+            try await lcRunOffMain {
                 try LCFileExplorerService.createFolder(named: name, in: dir, rootURL: rootURL, needsSecurityScope: scope)
-            }.value
+            }
             await reload()
         } catch {
-            errorMessage = error.localizedDescription
+            actionErrorMessage = error.localizedDescription
         }
     }
 
@@ -340,12 +350,12 @@ struct LCFileExplorerView: View {
         let rootURL = root.rootURL
         let scope = root.needsSecurityScope
         do {
-            try await Task.detached(priority: .userInitiated) {
+            try await lcRunOffMain {
                 try LCFileExplorerService.renameItem(at: itemURL, to: targetName, rootURL: rootURL, needsSecurityScope: scope)
-            }.value
+            }
             await reload()
         } catch {
-            errorMessage = error.localizedDescription
+            actionErrorMessage = error.localizedDescription
         }
     }
 
@@ -353,12 +363,12 @@ struct LCFileExplorerView: View {
         let rootURL = root.rootURL
         let scope = root.needsSecurityScope
         do {
-            let shareableURL = try await Task.detached(priority: .userInitiated) {
+            let shareableURL = try await lcRunOffMain {
                 try LCFileExplorerService.stageFileForSharing(at: url, rootURL: rootURL, needsSecurityScope: scope)
-            }.value
+            }
             shareURL = shareableURL
         } catch {
-            errorMessage = error.localizedDescription
+            actionErrorMessage = error.localizedDescription
         }
     }
 
@@ -367,12 +377,12 @@ struct LCFileExplorerView: View {
         let rootURL = root.rootURL
         let scope = root.needsSecurityScope
         do {
-            try await Task.detached(priority: .userInitiated) {
+            try await lcRunOffMain {
                 try LCFileExplorerService.deleteItem(at: itemURL, rootURL: rootURL, needsSecurityScope: scope)
-            }.value
+            }
             await reload()
         } catch {
-            errorMessage = error.localizedDescription
+            actionErrorMessage = error.localizedDescription
         }
     }
 }

@@ -171,7 +171,8 @@ enum LCMachODylibKind: String, Sendable {
 
 /// A dynamic library referenced by a Mach-O binary.
 struct LCMachODylibDependency: Identifiable, Sendable {
-    var id: String { "\(kind.rawValue):\(path)" }
+    var id: String { "\(index):\(kind.rawValue):\(path)" }
+    let index: Int
     let path: String
     let kind: LCMachODylibKind
     let currentVersion: String
