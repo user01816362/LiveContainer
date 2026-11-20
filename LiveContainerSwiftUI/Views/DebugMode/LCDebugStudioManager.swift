@@ -345,10 +345,11 @@ final class LCDebugStudioManager: ObservableObject {
     }
 
     static func clearStaleSessionMetadata(forPID pid: Int32 = 0) {
-        let shared = UserDefaults.lcShared()
-        shared.removeObject(forKey: "LCDebugActiveSession")
-        shared.removeObject(forKey: "LCDebugPendingBundleID")
-        shared.removeObject(forKey: "LCDebugPendingRelativePath")
+        if let shared = UserDefaults.lcShared() {
+            shared.removeObject(forKey: "LCDebugActiveSession")
+            shared.removeObject(forKey: "LCDebugPendingBundleID")
+            shared.removeObject(forKey: "LCDebugPendingRelativePath")
+        }
         if pid > 0, let fileURL = sessionFileURL(forPID: Int(pid)) {
             try? FileManager.default.removeItem(at: fileURL)
         }

@@ -820,8 +820,8 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 }
 
 __attribute__((visibility("default")))
-kern_return_t LCRebindGlobalSymbol(void *replacee, void *replacement) {
-    return litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, replacee, replacement, nil);
+void LCRebindGlobalSymbol(void *replacee, void *replacement) {
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, replacee, replacement, nil);
 }
 
 static void exceptionHandler(NSException *exception) {

@@ -1975,10 +1975,10 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (atomic, assign) BOOL lastJITState;
 @property (atomic, assign) NSUInteger errorLogCount;
 
-@property (atomic, assign) BOOL xrayEnabled;
-@property (atomic, assign) BOOL tapInspectEnabled;
-@property (atomic, assign) BOOL notificationMonitorEnabled;
-@property (atomic, assign) BOOL lanEnabled;
+@property (nonatomic, assign) BOOL xrayEnabled;
+@property (nonatomic, assign) BOOL tapInspectEnabled;
+@property (nonatomic, assign) BOOL notificationMonitorEnabled;
+@property (nonatomic, assign) BOOL lanEnabled;
 @property (nonatomic, copy) NSString *authToken;
 @property (nonatomic, strong) NSDictionary *selectedViewInfo;
 @property (nonatomic, strong) LCDebugInspectOverlayView *inspectOverlay;
@@ -2217,7 +2217,7 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
 }
 
 - (void)installNSLogHook {
-    kern_return_t (*rebindGlobal)(void *, void *) = (kern_return_t (*)(void *, void *))dlsym(RTLD_DEFAULT, "LCRebindGlobalSymbol");
+    void (*rebindGlobal)(void *, void *) = (void (*)(void *, void *))dlsym(RTLD_DEFAULT, "LCRebindGlobalSymbol");
     void *origNSLogPtr = dlsym(RTLD_DEFAULT, "NSLog");
     void *origNSLogvPtr = dlsym(RTLD_DEFAULT, "NSLogv");
     if (!rebindGlobal || !origNSLogPtr || !origNSLogvPtr) {
@@ -3157,7 +3157,7 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
 }
 
 - (void)setNotificationMonitorEnabled:(BOOL)enabled {
-    self.notificationMonitorEnabled = enabled;
+    _notificationMonitorEnabled = enabled;
     atomic_store(&gLCDebugNotifMonitorAtomic, enabled);
     dispatch_async(self.serverQueue, ^{
         [self broadcastSSEEvent:"telemetry" payload:[self currentStatusDictionary]];
@@ -3165,7 +3165,7 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
 }
 
 - (void)setTapInspectEnabled:(BOOL)enabled {
-    self.tapInspectEnabled = enabled;
+    _tapInspectEnabled = enabled;
     dispatch_async(self.serverQueue, ^{
         [self broadcastSSEEvent:"telemetry" payload:[self currentStatusDictionary]];
     });
@@ -3443,14 +3443,14 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
     if (self.overlayWindow) {
         if (self.overlayWindow.windowScene != scene) {
             self.overlayWindow.windowScene = scene;
-            self.overlayWindow.frame = scene.coordinateSpace.bounds;
+            self.overlayWindow.frame = scene.effectiveGeometry.coordinateSpace.bounds;
         }
         self.overlayWindow.hidden = NO;
         return;
     }
 
     LCDebugOverlayWindow *win = [[LCDebugOverlayWindow alloc] initWithWindowScene:scene];
-    win.frame = scene.coordinateSpace.bounds;
+    win.frame = scene.effectiveGeometry.coordinateSpace.bounds;
     win.windowLevel = UIWindowLevelAlert + 50;
     win.backgroundColor = UIColor.clearColor;
 
