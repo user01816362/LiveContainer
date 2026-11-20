@@ -96,11 +96,21 @@ struct LCDataManagementView : View {
                 }
             }
             
-            Section {
+            Section("Built-In File Explorer") {
                 ForEach(folderPaths, id:\.desc) { path in
                     HStack(spacing: 10) {
-                        Text(path.desc)
-                        Spacer()
+                        NavigationLink {
+                            LCFileExplorerView(
+                                root: LCFileExplorerRoot(
+                                    title: path.desc,
+                                    rootURL: path.path,
+                                    isReadOnly: path.desc == "LiveContainer Bundle",
+                                    readOnlyReason: path.desc == "LiveContainer Bundle" ? "Signed App Bundle" : nil
+                                )
+                            )
+                        } label: {
+                            Label(path.desc, systemImage: "folder.fill")
+                        }
                         if filzaInstalled {
                             Button {
                                 openInFilza(path: path.path)

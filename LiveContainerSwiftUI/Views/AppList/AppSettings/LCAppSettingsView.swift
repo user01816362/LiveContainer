@@ -104,6 +104,21 @@ struct LCAppSettingsView: View {
                     }
                 }
                 
+                if let bundlePath = appInfo.bundlePath() {
+                    NavigationLink {
+                        LCFileExplorerView(
+                            root: LCFileExplorerRoot(
+                                title: appInfo.displayName() ?? "App Bundle",
+                                rootURL: URL(fileURLWithPath: bundlePath, isDirectory: true),
+                                isReadOnly: sharedModel.multiLCStatus == 2,
+                                readOnlyReason: sharedModel.multiLCStatus == 2 ? "Secondary LiveContainer" : nil
+                            )
+                        )
+                    } label: {
+                        Label("Browse App Bundle", systemImage: "folder.fill")
+                    }
+                }
+
                 if !model.uiIsShared {
                     if LCUtils.isAppGroupAltStoreLike() || LCUtils.store() == .ADP {
                         Button("lc.appSettings.toSharedApp".loc) {

@@ -388,6 +388,20 @@ struct LCContainerView: View {
     @ViewBuilder
     private var managementActionsSection: some View {
         Section {
+            NavigationLink {
+                LCFileExplorerView(
+                    root: LCFileExplorerRoot(
+                        title: container.name,
+                        rootURL: delegate.getContainerURL(container: container),
+                        needsSecurityScope: container.storageBookMark != nil,
+                        isReadOnly: inUse,
+                        readOnlyReason: inUse ? "Container is Running" : nil
+                    )
+                )
+            } label: {
+                Label("Browse Container Files", systemImage: "folder.fill")
+            }
+
             if inUse {
                 Text("lc.container.inUse".loc)
                     .foregroundStyle(.gray)
