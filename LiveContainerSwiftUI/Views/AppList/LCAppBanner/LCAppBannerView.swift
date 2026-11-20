@@ -95,22 +95,34 @@ final class LCAppBannerRootView: UIView {
         detailStack.isAccessibilityElement = true
 
         runControl.translatesAutoresizingMaskIntoConstraints = false
+        runControl.setContentHuggingPriority(.required, for: .horizontal)
+        runControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         updateButton.translatesAutoresizingMaskIntoConstraints = false
-        updateButton.clipsToBounds = true
-        var updateConfig = UIButton.Configuration.filled()
+        var updateConfig = UIButton.Configuration.prominentGlass()
         updateConfig.cornerStyle = .capsule
-        updateConfig.buttonSize = .mini
-        updateConfig.contentInsets = NSDirectionalEdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8)
+        updateConfig.buttonSize = .small
+        updateConfig.titleLineBreakMode = .byTruncatingTail
+        updateConfig.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12)
+        updateConfig.titleTextAttributesTransformer = Self.updateTitleTransformer()
         updateButton.configuration = updateConfig
+        updateButton.maximumContentSizeCategory = .extraLarge
+        updateButton.configurationUpdateHandler = { button in
+            button.titleLabel?.numberOfLines = 1
+            button.titleLabel?.adjustsFontSizeToFitWidth = true
+            button.titleLabel?.minimumScaleFactor = 0.8
+        }
         updateButton.setContentHuggingPriority(.required, for: .horizontal)
         updateButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         updateButton.isHidden = true
 
         trailingControlsStack.translatesAutoresizingMaskIntoConstraints = false
         trailingControlsStack.axis = .vertical
-        trailingControlsStack.alignment = .trailing
+        trailingControlsStack.alignment = .fill
         trailingControlsStack.distribution = .fill
-        trailingControlsStack.spacing = 4
+        trailingControlsStack.spacing = 6
+        trailingControlsStack.setContentHuggingPriority(.required, for: .horizontal)
+        trailingControlsStack.setContentCompressionResistancePriority(.required, for: .horizontal)
         trailingControlsStack.addArrangedSubview(updateButton)
         trailingControlsStack.addArrangedSubview(runControl)
 
@@ -136,10 +148,11 @@ final class LCAppBannerRootView: UIView {
 
             trailingControlsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             trailingControlsStack.centerYAnchor.constraint(equalTo: centerYAnchor),
-            trailingControlsStack.widthAnchor.constraint(equalToConstant: 70),
-            runControl.widthAnchor.constraint(equalToConstant: 70),
+            trailingControlsStack.widthAnchor.constraint(lessThanOrEqualToConstant: 124),
+            runControl.widthAnchor.constraint(greaterThanOrEqualToConstant: 70),
             runControl.heightAnchor.constraint(equalToConstant: 28),
-            updateButton.heightAnchor.constraint(equalToConstant: 24)
+            updateButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 70),
+            updateButton.heightAnchor.constraint(equalToConstant: 28)
         ])
     }
 
@@ -195,23 +208,32 @@ final class LCAppBannerRootView: UIView {
         )
 
         if let activeDownload {
-            var config = updateButton.configuration ?? UIButton.Configuration.filled()
-            config.baseBackgroundColor = accentColor.withAlphaComponent(0.85)
+            var config = updateButton.configuration ?? UIButton.Configuration.prominentGlass()
+            config.baseBackgroundColor = accentColor
             config.baseForegroundColor = .white
-            config.image = UIImage(systemName: "arrow.down.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .bold))
-            config.imagePadding = 3
+            config.image = UIImage(
+                systemName: "arrow.down",
+                withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+            )
+            config.imagePadding = 4
             let pct = Int((activeDownload.progress * 100).rounded())
             config.title = pct > 0 ? "\(pct)%" : "…"
+            config.titleTextAttributesTransformer = Self.progressTitleTransformer()
             updateButton.configuration = config
+            updateButton.accessibilityLabel = pct > 0
+                ? "\("lc.appBanner.update".loc), \(pct)%"
+                : "lc.appBanner.update".loc
             updateButton.isHidden = false
         } else if updateCandidate != nil {
-            var config = updateButton.configuration ?? UIButton.Configuration.filled()
+            var config = updateButton.configuration ?? UIButton.Configuration.prominentGlass()
             config.baseBackgroundColor = .systemBlue
             config.baseForegroundColor = .white
-            config.image = UIImage(systemName: "arrow.down.circle.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .bold))
-            config.imagePadding = 3
+            config.image = nil
+            config.imagePadding = 0
             config.title = "lc.appBanner.update".loc
+            config.titleTextAttributesTransformer = Self.updateTitleTransformer()
             updateButton.configuration = config
+            updateButton.accessibilityLabel = "lc.appBanner.update".loc
             updateButton.isHidden = false
         } else {
             updateButton.isHidden = true
@@ -223,6 +245,25 @@ final class LCAppBannerRootView: UIView {
         }
         accessibilityParts.append(model.uiSelectedContainer?.name ?? "lc.appBanner.noDataFolder".loc)
         detailStack.accessibilityLabel = accessibilityParts.joined(separator: ", ")
+    }
+
+    private static func updateTitleTransformer() -> UIConfigurationTextAttributesTransformer {
+        UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = UIFontMetrics(forTextStyle: .footnote).scaledFont(
+                for: .systemFont(ofSize: 13, weight: .bold),
+                maximumPointSize: 15
+            )
+            return outgoing
+        }
+    }
+
+    private static func progressTitleTransformer() -> UIConfigurationTextAttributesTransformer {
+        UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
+            return outgoing
+        }
     }
 
     private static func extractMainHueColor(appInfo: LCAppInfo, icon: UIImage, darkModeIcon: Bool) -> UIColor {
@@ -434,7 +475,7 @@ final class LCAppBannerRunControl: UIControl {
     }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.insetBy(dx: -4, dy: -6).contains(point)
+        bounds.insetBy(dx: -4, dy: -2).contains(point)
     }
 
     func update(color: UIColor, isSigning: Bool, progress: Double, isEnabled: Bool) {

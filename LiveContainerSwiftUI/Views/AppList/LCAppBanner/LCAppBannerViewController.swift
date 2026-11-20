@@ -51,7 +51,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         doubleTapGesture.cancelsTouchesInView = false
         bannerView.addGestureRecognizer(doubleTapGesture)
 
-        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _) in
+        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
             self.refreshView()
         }
     }
