@@ -696,11 +696,16 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     NSString *pendingDebugBundleId = [lcSharedDefaults stringForKey:@"LCDebugPendingBundleID"];
     NSString *pendingDebugRelPath = [lcSharedDefaults stringForKey:@"LCDebugPendingRelativePath"];
     const char *envDebugMode = getenv("LC_DEBUG_MODE");
-    BOOL debugModeActive = (envDebugMode && envDebugMode[0] == '1') ||
-        [lcUserDefaults boolForKey:@"LCDebugLaunchRequested"] ||
-        [guestAppInfo[@"LCDebugModeEnabled"] boolValue] ||
+    BOOL pendingMatched =
         (pendingDebugBundleId.length > 0 && ([pendingDebugBundleId isEqualToString:appBundle.bundleIdentifier] || [pendingDebugBundleId isEqualToString:lcGuestAppId])) ||
         (pendingDebugRelPath.length > 0 && [pendingDebugRelPath isEqualToString:selectedApp]);
+    if (pendingMatched) {
+        [lcSharedDefaults removeObjectForKey:@"LCDebugPendingBundleID"];
+        [lcSharedDefaults removeObjectForKey:@"LCDebugPendingRelativePath"];
+    }
+    BOOL debugModeActive = (envDebugMode && envDebugMode[0] == '1') ||
+        [guestAppInfo[@"LCDebugModeEnabled"] boolValue] ||
+        pendingMatched;
     if (debugModeActive) {
         setenv("LC_DEBUG_MODE", "1", 1);
     }

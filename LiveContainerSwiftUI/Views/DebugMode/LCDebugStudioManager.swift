@@ -157,10 +157,14 @@ struct LCDebugSandboxFile: Identifiable, Decodable, Hashable, Sendable {
 }
 
 struct LCDebugKeychainItem: Identifiable, Decodable, Hashable, Sendable {
-    var id: String { "\(service)-\(account)-\(accessGroup)" }
+    let id = UUID()
     let account: String
     let service: String
     let accessGroup: String
+
+    enum CodingKeys: String, CodingKey {
+        case account, service, accessGroup
+    }
 }
 
 struct LCDebugSandboxSummary: Decodable, Sendable {
@@ -267,6 +271,14 @@ private struct LCDebugSessionFilePayload: Decodable, Sendable {
     let authToken: String?
 }
 
+private enum LCDecodedSSEMessage: Sendable {
+    case telemetry(LCDebugStatusSnapshot)
+    case log(LCDebugLogEntry)
+    case network(LCDebugNetworkEntry)
+    case uiEvent(LCDebugUIEventEntry)
+    case tap(LCDebugSelectedView)
+}
+
 @MainActor
 final class LCDebugStudioManager: ObservableObject {
     @Published var isConnected = false
@@ -303,6 +315,7 @@ final class LCDebugStudioManager: ObservableObject {
     private var connectionTask: Task<Void, Never>? = nil
     private var sseTask: Task<Void, Never>? = nil
     private let session: URLSession
+    private let decoder = JSONDecoder()
 
     init() {
         let config = URLSessionConfiguration.ephemeral
@@ -326,11 +339,16 @@ final class LCDebugStudioManager: ObservableObject {
     }
 
     deinit {
+        connectionTask?.cancel()
+        sseTask?.cancel()
         session.invalidateAndCancel()
     }
 
     static func clearStaleSessionMetadata(forPID pid: Int32 = 0) {
-        UserDefaults.lcShared().removeObject(forKey: "LCDebugActiveSession")
+        let shared = UserDefaults.lcShared()
+        shared.removeObject(forKey: "LCDebugActiveSession")
+        shared.removeObject(forKey: "LCDebugPendingBundleID")
+        shared.removeObject(forKey: "LCDebugPendingRelativePath")
         if pid > 0, let fileURL = sessionFileURL(forPID: Int(pid)) {
             try? FileManager.default.removeItem(at: fileURL)
         }
@@ -344,17 +362,15 @@ final class LCDebugStudioManager: ObservableObject {
     }
 
     private func discoverSession(expectedPID: Int32) -> (pid: Int, port: Int, token: String)? {
-        // 1. Prefer deterministic per-PID session file written by the exact target process
         if expectedPID > 0,
            let fileURL = Self.sessionFileURL(forPID: Int(expectedPID)),
            let data = try? Data(contentsOf: fileURL),
-           let payload = try? JSONDecoder().decode(LCDebugSessionFilePayload.self, from: data),
+           let payload = try? decoder.decode(LCDebugSessionFilePayload.self, from: data),
            payload.pid == Int(expectedPID),
            payload.localPort > 0 {
             return (payload.pid, payload.localPort, payload.authToken ?? "")
         }
 
-        // 2. Fallback to App Group UserDefaults (strict PID match when expectedPID > 0)
         if let info = UserDefaults.lcShared().dictionary(forKey: "LCDebugActiveSession"),
            let port = info["localPort"] as? Int, port > 0 {
             let sessionPID = info["pid"] as? Int ?? 0
@@ -380,9 +396,9 @@ final class LCDebugStudioManager: ObservableObject {
         }
 
         connectionTask = Task { [weak self] in
-            guard let self else { return }
             let deadline = Date().addingTimeInterval(25)
             while !Task.isCancelled && Date() < deadline {
+                guard let self else { return }
                 if let discovered = self.discoverSession(expectedPID: expectedPID) {
                     self.localPort = discovered.port
                     self.pid = discovered.pid
@@ -394,10 +410,9 @@ final class LCDebugStudioManager: ObservableObject {
                 }
                 try? await Task.sleep(for: .milliseconds(250))
             }
-            if !Task.isCancelled && !self.isConnected {
-                self.isConnecting = false
-                self.connectionError = "Timed out connecting to Debug Agent (PID \(expectedPID)). Tap Reconnect to retry."
-            }
+            guard let self, !Task.isCancelled, !self.isConnected else { return }
+            self.isConnecting = false
+            self.connectionError = "Timed out connecting to Debug Agent (PID \(expectedPID)). Tap Reconnect to retry."
         }
     }
 
@@ -428,16 +443,7 @@ final class LCDebugStudioManager: ObservableObject {
         apply(status: status)
         isConnected = true
         connectionError = nil
-
-        if let initialLogs: [LCDebugLogEntry] = await fetchJSON(url: base.appendingPathComponent("api/logs")) {
-            self.logs = initialLogs
-        }
-        if let initialNet: [LCDebugNetworkEntry] = await fetchJSON(url: base.appendingPathComponent("api/network")) {
-            self.networkEntries = initialNet
-        }
-        if let initialEvents: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
-            self.uiEvents = initialEvents
-        }
+        await fetchInitialCollections(base: base)
         startSSEStream()
         return true
     }
@@ -449,47 +455,62 @@ final class LCDebugStudioManager: ObservableObject {
             isConnected = true
             connectionError = nil
         }
-        if let initialLogs: [LCDebugLogEntry] = await fetchJSON(url: base.appendingPathComponent("api/logs")) {
+        await fetchInitialCollections(base: base)
+    }
+
+    private func fetchInitialCollections(base: URL) async {
+        async let logsFetch: [LCDebugLogEntry]? = fetchJSON(url: base.appendingPathComponent("api/logs"))
+        async let netFetch: [LCDebugNetworkEntry]? = fetchJSON(url: base.appendingPathComponent("api/network"))
+        async let evFetch: [LCDebugUIEventEntry]? = fetchJSON(url: base.appendingPathComponent("api/events"))
+
+        if let initialLogs = await logsFetch {
             self.logs = initialLogs
         }
-        if let initialNet: [LCDebugNetworkEntry] = await fetchJSON(url: base.appendingPathComponent("api/network")) {
+        if let initialNet = await netFetch {
             self.networkEntries = initialNet
         }
-        if let initialEvents: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
+        if let initialEvents = await evFetch {
             self.uiEvents = initialEvents
         }
     }
 
     private func startSSEStream() {
         sseTask?.cancel()
-        guard let base = baseURL else { return }
-        let streamURL = base.appendingPathComponent("api/stream")
+        let session = self.session
 
-        sseTask = Task { [weak self] in
-            guard let self else { return }
+        // Run raw SSE byte reading + JSON decoding off MainActor and batch-flush updates
+        sseTask = Task.detached(priority: .utility) { [weak self] in
+            let bgDecoder = JSONDecoder()
             while !Task.isCancelled {
+                guard let req = await self?.makeStreamRequest() else {
+                    break
+                }
+
                 do {
-                    var req = authorizedRequest(url: streamURL)
-                    req.timeoutInterval = 3600
-                    let (bytes, response) = try await self.session.bytes(for: req)
+                    let (bytes, response) = try await session.bytes(for: req)
                     if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                         throw URLError(.badServerResponse)
                     }
 
-                    self.isConnected = true
-                    self.connectionError = nil
+                    await MainActor.run { [weak self] in
+                        self?.isConnected = true
+                        self?.connectionError = nil
+                    }
 
                     var currentEvent = "message"
                     var dataLines: [String] = []
                     var lineBuffer: [UInt8] = []
                     lineBuffer.reserveCapacity(512)
+                    var pendingBatch: [LCDecodedSSEMessage] = []
+                    pendingBatch.reserveCapacity(32)
+                    var lastFlushTime = CFAbsoluteTimeGetCurrent()
 
-                    // IMPORTANT: Read raw bytes instead of `bytes.lines`, because Swift's
-                    // AsyncLineSequence strips empty lines (\n\n) that delimit SSE frames!
+                    // Read raw bytes instead of `bytes.lines` because Swift's AsyncLineSequence
+                    // strips blank lines (\n\n) that delimit SSE frames.
                     for try await byte in bytes {
                         if Task.isCancelled { break }
                         if byte == 0x0A { // '\n'
-                            if lineBuffer.last == 0x0D { // strip '\r'
+                            if lineBuffer.last == 0x0D {
                                 lineBuffer.removeLast()
                             }
                             let line = String(decoding: lineBuffer, as: UTF8.self)
@@ -498,10 +519,27 @@ final class LCDebugStudioManager: ObservableObject {
                             if line.isEmpty {
                                 if !dataLines.isEmpty {
                                     let joined = dataLines.joined(separator: "\n")
-                                    self.handleSSEEvent(name: currentEvent, jsonString: joined)
+                                    if let decoded = Self.decodeSSEEvent(name: currentEvent, jsonString: joined, decoder: bgDecoder) {
+                                        pendingBatch.append(decoded)
+                                    }
                                 }
                                 currentEvent = "message"
                                 dataLines.removeAll(keepingCapacity: true)
+
+                                let now = CFAbsoluteTimeGetCurrent()
+                                let shouldFlushNow = pendingBatch.count >= 16 || (now - lastFlushTime) >= 0.05 || pendingBatch.last.map({
+                                    if case .telemetry = $0 { return true }
+                                    if case .tap = $0 { return true }
+                                    return false
+                                }) == true
+                                if shouldFlushNow && !pendingBatch.isEmpty {
+                                    let batchToApply = pendingBatch
+                                    pendingBatch.removeAll(keepingCapacity: true)
+                                    lastFlushTime = now
+                                    await MainActor.run { [weak self] in
+                                        self?.applySSEBatch(batchToApply)
+                                    }
+                                }
                             } else if line.hasPrefix("event:") {
                                 currentEvent = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
                             } else if line.hasPrefix("data:") {
@@ -515,54 +553,111 @@ final class LCDebugStudioManager: ObservableObject {
                             lineBuffer.append(byte)
                         }
                     }
+
+                    if !pendingBatch.isEmpty {
+                        let remaining = pendingBatch
+                        await MainActor.run { [weak self] in
+                            self?.applySSEBatch(remaining)
+                        }
+                    }
+
+                    // Clean EOF from server -> mark disconnected so reconnect triggers cleanly
+                    if !Task.isCancelled {
+                        await MainActor.run { [weak self] in
+                            self?.isConnected = false
+                            self?.connectionError = "Live stream closed. Reconnecting…"
+                        }
+                    }
                 } catch {
                     if Task.isCancelled { break }
-                    self.isConnected = false
-                    self.connectionError = "Live stream disconnected. Reconnecting…"
+                    await MainActor.run { [weak self] in
+                        self?.isConnected = false
+                        self?.connectionError = "Live stream disconnected. Reconnecting…"
+                    }
                 }
 
                 if Task.isCancelled { break }
                 try? await Task.sleep(for: .seconds(1))
-                await self.refreshStatusAndSnapshots()
+                let stillAlive = await self?.refreshForReconnect() ?? false
+                if !stillAlive {
+                    break
+                }
             }
         }
     }
 
-    private func handleSSEEvent(name: String, jsonString: String) {
-        guard let data = jsonString.data(using: .utf8) else { return }
-        let decoder = JSONDecoder()
+    private func makeStreamRequest() -> URLRequest? {
+        guard let base = baseURL else { return nil }
+        var req = authorizedRequest(url: base.appendingPathComponent("api/stream"))
+        req.timeoutInterval = 3600
+        return req
+    }
+
+    private func refreshForReconnect() async -> Bool {
+        if expectedPID > 0 && kill(expectedPID, 0) != 0 && errno == ESRCH {
+            isConnected = false
+            connectionError = "Guest process (PID \(expectedPID)) exited."
+            return false
+        }
+        await refreshStatusAndSnapshots()
+        return baseURL != nil
+    }
+
+    private nonisolated static func decodeSSEEvent(name: String, jsonString: String, decoder: JSONDecoder) -> LCDecodedSSEMessage? {
+        guard let data = jsonString.data(using: .utf8) else { return nil }
         switch name {
         case "telemetry":
-            if let status = try? decoder.decode(LCDebugStatusSnapshot.self, from: data) {
-                apply(status: status)
-            }
+            return (try? decoder.decode(LCDebugStatusSnapshot.self, from: data)).map(LCDecodedSSEMessage.telemetry)
         case "log":
-            if let entry = try? decoder.decode(LCDebugLogEntry.self, from: data) {
-                logs.append(entry)
-                if logs.count > 2000 {
-                    logs.removeFirst(logs.count - 2000)
-                }
-            }
+            return (try? decoder.decode(LCDebugLogEntry.self, from: data)).map(LCDecodedSSEMessage.log)
         case "network":
-            if let entry = try? decoder.decode(LCDebugNetworkEntry.self, from: data) {
-                networkEntries.insert(entry, at: 0)
-                if networkEntries.count > 500 {
-                    networkEntries.removeLast(networkEntries.count - 500)
-                }
-            }
+            return (try? decoder.decode(LCDebugNetworkEntry.self, from: data)).map(LCDecodedSSEMessage.network)
         case "uievent":
-            if let entry = try? decoder.decode(LCDebugUIEventEntry.self, from: data) {
-                uiEvents.insert(entry, at: 0)
-                if uiEvents.count > 500 {
-                    uiEvents.removeLast(uiEvents.count - 500)
-                }
-            }
+            return (try? decoder.decode(LCDebugUIEventEntry.self, from: data)).map(LCDecodedSSEMessage.uiEvent)
         case "tap":
-            if let view = try? decoder.decode(LCDebugSelectedView.self, from: data) {
+            return (try? decoder.decode(LCDebugSelectedView.self, from: data)).map(LCDecodedSSEMessage.tap)
+        default:
+            return nil
+        }
+    }
+
+    private func applySSEBatch(_ batch: [LCDecodedSSEMessage]) {
+        var newLogs: [LCDebugLogEntry] = []
+        var newNets: [LCDebugNetworkEntry] = []
+        var newEvents: [LCDebugUIEventEntry] = []
+
+        for msg in batch {
+            switch msg {
+            case .telemetry(let status):
+                apply(status: status)
+            case .log(let entry):
+                newLogs.append(entry)
+            case .network(let entry):
+                newNets.append(entry)
+            case .uiEvent(let entry):
+                newEvents.append(entry)
+            case .tap(let view):
                 selectedView = view
             }
-        default:
-            break
+        }
+
+        if !newLogs.isEmpty {
+            logs.append(contentsOf: newLogs)
+            if logs.count > 2000 {
+                logs.removeFirst(logs.count - 2000)
+            }
+        }
+        if !newNets.isEmpty {
+            networkEntries.insert(contentsOf: newNets.reversed(), at: 0)
+            if networkEntries.count > 500 {
+                networkEntries.removeLast(networkEntries.count - 500)
+            }
+        }
+        if !newEvents.isEmpty {
+            uiEvents.insert(contentsOf: newEvents.reversed(), at: 0)
+            if uiEvents.count > 500 {
+                uiEvents.removeLast(uiEvents.count - 500)
+            }
         }
     }
 
@@ -701,7 +796,7 @@ final class LCDebugStudioManager: ObservableObject {
             jitStatusBanner = "Waiting for guest process PID..."
             return
         }
-        let enabler = JITEnablerType(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCJITEnablerType"))
+        let enabler = JITEnablerType(rawValue: UserDefaults.lcShared().integer(forKey: "LCJITEnablerType"))
         let bundleId = Bundle.main.bundleIdentifier ?? ""
         let script = appModel.jitLaunchScriptJs?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
 
@@ -741,7 +836,7 @@ final class LCDebugStudioManager: ObservableObject {
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 return nil
             }
-            return try JSONDecoder().decode(T.self, from: data)
+            return try decoder.decode(T.self, from: data)
         } catch {
             return nil
         }

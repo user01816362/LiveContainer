@@ -95,7 +95,7 @@ final class LCAppBannerRootView: UIView {
         detailStack.isAccessibilityElement = true
 
         runControl.translatesAutoresizingMaskIntoConstraints = false
-        runControl.setContentHuggingPriority(.required, for: .horizontal)
+        runControl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         runControl.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         updateButton.translatesAutoresizingMaskIntoConstraints = false
@@ -112,8 +112,8 @@ final class LCAppBannerRootView: UIView {
             button.titleLabel?.adjustsFontSizeToFitWidth = true
             button.titleLabel?.minimumScaleFactor = 0.8
         }
-        updateButton.setContentHuggingPriority(.required, for: .horizontal)
-        updateButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        updateButton.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        updateButton.setContentCompressionResistancePriority(UILayoutPriority(999), for: .horizontal)
         updateButton.isHidden = true
 
         trailingControlsStack.translatesAutoresizingMaskIntoConstraints = false
@@ -121,8 +121,6 @@ final class LCAppBannerRootView: UIView {
         trailingControlsStack.alignment = .fill
         trailingControlsStack.distribution = .fill
         trailingControlsStack.spacing = 6
-        trailingControlsStack.setContentHuggingPriority(.required, for: .horizontal)
-        trailingControlsStack.setContentCompressionResistancePriority(.required, for: .horizontal)
         trailingControlsStack.addArrangedSubview(updateButton)
         trailingControlsStack.addArrangedSubview(runControl)
 

@@ -34,6 +34,20 @@ enum LCVersionComparator {
         return trimmed
     }
 
+    static func formatDisplayVersion(version: String, build: String?) -> String {
+        if let normBuild = normalizeBuild(build) {
+            return "\(version) (\(normBuild))"
+        }
+        return version
+    }
+
+    static func formatIgnoredUpdateKey(_ ignoredKey: String) -> String {
+        let parts = ignoredKey.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+        let ver = String(parts[0])
+        let build = parts.count > 1 ? normalizeBuild(String(parts[1])) : nil
+        return formatDisplayVersion(version: ver, build: build)
+    }
+
     static func updateKey(version: String, build: String?) -> String {
         "\(version)#\(build ?? "")"
     }
@@ -44,6 +58,8 @@ enum LCVersionComparator {
         return "\(normVer)#\(normBuild)"
     }
 
+    /// Returns true if `(version, build)` is suppressed by `ignoredKey`
+    /// (i.e., equal to or older than the ignored update version).
     static func matchesIgnoredKey(_ ignoredKey: String?, version: String, build: String?) -> Bool {
         guard let ignoredKey, !ignoredKey.isEmpty else { return false }
         if ignoredKey == updateKey(version: version, build: build) {
@@ -52,7 +68,7 @@ enum LCVersionComparator {
         let parts = ignoredKey.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
         let ignoredVer = String(parts[0])
         let ignoredBuild = parts.count > 1 ? normalizeBuild(String(parts[1])) : nil
-        return compare(version, build: build, to: ignoredVer, build: ignoredBuild) == .orderedSame
+        return compare(version, build: build, to: ignoredVer, build: ignoredBuild) != .orderedDescending
     }
 
     static func isNewer(
@@ -64,32 +80,17 @@ enum LCVersionComparator {
         compare(lhsVersion, build: lhsBuild, to: rhsVersion, build: rhsBuild) == .orderedDescending
     }
 
+    /// Semantic comparison for update / installed / downgrade relation checks.
+    /// When marketing versions match and one side omits a build number, treats them as equal.
     static func compare(
         _ lhsVersion: String,
         build lhsBuild: String?,
         to rhsVersion: String,
         build rhsBuild: String?
     ) -> ComparisonResult {
-        let lhsParsed = parse(normalizeVersion(lhsVersion))
-        let rhsParsed = parse(normalizeVersion(rhsVersion))
-
-        let coreResult = compareCore(lhsParsed.core, rhsParsed.core)
-        if coreResult != .orderedSame {
-            return coreResult
-        }
-
-        switch (lhsParsed.prerelease, rhsParsed.prerelease) {
-        case (nil, nil):
-            break
-        case (nil, .some):
-            return .orderedDescending
-        case (.some, nil):
-            return .orderedAscending
-        case let (.some(lhsPre), .some(rhsPre)):
-            let preResult = comparePrerelease(lhsPre, rhsPre)
-            if preResult != .orderedSame {
-                return preResult
-            }
+        let verResult = compareParsed(parse(normalizeVersion(lhsVersion)), parse(normalizeVersion(rhsVersion)))
+        if verResult != .orderedSame {
+            return verResult
         }
 
         if let lhsB = normalizeBuild(lhsBuild), let rhsB = normalizeBuild(rhsBuild) {
@@ -99,14 +100,54 @@ enum LCVersionComparator {
         return .orderedSame
     }
 
-    private static func compareBuildStrings(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        let lhsParsed = parse(lhs)
-        let rhsParsed = parse(rhs)
+    /// Strict-weak-order comparison suitable for `Array.sorted` (establishes total order on build presence).
+    static func compareForSorting(
+        _ lhsVersion: String,
+        build lhsBuild: String?,
+        to rhsVersion: String,
+        build rhsBuild: String?
+    ) -> ComparisonResult {
+        let verResult = compareParsed(parse(normalizeVersion(lhsVersion)), parse(normalizeVersion(rhsVersion)))
+        if verResult != .orderedSame {
+            return verResult
+        }
+
+        switch (normalizeBuild(lhsBuild), normalizeBuild(rhsBuild)) {
+        case (nil, nil):
+            return .orderedSame
+        case (.some, nil):
+            return .orderedDescending
+        case (nil, .some):
+            return .orderedAscending
+        case let (.some(lhsB), .some(rhsB)):
+            return compareBuildStrings(lhsB, rhsB)
+        }
+    }
+
+    private static func compareParsed(_ lhsParsed: ParsedVersion, _ rhsParsed: ParsedVersion) -> ComparisonResult {
         let coreResult = compareCore(lhsParsed.core, rhsParsed.core)
         if coreResult != .orderedSame {
             return coreResult
         }
-        return lhs.compare(rhs, options: [.numeric, .caseInsensitive])
+
+        switch (lhsParsed.prerelease, rhsParsed.prerelease) {
+        case (nil, nil):
+            return .orderedSame
+        case (nil, .some):
+            return .orderedDescending
+        case (.some, nil):
+            return .orderedAscending
+        case let (.some(lhsPre), .some(rhsPre)):
+            return comparePrerelease(lhsPre, rhsPre)
+        }
+    }
+
+    private static func compareBuildStrings(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let parsedResult = compareParsed(parse(lhs), parse(rhs))
+        if parsedResult != .orderedSame {
+            return parsedResult
+        }
+        return .orderedSame
     }
 
     private static func parse(_ normalized: String) -> ParsedVersion {
@@ -118,27 +159,68 @@ enum LCVersionComparator {
             withoutMetadata = normalized
         }
 
-        let coreString: String
-        let prereleaseString: String?
+        var coreString: String
+        var prereleaseParts: [String] = []
         if let dashIdx = withoutMetadata.firstIndex(of: "-") {
             coreString = String(withoutMetadata[..<dashIdx])
             let afterDash = String(withoutMetadata[withoutMetadata.index(after: dashIdx)...])
-            prereleaseString = afterDash.isEmpty ? nil : afterDash
+            if !afterDash.isEmpty {
+                prereleaseParts.append(afterDash)
+            }
         } else {
             coreString = withoutMetadata
-            prereleaseString = nil
         }
 
-        let core = coreString
+        var rawCoreSegments = coreString
             .split(separator: ".", omittingEmptySubsequences: false)
-            .map { parseSegment(String($0)) }
+            .map(String.init)
 
-        let prerelease: [Segment]? = prereleaseString.map { pre in
-            pre.split(whereSeparator: { $0 == "." || $0 == "-" || $0 == "_" })
-                .map { parseSegment(String($0)) }
+        // Handle non-hyphenated prereleases like "1.0b1", "2.1rc2", "1.2.0alpha3"
+        // by splitting the trailing numeric prefix from its alpha suffix into prerelease.
+        if let last = rawCoreSegments.last, !last.isEmpty {
+            let digitsPrefix = last.prefix { $0.isASCII && $0.isNumber }
+            let remainder = last.dropFirst(digitsPrefix.count)
+            if !digitsPrefix.isEmpty,
+               !remainder.isEmpty,
+               let firstChar = remainder.first,
+               firstChar.isASCII && firstChar.isLetter {
+                rawCoreSegments[rawCoreSegments.count - 1] = String(digitsPrefix)
+                prereleaseParts.insert(String(remainder), at: 0)
+            }
         }
 
+        let core = rawCoreSegments.map(parseSegment)
+
+        let combinedPrerelease = prereleaseParts
+            .flatMap { part in
+                part.split(whereSeparator: { $0 == "." || $0 == "-" || $0 == "_" })
+                    .filter { !$0.isEmpty }
+                    .flatMap(splitAlphaNumericTokens)
+            }
+            .map(parseSegment)
+
+        let prerelease: [Segment]? = combinedPrerelease.isEmpty ? nil : combinedPrerelease
         return ParsedVersion(core: core, prerelease: prerelease)
+    }
+
+    private static func splitAlphaNumericTokens(_ raw: Substring) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var currentIsDigit: Bool? = nil
+
+        for ch in raw {
+            let isDigit = ch.isASCII && ch.isNumber
+            if let prev = currentIsDigit, prev != isDigit, !current.isEmpty {
+                result.append(current)
+                current = ""
+            }
+            current.append(ch)
+            currentIsDigit = isDigit
+        }
+        if !current.isEmpty {
+            result.append(current)
+        }
+        return result
     }
 
     private static func parseSegment(_ raw: String) -> Segment {
@@ -153,7 +235,7 @@ enum LCVersionComparator {
         for index in 0..<count {
             let lSeg: Segment = index < lhs.count ? lhs[index] : .numeric(0)
             let rSeg: Segment = index < rhs.count ? rhs[index] : .numeric(0)
-            let result = compareSegments(lSeg, rSeg)
+            let result = compareCoreSegments(lSeg, rSeg)
             if result != .orderedSame {
                 return result
             }
@@ -164,7 +246,7 @@ enum LCVersionComparator {
     private static func comparePrerelease(_ lhs: [Segment], _ rhs: [Segment]) -> ComparisonResult {
         let count = min(lhs.count, rhs.count)
         for index in 0..<count {
-            let result = compareSegments(lhs[index], rhs[index])
+            let result = comparePrereleaseSegments(lhs[index], rhs[index])
             if result != .orderedSame {
                 return result
             }
@@ -175,7 +257,23 @@ enum LCVersionComparator {
         return .orderedSame
     }
 
-    private static func compareSegments(_ lhs: Segment, _ rhs: Segment) -> ComparisonResult {
+    /// In core segments, numeric segments outrank pure text segments (e.g., "1.0" > "1.beta").
+    private static func compareCoreSegments(_ lhs: Segment, _ rhs: Segment) -> ComparisonResult {
+        switch (lhs, rhs) {
+        case let (.numeric(a), .numeric(b)):
+            if a == b { return .orderedSame }
+            return a < b ? .orderedAscending : .orderedDescending
+        case let (.text(a), .text(b)):
+            return a.compare(b, options: [.numeric, .caseInsensitive])
+        case (.numeric, .text):
+            return .orderedDescending
+        case (.text, .numeric):
+            return .orderedAscending
+        }
+    }
+
+    /// Per SemVer 2.0, in prerelease identifiers numeric identifiers have lower precedence than non-numeric.
+    private static func comparePrereleaseSegments(_ lhs: Segment, _ rhs: Segment) -> ComparisonResult {
         switch (lhs, rhs) {
         case let (.numeric(a), .numeric(b)):
             if a == b { return .orderedSame }
@@ -239,10 +337,7 @@ struct LCSourceVersionOffer: Identifiable, Hashable, Sendable {
     let size: Int64?
 
     var displayVersion: String {
-        if let build = LCVersionComparator.normalizeBuild(buildVersion) {
-            return "\(version) (\(build))"
-        }
-        return version
+        LCVersionComparator.formatDisplayVersion(version: version, build: buildVersion)
     }
 
     var updateKey: String {
@@ -264,10 +359,7 @@ struct LCAppVersionGroup: Identifiable, Hashable, Sendable {
     let isIgnoredUpdate: Bool
 
     var displayVersion: String {
-        if let build = LCVersionComparator.normalizeBuild(buildVersion) {
-            return "\(version) (\(build))"
-        }
-        return version
+        LCVersionComparator.formatDisplayVersion(version: version, build: buildVersion)
     }
 
     var updateKey: String {
@@ -409,7 +501,11 @@ struct AltStoreCatalogIndex: Sendable {
                 let rhsScore = metadataRichnessScore(rhs)
                 if lhsScore != rhsScore { return lhsScore > rhsScore }
 
-                return lhs.sourceName.localizedCaseInsensitiveCompare(rhs.sourceName) == .orderedAscending
+                let nameOrder = lhs.sourceName.localizedCaseInsensitiveCompare(rhs.sourceName)
+                if nameOrder != .orderedSame {
+                    return nameOrder == .orderedAscending
+                }
+                return lhs.id < rhs.id
             }
 
             guard let primary = sortedOffers.first else { continue }
@@ -454,12 +550,15 @@ struct AltStoreCatalogIndex: Sendable {
             ))
         }
 
+        // Total strict weak ordering (no non-transitive nil date / nil build cycles)
         return groups.sorted { lhs, rhs in
-            let cmp = LCVersionComparator.compare(lhs.version, build: lhs.buildVersion, to: rhs.version, build: rhs.buildVersion)
+            let cmp = LCVersionComparator.compareForSorting(lhs.version, build: lhs.buildVersion, to: rhs.version, build: rhs.buildVersion)
             if cmp != .orderedSame {
                 return cmp == .orderedDescending
             }
-            if let lDate = lhs.bestReleaseDate, let rDate = rhs.bestReleaseDate, lDate != rDate {
+            let lDate = lhs.bestReleaseDate ?? .distantPast
+            let rDate = rhs.bestReleaseDate ?? .distantPast
+            if lDate != rDate {
                 return lDate > rDate
             }
             let lhsPref = preferredSourceURL != nil && lhs.primaryOffer.sourceURL.absoluteString == preferredSourceURL
@@ -486,5 +585,22 @@ struct AltStoreCatalogIndex: Sendable {
             score += 1
         }
         return score
+    }
+}
+
+extension LCAppInfo {
+    var lcInstalledMarketingVersion: String {
+        installedSourceVersion ?? shortVersion() ?? version() ?? "0"
+    }
+
+    var lcInstalledBuildVersion: String? {
+        LCVersionComparator.normalizeBuild(installedSourceBuildVersion ?? buildVersion())
+    }
+
+    var lcInstalledDisplayVersion: String {
+        LCVersionComparator.formatDisplayVersion(
+            version: lcInstalledMarketingVersion,
+            build: lcInstalledBuildVersion
+        )
     }
 }

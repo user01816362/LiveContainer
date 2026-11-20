@@ -76,11 +76,6 @@ int LiveProcessMain(int argc, char *argv[]) {
     [lcUserDefaults setObject:appInfo[@"launchAppUrlScheme"] forKey:@"launchAppUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"selected"] forKey:@"selected"];
     [lcUserDefaults setObject:appInfo[@"selectedContainer"] forKey:@"selectedContainer"];
-    if([appInfo[@"debugMode"] boolValue]) {
-        [lcUserDefaults setBool:YES forKey:@"LCDebugLaunchRequested"];
-    } else {
-        [lcUserDefaults removeObjectForKey:@"LCDebugLaunchRequested"];
-    }
     
     bool access = false;
     NSArray* bookmarks = appInfo[@"bookmarks"];

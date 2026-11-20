@@ -80,6 +80,13 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
             vc.terminate()
         }
     }
+
+    static func dismantleUIViewController(_ uiViewController: UIViewController, coordinator: Coordinator) {
+        if !coordinator.didTerminate, let vc = uiViewController as? AppSceneViewController {
+            coordinator.didTerminate = true
+            vc.terminate()
+        }
+    }
 }
 
 struct LCDebugStudioView: View {
@@ -97,7 +104,7 @@ struct LCDebugStudioView: View {
     @State private var readyDataUUID: String? = nil
     @State private var terminateSignal = false
 
-    @State private var viewportScale: CGFloat = 0.80
+    @State private var viewportScale: CGFloat = 0.82
     @State private var isInspectorOpen = true
     @State private var selectedTab: LCDebugInspectorTab = .console
 
@@ -544,7 +551,8 @@ struct LCDebugStudioView: View {
     }
 
     private var consolePanel: some View {
-        VStack(spacing: 6) {
+        let items = filteredLogs
+        return VStack(spacing: 6) {
             HStack(spacing: 6) {
                 TextField("Filter stdout / NSLog / OSLog / Web…", text: $logSearch)
                     .textFieldStyle(.roundedBorder)
@@ -557,7 +565,7 @@ struct LCDebugStudioView: View {
                 .buttonStyle(.glass)
                 .controlSize(.mini)
                 Button("Copy") {
-                    let allText = filteredLogs.map {
+                    let allText = items.map {
                         let sub = ($0.subsystem?.isEmpty == false) ? ":\($0.subsystem!)" : ""
                         return "[\($0.stream)\(sub)] \($0.text)"
                     }.joined(separator: "\n")
@@ -590,13 +598,13 @@ struct LCDebugStudioView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
-                    if filteredLogs.isEmpty {
+                    if items.isEmpty {
                         Text(manager.isConnected ? "No matching logs yet. Output from print(), NSLog, OSLog, WKWebView, and crashes will stream here live." : "Connecting to guest Debug Agent…")
                             .font(.caption2.monospaced())
                             .foregroundStyle(.secondary)
                             .padding(.top, 8)
                     } else {
-                        ForEach(filteredLogs) { entry in
+                        ForEach(items) { entry in
                             HStack(alignment: .top, spacing: 6) {
                                 Text(entry.stream.uppercased())
                                     .font(.system(size: 9, weight: .bold, design: .monospaced))
@@ -1056,6 +1064,7 @@ struct LCDebugStudioView: View {
             launchError = error.localizedDescription
             return
         }
+        guard !Task.isCancelled else { return }
 
         LCDebugStudioManager.clearStaleSessionMetadata()
         UserDefaults.lcShared().set(appModel.bundleIdentifier, forKey: "LCDebugPendingBundleID")
@@ -1107,17 +1116,17 @@ private struct ObjCClassInspectorSheet: View {
                     }
                 }
                 Section("Methods (\(detail.methods.count))") {
-                    ForEach(detail.methods, id: \.self) { m in
+                    ForEach(Array(detail.methods.enumerated()), id: \.offset) { _, m in
                         Text(m).font(.caption.monospaced())
                     }
                 }
                 Section("Properties (\(detail.properties.count))") {
-                    ForEach(detail.properties, id: \.self) { p in
+                    ForEach(Array(detail.properties.enumerated()), id: \.offset) { _, p in
                         Text(p).font(.caption.monospaced())
                     }
                 }
                 Section("Ivars (\(detail.ivars.count))") {
-                    ForEach(detail.ivars, id: \.self) { iv in
+                    ForEach(Array(detail.ivars.enumerated()), id: \.offset) { _, iv in
                         Text(iv).font(.caption.monospaced())
                     }
                 }

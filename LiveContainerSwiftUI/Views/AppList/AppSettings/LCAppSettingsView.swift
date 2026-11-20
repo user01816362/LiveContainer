@@ -562,6 +562,19 @@ struct LCAppSettingsView: View {
         .task(id: model.uiContainers.count) {
             await refreshAppStorageMetrics()
         }
+        .onChange(of: sharedModel.apps) { _, newApps in
+            dismissIfAppBundleWasReplaced(in: newApps + sharedModel.hiddenApps)
+        }
+        .onChange(of: sharedModel.hiddenApps) { _, newHiddenApps in
+            dismissIfAppBundleWasReplaced(in: sharedModel.apps + newHiddenApps)
+        }
+    }
+
+    private func dismissIfAppBundleWasReplaced(in allApps: [LCAppModel]) {
+        guard let relPath = appInfo.relativeBundlePath else { return }
+        if let current = allApps.first(where: { $0.appInfo.relativeBundlePath == relPath }), current !== model {
+            dismiss()
+        }
     }
 
     @ViewBuilder

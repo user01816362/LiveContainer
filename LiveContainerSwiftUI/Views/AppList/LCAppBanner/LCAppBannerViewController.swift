@@ -103,7 +103,8 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
     @objc private func updateButtonTapped() {
         if configuration.activeDownload != nil {
             LCDownloadManager.shared.isQueueSheetPresented = true
-        } else if let candidate = configuration.updateCandidate {
+        } else if DataManager.shared.model.multiLCStatus != 2,
+                  let candidate = configuration.updateCandidate {
             AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
         }
     }
@@ -150,9 +151,10 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         var menuChildren: [UIMenuElement] = []
 
         // Update & Version History Menu Section
+        let isPrimaryLC = DataManager.shared.model.multiLCStatus != 2
         let versionCount = AltStoreSourcesViewModel.shared.availableVersionCount(forBundleId: model.bundleIdentifier)
         var versionActions: [UIMenuElement] = []
-        if let candidate = configuration.updateCandidate {
+        if isPrimaryLC, let candidate = configuration.updateCandidate {
             versionActions.append(UIAction(
                 title: "Update to \(candidate.latestDisplayVersion)",
                 image: UIImage(systemName: "arrow.down.circle.fill")
@@ -160,7 +162,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
                 AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
             })
             versionActions.append(UIAction(
-                title: "Ignore Version \(candidate.latestVersion.version)",
+                title: "Ignore Version \(candidate.latestDisplayVersion)",
                 image: UIImage(systemName: "eye.slash")
             ) { _ in
                 AltStoreSourcesViewModel.shared.ignoreUpdate(candidate)
@@ -177,7 +179,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             versionActions.append(versionsAction)
         }
         if !versionActions.isEmpty {
-            let sectionTitle = configuration.updateCandidate != nil ? "Update Available" : ""
+            let sectionTitle = (isPrimaryLC && configuration.updateCandidate != nil) ? "Update Available" : ""
             menuChildren.append(UIMenu(title: sectionTitle, options: .displayInline, children: versionActions))
         }
 
@@ -335,7 +337,8 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
     }
 
     private func openVersionHistory() {
-        guard presentedViewController == nil else {
+        let presenter = UIApplication.shared.lcTopmostViewController() ?? self
+        guard presenter.presentedViewController == nil else {
             return
         }
         let target = LCVersionHistoryTarget(app: configuration.model)
@@ -344,7 +347,7 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             .environmentObject(LCDownloadManager.shared)
         let controller = UIHostingController(rootView: rootView)
         controller.modalPresentationStyle = .formSheet
-        present(controller, animated: true)
+        presenter.present(controller, animated: true)
     }
 
     private func openDataFolder() {

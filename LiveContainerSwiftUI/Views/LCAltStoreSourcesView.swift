@@ -114,37 +114,17 @@ private struct AltStoreSourceAppResponse: Decodable, Sendable {
         developerName = try container.decodeIfPresent(String.self, forKey: .developerName)
         subtitle = try container.decodeIfPresent(String.self, forKey: .subtitle)
         version = try container.decodeIfPresent(String.self, forKey: .version)
-        buildVersion = Self.decodeFlexibleString(in: container, key: .buildVersion)
-            ?? Self.decodeFlexibleString(in: container, key: .buildNumber)
+        buildVersion = container.lcDecodeFlexibleString(forKey: .buildVersion)
+            ?? container.lcDecodeFlexibleString(forKey: .buildNumber)
         versionDate = try container.decodeIfPresent(String.self, forKey: .versionDate)
         versionDescription = try container.decodeIfPresent(String.self, forKey: .versionDescription)
         downloadURL = try container.decodeIfPresent(String.self, forKey: .downloadURL)
-        size = Self.decodeFlexibleInt64(in: container, key: .size)
+        size = container.lcDecodeFlexibleInt64(forKey: .size)
         localizedDescription = try container.decodeIfPresent(String.self, forKey: .localizedDescription)
         iconURL = try container.decodeIfPresent(String.self, forKey: .iconURL)
         tintColor = try container.decodeIfPresent(String.self, forKey: .tintColor)
         screenshotURLs = try container.decodeIfPresent([String].self, forKey: .screenshotURLs)
         versions = try container.decodeIfPresent([AltStoreSourceAppVersionResponse].self, forKey: .versions)
-    }
-
-    fileprivate static func decodeFlexibleString(in container: KeyedDecodingContainer<CodingKeys>, key: CodingKeys) -> String? {
-        if let str = try? container.decodeIfPresent(String.self, forKey: key) {
-            return str
-        }
-        if let num = try? container.decodeIfPresent(Int.self, forKey: key) {
-            return String(num)
-        }
-        return nil
-    }
-
-    fileprivate static func decodeFlexibleInt64(in container: KeyedDecodingContainer<CodingKeys>, key: CodingKeys) -> Int64? {
-        if let num = try? container.decodeIfPresent(Int64.self, forKey: key) {
-            return num
-        }
-        if let str = try? container.decodeIfPresent(String.self, forKey: key) {
-            return Int64(str.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return nil
     }
 }
 
@@ -169,27 +149,34 @@ private struct AltStoreSourceAppVersionResponse: Decodable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decodeIfPresent(String.self, forKey: .version)
-        if let bv = try? container.decodeIfPresent(String.self, forKey: .buildVersion) {
-            buildVersion = bv
-        } else if let bn = try? container.decodeIfPresent(String.self, forKey: .buildNumber) {
-            buildVersion = bn
-        } else if let bvInt = try? container.decodeIfPresent(Int.self, forKey: .buildVersion) {
-            buildVersion = String(bvInt)
-        } else if let bnInt = try? container.decodeIfPresent(Int.self, forKey: .buildNumber) {
-            buildVersion = String(bnInt)
-        } else {
-            buildVersion = nil
-        }
+        buildVersion = container.lcDecodeFlexibleString(forKey: .buildVersion)
+            ?? container.lcDecodeFlexibleString(forKey: .buildNumber)
         date = try container.decodeIfPresent(String.self, forKey: .date)
         localizedDescription = try container.decodeIfPresent(String.self, forKey: .localizedDescription)
         downloadURL = try container.decodeIfPresent(String.self, forKey: .downloadURL)
-        if let sizeVal = try? container.decodeIfPresent(Int64.self, forKey: .size) {
-            size = sizeVal
-        } else if let sizeStr = try? container.decodeIfPresent(String.self, forKey: .size) {
-            size = Int64(sizeStr.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else {
-            size = nil
+        size = container.lcDecodeFlexibleInt64(forKey: .size)
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func lcDecodeFlexibleString(forKey key: K) -> String? {
+        if let str = try? decodeIfPresent(String.self, forKey: key) {
+            return str
         }
+        if let num = try? decodeIfPresent(Int.self, forKey: key) {
+            return String(num)
+        }
+        return nil
+    }
+
+    func lcDecodeFlexibleInt64(forKey key: K) -> Int64? {
+        if let num = try? decodeIfPresent(Int64.self, forKey: key) {
+            return num
+        }
+        if let str = try? decodeIfPresent(String.self, forKey: key) {
+            return Int64(str.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
     }
 }
 
@@ -235,7 +222,6 @@ final class AltStoreSourcesViewModel: ObservableObject {
 
     @Published private(set) var sources: [SourceItem] = []
     @Published private(set) var availableUpdates: [LCAppUpdateCandidate] = []
-    @Published private(set) var catalogRevision = 0
     @Published var isRefreshingAll = false
     private let defaultsKey = "LCAltStoreSourceURLs"
     private var hasLoadedSources = false
@@ -254,6 +240,8 @@ final class AltStoreSourcesViewModel: ObservableObject {
 
         // Populate placeholders immediately on MainActor with zero blocking I/O
         self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
+        let initialGeneration = indexGeneration
+        let expectedURLSet = Set(urls)
 
         // Decode cached repositories and build the version catalog index off-thread
         Task.detached(priority: .utility) { [weak self] in
@@ -278,17 +266,22 @@ final class AltStoreSourcesViewModel: ObservableObject {
                 var updated = self.sources
                 var hasAnyChanges = false
                 for i in updated.indices {
-                    if let source = loaded[updated[i].url] {
+                    if updated[i].source == nil, let source = loaded[updated[i].url] {
                         updated[i].source = source
                         hasAnyChanges = true
                     }
                 }
                 if hasAnyChanges {
                     self.sources = updated
-                    self.indexGeneration += 1
-                    self.catalogIndex = builtIndex
-                    self.catalogRevision += 1
-                    self.recomputeAvailableUpdates()
+                    if self.indexGeneration == initialGeneration && Set(updated.map(\.url)) == expectedURLSet {
+                        self.indexGeneration += 1
+                        self.catalogIndex = builtIndex
+                        self.recomputeAvailableUpdates()
+                    } else {
+                        Task { [weak self] in
+                            await self?.rebuildCatalogIndexAndUpdates()
+                        }
+                    }
                 }
 
                 Task { [weak self] in
@@ -317,7 +310,10 @@ final class AltStoreSourcesViewModel: ObservableObject {
     func removeSource(_ item: SourceItem) {
         sources.removeAll { $0.id == item.id }
         persistSources()
-        Self.removeCache(for: item.url)
+        let urlToRemove = item.url
+        Task.detached(priority: .background) {
+            Self.removeCache(for: urlToRemove)
+        }
         Task { [weak self] in
             await self?.rebuildCatalogIndexAndUpdates()
         }
@@ -342,31 +338,37 @@ final class AltStoreSourcesViewModel: ObservableObject {
         }
         sources = initialSources
 
-        await withTaskGroup(of: (URL, Result<(AltStoreSource, Data), Error>).self) { group in
+        await withTaskGroup(of: (URL, Result<(AltStoreSource, Data, Bool), Error>).self) { group in
             for url in urlsToFetch {
                 group.addTask {
                     do {
-                        let result = try await AltStoreSourceLoader.load(from: url)
-                        return (url, .success(result))
+                        let (source, data) = try await AltStoreSourceLoader.load(from: url)
+                        let prevData = Self.cachedData(for: url)
+                        let changed = (prevData != data)
+                        if changed {
+                            Self.storeCache(data, for: url)
+                        }
+                        return (url, .success((source, data, changed)))
                     } catch {
                         return (url, .failure(error))
                     }
                 }
             }
 
-            var updatedSources = sources
+            var results: [URL: Result<(AltStoreSource, Data, Bool), Error>] = [:]
+            for await (url, result) in group {
+                results[url] = result
+            }
+
+            // Re-read `self.sources` after network wait so concurrent add/remove edits are preserved.
+            var updatedSources = self.sources
             var didChangeAnySource = false
 
-            for await (url, result) in group {
+            for (url, result) in results {
                 guard let idx = updatedSources.firstIndex(where: { $0.url == url }) else { continue }
                 switch result {
-                case .success(let (source, data)):
-                    let prevData = Self.cachedData(for: url)
-                    if prevData != data {
-                        updatedSources[idx].source = source
-                        Self.storeCache(data, for: url)
-                        didChangeAnySource = true
-                    } else if updatedSources[idx].source == nil {
+                case .success(let (source, _, changed)):
+                    if changed || updatedSources[idx].source == nil {
                         updatedSources[idx].source = source
                         didChangeAnySource = true
                     }
@@ -405,7 +407,6 @@ final class AltStoreSourcesViewModel: ObservableObject {
 
         guard generation == indexGeneration else { return }
         catalogIndex = builtIndex
-        catalogRevision += 1
         recomputeAvailableUpdates()
     }
 
@@ -415,19 +416,26 @@ final class AltStoreSourcesViewModel: ObservableObject {
         }
         sources[index].isLoading = true
         sources[index].error = nil
-        let previousData = Self.cachedData(for: url)
         do {
-            let (source, data) = try await AltStoreSourceLoader.load(from: url)
+            let (source, data, changed) = try await Task.detached(priority: .userInitiated) {
+                let (loadedSource, loadedData) = try await AltStoreSourceLoader.load(from: url)
+                let prevData = Self.cachedData(for: url)
+                let didChange = (prevData != loadedData)
+                if didChange {
+                    Self.storeCache(loadedData, for: url)
+                }
+                return (loadedSource, loadedData, didChange)
+            }.value
+            _ = data
             guard let sourceIndex = sources.firstIndex(where: { $0.url == url }) else {
                 return
             }
-            if let previousData, previousData == data, sources[sourceIndex].source != nil {
+            if !changed, sources[sourceIndex].source != nil {
                 sources[sourceIndex].isLoading = false
                 return
             }
             sources[sourceIndex].source = source
             sources[sourceIndex].isLoading = false
-            Self.storeCache(data, for: url)
         } catch {
             if let sourceIndex = sources.firstIndex(where: { $0.url == url }) {
                 sources[sourceIndex].error = error.localizedDescription
@@ -448,8 +456,8 @@ final class AltStoreSourcesViewModel: ObservableObject {
                 continue
             }
             let preferredSourceURL = app.appInfo.sourceURL
-            let installedMarketing = app.appInfo.installedSourceVersion ?? app.appInfo.shortVersion() ?? app.appInfo.version() ?? "0"
-            let installedBuild = app.appInfo.installedSourceBuildVersion ?? app.appInfo.buildVersion()
+            let installedMarketing = app.appInfo.lcInstalledMarketingVersion
+            let installedBuild = app.appInfo.lcInstalledBuildVersion
 
             let matchingEntries = catalogIndex.sourceApps(forBundleId: bundleId)
             var bestMatch: (entry: AltStoreCatalogSourceAppEntry, version: AltStoreSourceAppVersion)? = nil
@@ -477,13 +485,6 @@ final class AltStoreSourcesViewModel: ObservableObject {
                 continue
             }
 
-            let currentDisplay: String
-            if let installedBuild, !installedBuild.isEmpty {
-                currentDisplay = "\(installedMarketing) (\(installedBuild))"
-            } else {
-                currentDisplay = installedMarketing
-            }
-
             if LCVersionComparator.matchesIgnoredKey(
                 app.appInfo.ignoredUpdateVersion,
                 version: bestMatch.version.version,
@@ -499,7 +500,7 @@ final class AltStoreSourcesViewModel: ObservableObject {
                 sourceName: bestMatch.entry.sourceName,
                 sourceApp: bestMatch.entry.sourceApp,
                 latestVersion: bestMatch.version,
-                currentDisplayVersion: currentDisplay
+                currentDisplayVersion: app.appInfo.lcInstalledDisplayVersion
             ))
         }
 
@@ -515,14 +516,10 @@ final class AltStoreSourcesViewModel: ObservableObject {
         guard let bundleId = app.appInfo.bundleIdentifier(), !bundleId.isEmpty, bundleId != "Unknown" else {
             return []
         }
-        let installedMarketing = app.appInfo.installedSourceVersion
-            ?? app.appInfo.shortVersion()
-            ?? app.appInfo.version()
-        let installedBuild = app.appInfo.installedSourceBuildVersion ?? app.appInfo.buildVersion()
         return catalogIndex.versionGroups(
             forBundleId: bundleId,
-            installedVersion: installedMarketing,
-            installedBuild: installedBuild,
+            installedVersion: app.appInfo.lcInstalledMarketingVersion,
+            installedBuild: app.appInfo.lcInstalledBuildVersion,
             preferredSourceURL: app.appInfo.sourceURL,
             ignoredUpdateKey: app.appInfo.ignoredUpdateVersion
         )
@@ -612,10 +609,6 @@ final class AltStoreSourcesViewModel: ObservableObject {
     func ignoreUpdate(_ candidate: LCAppUpdateCandidate) {
         candidate.installedApp.appInfo.ignoredUpdateVersion = candidate.updateKey
         recomputeAvailableUpdates()
-    }
-
-    nonisolated static func isVersion(_ lhsVersion: String, build lhsBuild: String?, newerThan rhsVersion: String, build rhsBuild: String?) -> Bool {
-        LCVersionComparator.isNewer(lhsVersion, build: lhsBuild, than: rhsVersion, build: rhsBuild)
     }
 
     // MARK: - Persistence & Cache
@@ -782,14 +775,16 @@ enum AltStoreSourceLoader {
         let resolvedVersions: [AltStoreSourceAppVersion]
         if !parsedVersions.isEmpty {
             resolvedVersions = parsedVersions.sorted { lhs, rhs in
-                let cmp = LCVersionComparator.compare(lhs.version, build: lhs.buildVersion, to: rhs.version, build: rhs.buildVersion)
+                let cmp = LCVersionComparator.compareForSorting(lhs.version, build: lhs.buildVersion, to: rhs.version, build: rhs.buildVersion)
                 if cmp != .orderedSame {
                     return cmp == .orderedDescending
                 }
-                if let lDate = lhs.releaseDate, let rDate = rhs.releaseDate, lDate != rDate {
+                let lDate = lhs.releaseDate ?? .distantPast
+                let rDate = rhs.releaseDate ?? .distantPast
+                if lDate != rDate {
                     return lDate > rDate
                 }
-                return false
+                return lhs.downloadURL.absoluteString < rhs.downloadURL.absoluteString
             }
         } else if let legacy = buildLegacyVersion(
             from: response,
@@ -1530,10 +1525,20 @@ private struct LCSourceAppBanner: View {
     }
 
     var body: some View {
-        let activeTask = app.latestVersion.flatMap { downloadManager.activeTask(forURL: $0.downloadURL) }
-            ?? downloadManager.activeTask(forBundleId: app.bundleIdentifier)
         let updateCandidate = sourcesVM.updateCandidate(for: app, in: sourceURL)
         let installedApp = sourcesVM.installedApp(matching: app)
+        let activeTask = app.latestVersion.flatMap { downloadManager.activeTask(forURL: $0.downloadURL) }
+            ?? installedApp?.appInfo.relativeBundlePath.flatMap { downloadManager.activeTask(forTargetId: $0) }
+            ?? downloadManager.activeTask(forTargetId: app.bundleIdentifier)
+        let latestIsOlderThanInstalled: Bool = {
+            guard let installedApp, let latest = app.latestVersion else { return false }
+            return LCVersionComparator.compare(
+                latest.version,
+                build: latest.buildVersion,
+                to: installedApp.appInfo.lcInstalledMarketingVersion,
+                build: installedApp.appInfo.lcInstalledBuildVersion
+            ) == .orderedAscending
+        }()
 
         HStack {
             HStack(alignment: .center, spacing: 12) {
@@ -1572,20 +1577,26 @@ private struct LCSourceAppBanner: View {
             Spacer()
 
             if let activeTask {
-                Button {
-                    downloadManager.cancel(activeTask)
-                } label: {
-                    HStack(spacing: 6) {
-                        ProgressView(value: min(max(activeTask.progress, 0.05), 1))
-                            .progressViewStyle(.circular)
-                            .controlSize(.mini)
-                        Image(systemName: "xmark")
-                            .font(.caption.bold())
+                if case .installing = activeTask.state {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.horizontal, 12)
+                } else {
+                    Button {
+                        downloadManager.cancel(activeTask)
+                    } label: {
+                        HStack(spacing: 6) {
+                            ProgressView(value: min(max(activeTask.progress, 0.05), 1))
+                                .progressViewStyle(.circular)
+                                .controlSize(.mini)
+                            Image(systemName: "xmark")
+                                .font(.caption.bold())
+                        }
+                        .padding(.horizontal, 10)
+                        .frame(height: 32)
                     }
-                    .padding(.horizontal, 10)
-                    .frame(height: 32)
+                    .buttonStyle(.glass)
                 }
-                .buttonStyle(.glass)
             } else if updateCandidate != nil {
                 Button("lc.appBanner.update".loc) {
                     installAction(app)
@@ -1593,11 +1604,19 @@ private struct LCSourceAppBanner: View {
                 .buttonStyle(.glassProminent)
                 .controlSize(.small)
             } else if installedApp != nil {
-                Button("Reinstall") {
-                    installAction(app)
+                if latestIsOlderThanInstalled {
+                    Button("Versions") {
+                        versionsAction(app)
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                } else {
+                    Button("Reinstall") {
+                        installAction(app)
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.glass)
-                .controlSize(.small)
             } else {
                 Button("lc.common.install".loc) {
                     installAction(app)
@@ -1616,8 +1635,10 @@ private struct LCSourceAppBanner: View {
             Button("All Versions…", systemImage: "clock.arrow.circlepath") {
                 versionsAction(app)
             }
-            Button(updateCandidate != nil ? "lc.appBanner.update".loc : "lc.common.install".loc, systemImage: "arrow.down.circle") {
-                installAction(app)
+            if !latestIsOlderThanInstalled {
+                Button(updateCandidate != nil ? "lc.appBanner.update".loc : "lc.common.install".loc, systemImage: "arrow.down.circle") {
+                    installAction(app)
+                }
             }
         }
     }

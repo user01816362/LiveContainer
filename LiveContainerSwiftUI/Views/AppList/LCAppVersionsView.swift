@@ -9,7 +9,7 @@
 import SwiftUI
 import UIKit
 
-struct LCVersionHistoryTarget: Identifiable, Hashable {
+struct LCVersionHistoryTarget: Identifiable, Hashable, Sendable {
     let id: String
     let bundleIdentifier: String
     let fallbackDisplayName: String
@@ -17,6 +17,7 @@ struct LCVersionHistoryTarget: Identifiable, Hashable {
     let targetRelativeBundlePath: String?
     let preferredSourceURL: URL?
 
+    @MainActor
     init(app: LCAppModel) {
         let relPath = app.appInfo.relativeBundlePath
         let bundleId = app.appInfo.bundleIdentifier() ?? app.bundleIdentifier
@@ -28,6 +29,7 @@ struct LCVersionHistoryTarget: Identifiable, Hashable {
         self.preferredSourceURL = app.appInfo.sourceURL.flatMap(URL.init(string:))
     }
 
+    @MainActor
     init(sourceApp: AltStoreSourceApp, sourceURL: URL, installedApp: LCAppModel?) {
         self.id = "\(sourceURL.absoluteString)#\(sourceApp.bundleIdentifier)"
         self.bundleIdentifier = sourceApp.bundleIdentifier
@@ -41,7 +43,7 @@ struct LCVersionHistoryTarget: Identifiable, Hashable {
 private struct PendingDowngradeRequest: Equatable {
     let group: LCAppVersionGroup
     let offer: LCSourceVersionOffer
-    let latestUpdateGroup: LCAppVersionGroup?
+    let ignoreTargetGroup: LCAppVersionGroup?
 }
 
 struct LCAppVersionsView: View {
@@ -60,9 +62,9 @@ struct LCAppVersionsView: View {
         let allApps = sharedModel.isHiddenAppUnlocked
             ? (sharedModel.apps + sharedModel.hiddenApps)
             : sharedModel.apps
-        if let relPath = target.targetRelativeBundlePath,
-           let byPath = allApps.first(where: { $0.appInfo.relativeBundlePath == relPath }) {
-            return byPath
+        if let relPath = target.targetRelativeBundlePath {
+            // Never fall back to a different clone when opened for a specific bundle path.
+            return allApps.first(where: { $0.appInfo.relativeBundlePath == relPath })
         }
         return allApps.first(where: {
             ($0.appInfo.bundleIdentifier() ?? "").caseInsensitiveCompare(target.bundleIdentifier) == .orderedSame
@@ -78,7 +80,6 @@ struct LCAppVersionsView: View {
     }
 
     private var versionGroups: [LCAppVersionGroup] {
-        _ = sourcesVM.catalogRevision
         if let installed = liveInstalledApp {
             return sourcesVM.versionGroups(for: installed)
         }
@@ -89,29 +90,16 @@ struct LCAppVersionsView: View {
         )
     }
 
-    private var latestNewerGroup: LCAppVersionGroup? {
-        versionGroups.first { $0.relation == .update }
-    }
-
     private var currentInstalledDisplayVersion: String? {
-        guard let installed = liveInstalledApp else { return nil }
-        let marketing = installed.appInfo.installedSourceVersion
-            ?? installed.appInfo.shortVersion()
-            ?? installed.appInfo.version()
-            ?? installed.version
-        let build = LCVersionComparator.normalizeBuild(
-            installed.appInfo.installedSourceBuildVersion ?? installed.appInfo.buildVersion()
-        )
-        if let build {
-            return "\(marketing) (\(build))"
-        }
-        return marketing
+        liveInstalledApp?.appInfo.lcInstalledDisplayVersion
     }
 
     private var activeAppDownload: LCDownloadTaskItem? {
-        let targetId = liveInstalledApp?.appInfo.relativeBundlePath ?? target.targetRelativeBundlePath ?? target.bundleIdentifier
-        return downloadManager.activeTask(forTargetId: targetId)
-            ?? downloadManager.activeTask(forBundleId: target.bundleIdentifier)
+        let targetId = liveInstalledApp?.appInfo.relativeBundlePath ?? target.targetRelativeBundlePath
+        if let targetId, let matched = downloadManager.activeTask(forTargetId: targetId) {
+            return matched
+        }
+        return downloadManager.activeTask(forTargetId: target.bundleIdentifier)
     }
 
     var body: some View {
@@ -146,9 +134,9 @@ struct LCAppVersionsView: View {
             Button("Downgrade to \(request.offer.displayVersion)", role: .destructive) {
                 enqueue(offer: request.offer, ignoreUpdateKey: nil)
             }
-            if let latest = request.latestUpdateGroup {
-                Button("Downgrade & Ignore Updates for \(latest.version)") {
-                    enqueue(offer: request.offer, ignoreUpdateKey: latest.updateKey)
+            if let ignoreTarget = request.ignoreTargetGroup {
+                Button("Downgrade & Ignore Updates up to \(ignoreTarget.displayVersion)") {
+                    enqueue(offer: request.offer, ignoreUpdateKey: ignoreTarget.updateKey)
                 }
             }
             Button("lc.common.cancel".loc, role: .cancel) {}
@@ -217,9 +205,10 @@ struct LCAppVersionsView: View {
             } else {
                 Section {
                     ForEach(versionGroups) { group in
+                        let matchingTask = group.offers.lazy.compactMap { downloadManager.activeTask(forURL: $0.downloadURL) }.first
                         LCVersionGroupRow(
                             group: group,
-                            activeDownloadForURL: downloadManager.activeTask(forURL: group.primaryOffer.downloadURL),
+                            activeDownloadForGroup: matchingTask,
                             activeDownloadForApp: activeAppDownload,
                             isInstallDisabled: isSecondaryLC,
                             isNotesExpanded: expandedNotesGroupIDs.contains(group.id),
@@ -255,10 +244,16 @@ struct LCAppVersionsView: View {
     private func handleSelection(group: LCAppVersionGroup, offer: LCSourceVersionOffer) {
         guard !isSecondaryLC else { return }
         if group.relation == .downgrade, liveInstalledApp != nil {
+            // Pick the highest version newer than `offer` (preferring offer's source first if newer exists),
+            // so "Downgrade & Ignore Updates" suppresses both same-source and cross-source update nags.
+            let newerGroups = versionGroups.filter {
+                LCVersionComparator.isNewer($0.version, build: $0.buildVersion, than: offer.version, build: offer.buildVersion)
+            }
+            let ignoreTarget = newerGroups.first
             pendingDowngrade = PendingDowngradeRequest(
                 group: group,
                 offer: offer,
-                latestUpdateGroup: latestNewerGroup ?? versionGroups.first(where: { $0.relation == .installed })
+                ignoreTargetGroup: ignoreTarget
             )
         } else {
             enqueue(offer: offer, ignoreUpdateKey: nil)
@@ -282,6 +277,8 @@ private struct LCVersionHeaderCard: View {
     let installedVersionDisplay: String?
     let ignoredUpdateVersion: String?
     let onUnignore: () -> Void
+
+    @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) private var darkModeIcon = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -311,11 +308,11 @@ private struct LCVersionHeaderCard: View {
             }
 
             if let ignoredUpdateVersion, !ignoredUpdateVersion.isEmpty {
-                let cleanIgnored = ignoredUpdateVersion.split(separator: "#").first.map(String.init) ?? ignoredUpdateVersion
+                let formattedIgnored = LCVersionComparator.formatIgnoredUpdateKey(ignoredUpdateVersion)
                 HStack(spacing: 8) {
                     Image(systemName: "eye.slash.fill")
                         .foregroundStyle(.orange)
-                    Text("Updates for \(cleanIgnored) are ignored")
+                    Text("Updates up to \(formattedIgnored) are ignored")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -331,7 +328,7 @@ private struct LCVersionHeaderCard: View {
 
     @ViewBuilder
     private var headerIcon: some View {
-        if let appIcon = installedApp?.appInfo.icon() {
+        if let appIcon = installedApp?.appInfo.iconIsDarkIcon(darkModeIcon) {
             Image(uiImage: appIcon)
                 .resizable()
                 .scaledToFill()
@@ -354,7 +351,7 @@ private struct LCVersionHeaderCard: View {
 
 private struct LCVersionGroupRow: View {
     let group: LCAppVersionGroup
-    let activeDownloadForURL: LCDownloadTaskItem?
+    let activeDownloadForGroup: LCDownloadTaskItem?
     let activeDownloadForApp: LCDownloadTaskItem?
     let isInstallDisabled: Bool
     let isNotesExpanded: Bool
@@ -363,7 +360,7 @@ private struct LCVersionGroupRow: View {
     let onCancelDownload: (LCDownloadTaskItem) -> Void
 
     private var matchingActiveTask: LCDownloadTaskItem? {
-        if let direct = activeDownloadForURL {
+        if let direct = activeDownloadForGroup {
             return direct
         }
         if let appTask = activeDownloadForApp,
@@ -450,55 +447,76 @@ private struct LCVersionGroupRow: View {
     @ViewBuilder
     private var actionControl: some View {
         if let task = matchingActiveTask {
-            Button {
-                onCancelDownload(task)
-            } label: {
-                HStack(spacing: 5) {
-                    ProgressView(value: min(max(task.progress, 0.05), 1))
-                        .progressViewStyle(.circular)
-                        .controlSize(.mini)
-                    Image(systemName: "xmark")
-                        .font(.caption2.bold())
-                }
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
-        } else if group.offers.count > 1 {
-            Menu {
-                ForEach(group.offers) { offer in
-                    Button {
-                        onSelectOffer(offer)
-                    } label: {
-                        if let size = offer.size, size > 0 {
-                            Text("\(offer.sourceName) (\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)))")
-                        } else {
-                            Text(offer.sourceName)
-                        }
-                    }
-                }
-            } label: {
-                Text(actionTitle)
-                    .font(.caption.weight(.bold))
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
-            .disabled(isInstallDisabled || isAnotherVersionDownloading)
-        } else {
-            if group.relation == .update {
-                Button(actionTitle) {
-                    onSelectOffer(group.primaryOffer)
-                }
-                .buttonStyle(.glassProminent)
-                .controlSize(.small)
-                .disabled(isInstallDisabled || isAnotherVersionDownloading)
+            if case .installing = task.state {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.horizontal, 8)
             } else {
-                Button(actionTitle) {
-                    onSelectOffer(group.primaryOffer)
+                Button {
+                    onCancelDownload(task)
+                } label: {
+                    HStack(spacing: 5) {
+                        ProgressView(value: min(max(task.progress, 0.05), 1))
+                            .progressViewStyle(.circular)
+                            .controlSize(.mini)
+                        Image(systemName: "xmark")
+                            .font(.caption2.bold())
+                    }
                 }
                 .buttonStyle(.glass)
                 .controlSize(.small)
-                .disabled(isInstallDisabled || isAnotherVersionDownloading)
             }
+        } else if group.offers.count > 1 {
+            multiSourceMenu
+                .controlSize(.small)
+                .disabled(isInstallDisabled || isAnotherVersionDownloading)
+        } else {
+            singleSourceButton
+                .controlSize(.small)
+                .disabled(isInstallDisabled || isAnotherVersionDownloading)
+        }
+    }
+
+    @ViewBuilder
+    private var multiSourceMenu: some View {
+        let menu = Menu {
+            ForEach(group.offers) { offer in
+                Button {
+                    onSelectOffer(offer)
+                } label: {
+                    if let size = offer.size, size > 0 {
+                        Text("\(offer.sourceName) (\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)))")
+                    } else {
+                        Text(offer.sourceName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(actionTitle)
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.bold))
+            }
+        }
+        if group.relation == .update {
+            menu.buttonStyle(.glassProminent)
+        } else {
+            menu.buttonStyle(.glass)
+        }
+    }
+
+    @ViewBuilder
+    private var singleSourceButton: some View {
+        if group.relation == .update {
+            Button(actionTitle) {
+                onSelectOffer(group.primaryOffer)
+            }
+            .buttonStyle(.glassProminent)
+        } else {
+            Button(actionTitle) {
+                onSelectOffer(group.primaryOffer)
+            }
+            .buttonStyle(.glass)
         }
     }
 
@@ -545,29 +563,28 @@ private struct LCVersionRelationBadge: View {
 
 struct LCAppSettingsVersionRow: View {
     @ObservedObject var model: LCAppModel
+    @EnvironmentObject private var sharedModel: SharedModel
     @ObservedObject private var sourcesVM = AltStoreSourcesViewModel.shared
 
-    private var installedVersionText: String {
-        let marketing = model.appInfo.installedSourceVersion
-            ?? model.appInfo.shortVersion()
-            ?? model.appInfo.version()
-            ?? model.version
-        if let build = LCVersionComparator.normalizeBuild(
-            model.appInfo.installedSourceBuildVersion ?? model.appInfo.buildVersion()
-        ) {
-            return "\(marketing) (\(build))"
+    private var liveModel: LCAppModel {
+        let allApps = sharedModel.isHiddenAppUnlocked
+            ? (sharedModel.apps + sharedModel.hiddenApps)
+            : sharedModel.apps
+        if let relPath = model.appInfo.relativeBundlePath,
+           let matched = allApps.first(where: { $0.appInfo.relativeBundlePath == relPath }) {
+            return matched
         }
-        return marketing
+        return model
     }
 
     var body: some View {
-        let _ = sourcesVM.catalogRevision
-        let updateCandidate = sourcesVM.updateCandidate(for: model)
-        let versionCount = sourcesVM.availableVersionCount(forBundleId: model.bundleIdentifier)
+        let currentModel = liveModel
+        let updateCandidate = sourcesVM.updateCandidate(for: currentModel)
+        let versionCount = sourcesVM.availableVersionCount(forBundleId: currentModel.bundleIdentifier)
 
         NavigationLink {
             LCAppVersionsView(
-                target: LCVersionHistoryTarget(app: model),
+                target: LCVersionHistoryTarget(app: currentModel),
                 isPresentedAsSheet: false
             )
         } label: {
@@ -582,7 +599,8 @@ struct LCAppSettingsVersionRow: View {
                         .padding(.vertical, 2)
                         .background(.blue, in: .capsule)
                 } else {
-                    Text(versionCount > 0 ? "\(installedVersionText) • \(versionCount)" : installedVersionText)
+                    let installed = currentModel.appInfo.lcInstalledDisplayVersion
+                    Text(versionCount > 0 ? "\(installed) • \(versionCount)" : installed)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }

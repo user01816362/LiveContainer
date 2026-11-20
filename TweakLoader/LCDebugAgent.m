@@ -61,8 +61,41 @@ static const struct mach_header *(*g_orig_dyld_get_image_header)(uint32_t) = NUL
 static void (*g_orig_NSLogv)(NSString *format, va_list args) = NULL;
 static _Thread_local BOOL gLCInNSLogHook = NO;
 static _Thread_local BOOL gLCInNotifHook = NO;
+static _Thread_local BOOL gLCInURLSessionTaskCreate = NO;
+static _Thread_local BOOL gLCInDidReceiveDataHook = NO;
+static _Thread_local BOOL gLCInTabSelectHook = NO;
 
 static char gLCCrashLogPath[PATH_MAX] = {0};
+
+static os_unfair_lock gLCRecentNSLogLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray<NSString *> *gLCRecentNSLogMessages = nil;
+
+static void LCRecordRecentNSLogMessage(NSString *msg) {
+    if (msg.length == 0) return;
+    os_unfair_lock_lock(&gLCRecentNSLogLock);
+    if (!gLCRecentNSLogMessages) {
+        gLCRecentNSLogMessages = [NSMutableArray arrayWithCapacity:24];
+    }
+    [gLCRecentNSLogMessages addObject:msg];
+    if (gLCRecentNSLogMessages.count > 24) {
+        [gLCRecentNSLogMessages removeObjectAtIndex:0];
+    }
+    os_unfair_lock_unlock(&gLCRecentNSLogLock);
+}
+
+static BOOL LCMatchesRecentNSLogMessage(NSString *msg) {
+    if (msg.length == 0) return NO;
+    os_unfair_lock_lock(&gLCRecentNSLogLock);
+    BOOL found = NO;
+    for (NSString *recent in gLCRecentNSLogMessages) {
+        if ([msg isEqualToString:recent] || [msg hasSuffix:recent]) {
+            found = YES;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gLCRecentNSLogLock);
+    return found;
+}
 
 static uint32_t LCDebugImageCount(void) {
     return g_orig_dyld_image_count ? g_orig_dyld_image_count() : _dyld_image_count();
@@ -118,6 +151,10 @@ static BOOL LCDebugIsOwnDebugRequestURL(NSURL *url) {
         }
     }
     return NO;
+}
+
+static NSString *LCEscapeSingleQuotes(NSString *raw) {
+    return [(raw ?: @"") stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"];
 }
 
 // MARK: - JSON Safety Helper
@@ -279,18 +316,16 @@ static NSString *LCBuildCurlCommand(NSURLRequest *req, NSData *overrideBody) {
     if (!req) return @"";
     NSMutableString *curl = [NSMutableString stringWithFormat:@"curl -X %@", req.HTTPMethod ?: @"GET"];
     [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-        NSString *escaped = [v stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"];
-        [curl appendFormat:@" -H '%@: %@'", k, escaped];
+        [curl appendFormat:@" -H '%@: %@'", LCEscapeSingleQuotes(k), LCEscapeSingleQuotes(v)];
     }];
     NSData *body = overrideBody ?: req.HTTPBody;
     if (body.length > 0 && body.length <= 4096) {
         NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         if (bodyStr) {
-            NSString *escaped = [bodyStr stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"];
-            [curl appendFormat:@" --data '%@'", escaped];
+            [curl appendFormat:@" --data '%@'", LCEscapeSingleQuotes(bodyStr)];
         }
     }
-    [curl appendFormat:@" '%@'", req.URL.absoluteString ?: @""];
+    [curl appendFormat:@" '%@'", LCEscapeSingleQuotes(req.URL.absoluteString ?: @"")];
     return curl;
 }
 
@@ -335,6 +370,7 @@ static NSString *LCPreviewStringFromData(NSData *data, NSUInteger maxBytes) {
 - (void)setTapInspectEnabled:(BOOL)enabled;
 - (void)setNotificationMonitorEnabled:(BOOL)enabled;
 - (void)setLANEnabled:(BOOL)enabled;
+- (void)simulateMemoryWarning;
 - (NSDictionary *)captureViewHierarchy;
 - (NSArray *)captureLoadedDylibs;
 @end
@@ -343,9 +379,14 @@ static NSString *LCPreviewStringFromData(NSData *data, NSUInteger maxBytes) {
 
 static char kLCDebugTaskContextKey;
 static os_unfair_lock gLCDelegateHookLock = OS_UNFAIR_LOCK_INIT;
-static NSMutableSet<NSString *> *gLCHookedDelegateClasses = nil;
+static NSMutableSet<NSString *> *gLCHookedDelegateMethods = nil;
 
-@interface LCDebugNetworkTaskContext : NSObject
+@interface LCDebugNetworkTaskContext : NSObject {
+@public
+    os_unfair_lock _lock;
+    _Atomic BOOL _started;
+    _Atomic BOOL _completed;
+}
 @property (nonatomic, copy) NSString *entryId;
 @property (nonatomic, strong) NSURLRequest *request;
 @property (nonatomic, strong) NSData *uploadBody;
@@ -354,19 +395,65 @@ static NSMutableSet<NSString *> *gLCHookedDelegateClasses = nil;
 @property (nonatomic, assign) NSUInteger totalReceivedBytes;
 @property (nonatomic, assign) CFAbsoluteTime startTime;
 @property (nonatomic, copy) NSString *source;
-@property (nonatomic, assign) BOOL completed;
+- (void)markStartedIfNeeded;
+- (void)appendChunk:(NSData *)chunk;
+- (void)setCapturedResponse:(NSURLResponse *)response;
+- (void)snapshotResponse:(NSURLResponse *__autoreleasing *)outResp data:(NSData *__autoreleasing *)outData bytes:(NSUInteger *)outBytes;
 @end
 
 @implementation LCDebugNetworkTaskContext
+
 - (instancetype)init {
     self = [super init];
     if (self) {
+        _lock = OS_UNFAIR_LOCK_INIT;
+        atomic_init(&_started, NO);
+        atomic_init(&_completed, NO);
         _entryId = NSUUID.UUID.UUIDString;
         _startTime = CFAbsoluteTimeGetCurrent();
         _source = @"urlsession";
     }
     return self;
 }
+
+- (void)markStartedIfNeeded {
+    if (!atomic_exchange(&_started, YES)) {
+        os_unfair_lock_lock(&_lock);
+        _startTime = CFAbsoluteTimeGetCurrent();
+        os_unfair_lock_unlock(&_lock);
+    }
+}
+
+- (void)appendChunk:(NSData *)chunk {
+    if (chunk.length == 0) return;
+    os_unfair_lock_lock(&_lock);
+    _totalReceivedBytes += chunk.length;
+    if (!_receivedData) {
+        _receivedData = [NSMutableData dataWithCapacity:MIN(chunk.length, (NSUInteger)8192)];
+    }
+    if (_receivedData.length < 16384) {
+        NSUInteger remaining = 16384 - _receivedData.length;
+        NSUInteger toCopy = MIN(remaining, chunk.length);
+        [_receivedData appendBytes:chunk.bytes length:toCopy];
+    }
+    os_unfair_lock_unlock(&_lock);
+}
+
+- (void)setCapturedResponse:(NSURLResponse *)response {
+    if (!response) return;
+    os_unfair_lock_lock(&_lock);
+    _response = response;
+    os_unfair_lock_unlock(&_lock);
+}
+
+- (void)snapshotResponse:(NSURLResponse *__autoreleasing *)outResp data:(NSData *__autoreleasing *)outData bytes:(NSUInteger *)outBytes {
+    os_unfair_lock_lock(&_lock);
+    if (outResp) *outResp = _response;
+    if (outData) *outData = [_receivedData copy];
+    if (outBytes) *outBytes = _totalReceivedBytes;
+    os_unfair_lock_unlock(&_lock);
+}
+
 @end
 
 static LCDebugNetworkTaskContext *LCGetOrCreateTaskContext(NSURLSessionTask *task, NSURLRequest *req, NSData *uploadBody) {
@@ -393,15 +480,19 @@ static void LCFinalizeNetworkTaskContext(LCDebugNetworkTaskContext *ctx,
                                          NSURLResponse *response,
                                          NSData *data,
                                          NSError *error) {
-    if (!ctx || ctx.completed) return;
-    ctx.completed = YES;
+    if (!ctx || atomic_exchange(&ctx->_completed, YES)) return;
 
     NSURLRequest *req = task.currentRequest ?: task.originalRequest ?: ctx.request;
     if (!req || LCDebugIsOwnDebugRequestURL(req.URL)) return;
 
-    NSURLResponse *finalResp = response ?: ctx.response ?: task.response;
-    NSData *finalData = data ?: ctx.receivedData;
-    NSUInteger byteCount = data ? data.length : MAX(ctx.totalReceivedBytes, (NSUInteger)MAX((int64_t)0, task.countOfBytesReceived));
+    NSURLResponse *capturedResp = nil;
+    NSData *capturedData = nil;
+    NSUInteger capturedBytes = 0;
+    [ctx snapshotResponse:&capturedResp data:&capturedData bytes:&capturedBytes];
+
+    NSURLResponse *finalResp = response ?: capturedResp ?: task.response;
+    NSData *finalData = data ?: capturedData;
+    NSUInteger byteCount = data ? data.length : MAX(capturedBytes, (NSUInteger)MAX((int64_t)0, task.countOfBytesReceived));
 
     CFAbsoluteTime elapsedMs = MAX(0.0, (CFAbsoluteTimeGetCurrent() - ctx.startTime) * 1000.0);
     NSInteger statusCode = [finalResp isKindOfClass:NSHTTPURLResponse.class]
@@ -443,91 +534,142 @@ static void LCFinalizeNetworkTaskContext(LCDebugNetworkTaskContext *ctx,
     }];
 }
 
+static void LCRecordWebSocketEvent(NSURLRequest *request) {
+    if (!request.URL || LCDebugIsOwnDebugRequestURL(request.URL)) return;
+    [LCDebugServer.shared recordNetworkEvent:@{
+        @"id": NSUUID.UUID.UUIDString,
+        @"timestamp": @(CFAbsoluteTimeGetCurrent()),
+        @"source": @"websocket",
+        @"method": @"WS",
+        @"url": request.URL.absoluteString ?: @"",
+        @"statusCode": @(101),
+        @"mimeType": @"websocket",
+        @"durationMs": @(0),
+        @"bytes": @(0),
+        @"requestHeaders": request.allHTTPHeaderFields ?: @{},
+        @"responseHeaders": @{},
+        @"requestBodyPreview": @"",
+        @"responseBodyPreview": @"WebSocket task created",
+        @"curl": LCBuildCurlCommand(request, nil),
+        @"error": @""
+    }];
+}
+
+/// Finds the exact class in `cls`'s hierarchy that defines `sel` directly (not inherited).
+static Class LCOwningClassForSelector(Class cls, SEL sel) {
+    Class cursor = cls;
+    while (cursor) {
+        Method m = class_getInstanceMethod(cursor, sel);
+        if (!m) return Nil;
+        Class superCls = class_getSuperclass(cursor);
+        Method superM = superCls ? class_getInstanceMethod(superCls, sel) : NULL;
+        if (m != superM) {
+            return cursor;
+        }
+        cursor = superCls;
+    }
+    return Nil;
+}
+
+static BOOL LCMarkDelegateMethodHooked(Class ownerCls, SEL sel) {
+    NSString *key = [NSString stringWithFormat:@"%s::%s", class_getName(ownerCls), sel_getName(sel)];
+    os_unfair_lock_lock(&gLCDelegateHookLock);
+    if (!gLCHookedDelegateMethods) {
+        gLCHookedDelegateMethods = [NSMutableSet set];
+    }
+    BOOL already = [gLCHookedDelegateMethods containsObject:key];
+    if (!already) {
+        [gLCHookedDelegateMethods addObject:key];
+    }
+    os_unfair_lock_unlock(&gLCDelegateHookLock);
+    return !already;
+}
+
+static BOOL LCClassOverridesForwarding(Class cls) {
+    IMP baseForwardTarget = class_getMethodImplementation(NSObject.class, @selector(forwardingTargetForSelector:));
+    IMP baseForwardInvoc = class_getMethodImplementation(NSObject.class, @selector(forwardInvocation:));
+    return (class_getMethodImplementation(cls, @selector(forwardingTargetForSelector:)) != baseForwardTarget) ||
+           (class_getMethodImplementation(cls, @selector(forwardInvocation:)) != baseForwardInvoc);
+}
+
 static void LCHookSessionDelegateClassIfNeeded(id delegate) {
     if (!delegate) return;
-    Class cls = object_getClass(delegate);
-    if (!cls || LCDebugIsInternalDebugClass(cls)) return;
-    NSString *className = NSStringFromClass(cls);
-    if (!className) return;
+    if ([delegate isProxy] || ![delegate isKindOfClass:NSObject.class]) return;
+    // Use [delegate class] (not object_getClass) to avoid KVO dynamic NSKVONotifying_* classes
+    Class cls = [delegate class];
+    if (!cls || LCDebugIsInternalDebugClass(cls) || LCClassOverridesForwarding(cls)) return;
 
-    os_unfair_lock_lock(&gLCDelegateHookLock);
-    if (!gLCHookedDelegateClasses) {
-        gLCHookedDelegateClasses = [NSMutableSet set];
-    }
-    if ([gLCHookedDelegateClasses containsObject:className]) {
-        os_unfair_lock_unlock(&gLCDelegateHookLock);
-        return;
-    }
-    [gLCHookedDelegateClasses addObject:className];
-    os_unfair_lock_unlock(&gLCDelegateHookLock);
-
-    // 1. Hook URLSession:dataTask:didReceiveData: ONLY if the delegate already implements it
+    // 1. Hook URLSession:dataTask:didReceiveData: on its exact owning class (if implemented)
     SEL recvDataSel = @selector(URLSession:dataTask:didReceiveData:);
-    if ([cls instancesRespondToSelector:recvDataSel]) {
-        Method m = class_getInstanceMethod(cls, recvDataSel);
+    Class dataOwner = LCOwningClassForSelector(cls, recvDataSel);
+    if (dataOwner && LCMarkDelegateMethodHooked(dataOwner, recvDataSel)) {
+        Method m = class_getInstanceMethod(dataOwner, recvDataSel);
         if (m) {
             IMP origIMP = method_getImplementation(m);
             id block = ^(id selfObj, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *chunk) {
-                LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(dataTask, &kLCDebugTaskContextKey);
-                if (ctx && chunk.length > 0) {
-                    ctx.totalReceivedBytes += chunk.length;
-                    if (!ctx.receivedData) {
-                        ctx.receivedData = [NSMutableData dataWithCapacity:MIN(chunk.length, (NSUInteger)8192)];
-                    }
-                    if (ctx.receivedData.length < 16384) {
-                        NSUInteger remaining = 16384 - ctx.receivedData.length;
-                        NSUInteger toCopy = MIN(remaining, chunk.length);
-                        [ctx.receivedData appendBytes:chunk.bytes length:toCopy];
+                BOOL entered = NO;
+                if (!gLCInDidReceiveDataHook) {
+                    gLCInDidReceiveDataHook = YES;
+                    entered = YES;
+                    LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(dataTask, &kLCDebugTaskContextKey);
+                    if (ctx) {
+                        [ctx appendChunk:chunk];
                     }
                 }
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))origIMP)(selfObj, recvDataSel, session, dataTask, chunk);
+                @try {
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))origIMP)(selfObj, recvDataSel, session, dataTask, chunk);
+                } @finally {
+                    if (entered) gLCInDidReceiveDataHook = NO;
+                }
             };
-            IMP newIMP = imp_implementationWithBlock(block);
-            class_replaceMethod(cls, recvDataSel, newIMP, method_getTypeEncoding(m));
+            class_replaceMethod(dataOwner, recvDataSel, imp_implementationWithBlock(block), method_getTypeEncoding(m));
         }
     }
 
-    // 2. Hook URLSession:dataTask:didReceiveResponse:completionHandler: ONLY if already implemented
+    // 2. Hook URLSession:dataTask:didReceiveResponse:completionHandler: on its exact owning class (if implemented)
     SEL recvRespSel = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-    if ([cls instancesRespondToSelector:recvRespSel]) {
-        Method m = class_getInstanceMethod(cls, recvRespSel);
+    Class respOwner = LCOwningClassForSelector(cls, recvRespSel);
+    if (respOwner && LCMarkDelegateMethodHooked(respOwner, recvRespSel)) {
+        Method m = class_getInstanceMethod(respOwner, recvRespSel);
         if (m) {
             IMP origIMP = method_getImplementation(m);
             id block = ^(id selfObj, NSURLSession *session, NSURLSessionDataTask *dataTask, NSURLResponse *response, void (^completionHandler)(NSURLSessionResponseDisposition)) {
                 LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(dataTask, &kLCDebugTaskContextKey);
                 if (ctx && response) {
-                    ctx.response = response;
+                    [ctx setCapturedResponse:response];
                 }
                 ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSURLSessionResponseDisposition)))origIMP)(selfObj, recvRespSel, session, dataTask, response, completionHandler);
             };
-            IMP newIMP = imp_implementationWithBlock(block);
-            class_replaceMethod(cls, recvRespSel, newIMP, method_getTypeEncoding(m));
+            class_replaceMethod(respOwner, recvRespSel, imp_implementationWithBlock(block), method_getTypeEncoding(m));
         }
     }
 
-    // 3. Hook URLSession:task:didCompleteWithError: (safe to add if absent, or wrap if present)
+    // 3. Hook URLSession:task:didCompleteWithError: on its exact owning class (or safely add on non-forwarding NSObject subclass)
     SEL completeSel = @selector(URLSession:task:didCompleteWithError:);
-    Method completeMethod = class_getInstanceMethod(cls, completeSel);
-    if (completeMethod) {
-        IMP origIMP = method_getImplementation(completeMethod);
+    Class completeOwner = LCOwningClassForSelector(cls, completeSel);
+    if (completeOwner) {
+        if (LCMarkDelegateMethodHooked(completeOwner, completeSel)) {
+            Method completeMethod = class_getInstanceMethod(completeOwner, completeSel);
+            if (completeMethod) {
+                IMP origIMP = method_getImplementation(completeMethod);
+                id block = ^(id selfObj, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+                    LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(task, &kLCDebugTaskContextKey);
+                    if (ctx) {
+                        LCFinalizeNetworkTaskContext(ctx, task, task.response, nil, error);
+                    }
+                    ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))origIMP)(selfObj, completeSel, session, task, error);
+                };
+                class_replaceMethod(completeOwner, completeSel, imp_implementationWithBlock(block), method_getTypeEncoding(completeMethod));
+            }
+        }
+    } else if (LCMarkDelegateMethodHooked(cls, completeSel)) {
         id block = ^(id selfObj, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
             LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(task, &kLCDebugTaskContextKey);
             if (ctx) {
                 LCFinalizeNetworkTaskContext(ctx, task, task.response, nil, error);
             }
-            ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))origIMP)(selfObj, completeSel, session, task, error);
         };
-        IMP newIMP = imp_implementationWithBlock(block);
-        class_replaceMethod(cls, completeSel, newIMP, method_getTypeEncoding(completeMethod));
-    } else {
-        id block = ^(id selfObj, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
-            LCDebugNetworkTaskContext *ctx = objc_getAssociatedObject(task, &kLCDebugTaskContextKey);
-            if (ctx) {
-                LCFinalizeNetworkTaskContext(ctx, task, task.response, nil, error);
-            }
-        };
-        IMP newIMP = imp_implementationWithBlock(block);
-        class_addMethod(cls, completeSel, newIMP, "v@:@@@");
+        class_addMethod(cls, completeSel, imp_implementationWithBlock(block), "v@:@@@");
     }
 }
 
@@ -544,168 +686,237 @@ static void LCHookSessionDelegateClassIfNeeded(id delegate) {
 
 - (NSURLSessionDataTask *)lcDebug_dataTaskWithRequest:(NSURLRequest *)request
                                     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (!atomic_load(&gLCDebugAgentActive) || LCDebugIsOwnDebugRequestURL(request.URL)) {
+    if (!atomic_load(&gLCDebugAgentActive) || gLCInURLSessionTaskCreate || LCDebugIsOwnDebugRequestURL(request.URL)) {
         return [self lcDebug_dataTaskWithRequest:request completionHandler:completionHandler];
     }
-    LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
-    ctx.request = request;
-    __block __weak NSURLSessionDataTask *weakTask = nil;
-    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-        LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
-        if (completionHandler) completionHandler(data, response, error);
-    };
-    NSURLSessionDataTask *task = [self lcDebug_dataTaskWithRequest:request completionHandler:wrapped];
-    weakTask = task;
-    objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        if (!completionHandler) {
+            NSURLSessionDataTask *task = [self lcDebug_dataTaskWithRequest:request completionHandler:nil];
+            LCGetOrCreateTaskContext(task, request, nil);
+            return task;
+        }
+        LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
+        ctx.request = request;
+        __block __weak NSURLSessionDataTask *weakTask = nil;
+        void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
+            completionHandler(data, response, error);
+        };
+        NSURLSessionDataTask *task = [self lcDebug_dataTaskWithRequest:request completionHandler:wrapped];
+        weakTask = task;
+        objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionDataTask *)lcDebug_dataTaskWithURL:(NSURL *)url
                                 completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (!atomic_load(&gLCDebugAgentActive) || LCDebugIsOwnDebugRequestURL(url)) {
+    if (!atomic_load(&gLCDebugAgentActive) || gLCInURLSessionTaskCreate || LCDebugIsOwnDebugRequestURL(url)) {
         return [self lcDebug_dataTaskWithURL:url completionHandler:completionHandler];
     }
-    LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
-    ctx.request = url ? [NSURLRequest requestWithURL:url] : nil;
-    __block __weak NSURLSessionDataTask *weakTask = nil;
-    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-        LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
-        if (completionHandler) completionHandler(data, response, error);
-    };
-    NSURLSessionDataTask *task = [self lcDebug_dataTaskWithURL:url completionHandler:wrapped];
-    weakTask = task;
-    objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLRequest *req = url ? [NSURLRequest requestWithURL:url] : nil;
+        if (!completionHandler) {
+            NSURLSessionDataTask *task = [self lcDebug_dataTaskWithURL:url completionHandler:nil];
+            LCGetOrCreateTaskContext(task, req, nil);
+            return task;
+        }
+        LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
+        ctx.request = req;
+        __block __weak NSURLSessionDataTask *weakTask = nil;
+        void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
+            completionHandler(data, response, error);
+        };
+        NSURLSessionDataTask *task = [self lcDebug_dataTaskWithURL:url completionHandler:wrapped];
+        weakTask = task;
+        objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionUploadTask *)lcDebug_uploadTaskWithRequest:(NSURLRequest *)request
                                                  fromData:(NSData *)bodyData
                                         completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (!atomic_load(&gLCDebugAgentActive) || LCDebugIsOwnDebugRequestURL(request.URL)) {
+    if (!atomic_load(&gLCDebugAgentActive) || gLCInURLSessionTaskCreate || LCDebugIsOwnDebugRequestURL(request.URL)) {
         return [self lcDebug_uploadTaskWithRequest:request fromData:bodyData completionHandler:completionHandler];
     }
-    LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
-    ctx.request = request;
-    ctx.uploadBody = bodyData;
-    __block __weak NSURLSessionUploadTask *weakTask = nil;
-    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-        LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
-        if (completionHandler) completionHandler(data, response, error);
-    };
-    NSURLSessionUploadTask *task = [self lcDebug_uploadTaskWithRequest:request fromData:bodyData completionHandler:wrapped];
-    weakTask = task;
-    objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        if (!completionHandler) {
+            NSURLSessionUploadTask *task = [self lcDebug_uploadTaskWithRequest:request fromData:bodyData completionHandler:nil];
+            LCGetOrCreateTaskContext(task, request, bodyData);
+            return task;
+        }
+        LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
+        ctx.request = request;
+        ctx.uploadBody = bodyData;
+        __block __weak NSURLSessionUploadTask *weakTask = nil;
+        void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            LCFinalizeNetworkTaskContext(ctx, weakTask, response, data, error);
+            completionHandler(data, response, error);
+        };
+        NSURLSessionUploadTask *task = [self lcDebug_uploadTaskWithRequest:request fromData:bodyData completionHandler:wrapped];
+        weakTask = task;
+        objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionDownloadTask *)lcDebug_downloadTaskWithRequest:(NSURLRequest *)request
                                             completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
-    if (!atomic_load(&gLCDebugAgentActive) || LCDebugIsOwnDebugRequestURL(request.URL)) {
+    if (!atomic_load(&gLCDebugAgentActive) || gLCInURLSessionTaskCreate || LCDebugIsOwnDebugRequestURL(request.URL)) {
         return [self lcDebug_downloadTaskWithRequest:request completionHandler:completionHandler];
     }
-    LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
-    ctx.request = request;
-    __block __weak NSURLSessionDownloadTask *weakTask = nil;
-    void (^wrapped)(NSURL *, NSURLResponse *, NSError *) = ^(NSURL *location, NSURLResponse *response, NSError *error) {
-        NSString *note = location ? [NSString stringWithFormat:@"<Downloaded to %@>", location.lastPathComponent] : @"";
-        NSData *noteData = [note dataUsingEncoding:NSUTF8StringEncoding];
-        LCFinalizeNetworkTaskContext(ctx, weakTask, response, noteData, error);
-        if (completionHandler) completionHandler(location, response, error);
-    };
-    NSURLSessionDownloadTask *task = [self lcDebug_downloadTaskWithRequest:request completionHandler:wrapped];
-    weakTask = task;
-    objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        if (!completionHandler) {
+            NSURLSessionDownloadTask *task = [self lcDebug_downloadTaskWithRequest:request completionHandler:nil];
+            LCGetOrCreateTaskContext(task, request, nil);
+            return task;
+        }
+        LCDebugNetworkTaskContext *ctx = [[LCDebugNetworkTaskContext alloc] init];
+        ctx.request = request;
+        __block __weak NSURLSessionDownloadTask *weakTask = nil;
+        void (^wrapped)(NSURL *, NSURLResponse *, NSError *) = ^(NSURL *location, NSURLResponse *response, NSError *error) {
+            NSString *note = location ? [NSString stringWithFormat:@"<Downloaded to %@>", location.lastPathComponent] : @"";
+            NSData *noteData = [note dataUsingEncoding:NSUTF8StringEncoding];
+            LCFinalizeNetworkTaskContext(ctx, weakTask, response, noteData, error);
+            completionHandler(location, response, error);
+        };
+        NSURLSessionDownloadTask *task = [self lcDebug_downloadTaskWithRequest:request completionHandler:wrapped];
+        weakTask = task;
+        objc_setAssociatedObject(task, &kLCDebugTaskContextKey, ctx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionDataTask *)lcDebug_dataTaskWithRequest:(NSURLRequest *)request {
-    NSURLSessionDataTask *task = [self lcDebug_dataTaskWithRequest:request];
-    if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(request.URL)) {
-        LCGetOrCreateTaskContext(task, request, nil);
+    if (gLCInURLSessionTaskCreate) {
+        return [self lcDebug_dataTaskWithRequest:request];
     }
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLSessionDataTask *task = [self lcDebug_dataTaskWithRequest:request];
+        if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(request.URL)) {
+            LCGetOrCreateTaskContext(task, request, nil);
+        }
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionDataTask *)lcDebug_dataTaskWithURL:(NSURL *)url {
-    NSURLSessionDataTask *task = [self lcDebug_dataTaskWithURL:url];
-    if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(url)) {
-        LCGetOrCreateTaskContext(task, url ? [NSURLRequest requestWithURL:url] : nil, nil);
+    if (gLCInURLSessionTaskCreate) {
+        return [self lcDebug_dataTaskWithURL:url];
     }
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLSessionDataTask *task = [self lcDebug_dataTaskWithURL:url];
+        if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(url)) {
+            LCGetOrCreateTaskContext(task, url ? [NSURLRequest requestWithURL:url] : nil, nil);
+        }
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionUploadTask *)lcDebug_uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
-    NSURLSessionUploadTask *task = [self lcDebug_uploadTaskWithRequest:request fromData:bodyData];
-    if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(request.URL)) {
-        LCGetOrCreateTaskContext(task, request, bodyData);
+    if (gLCInURLSessionTaskCreate) {
+        return [self lcDebug_uploadTaskWithRequest:request fromData:bodyData];
     }
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLSessionUploadTask *task = [self lcDebug_uploadTaskWithRequest:request fromData:bodyData];
+        if (atomic_load(&gLCDebugAgentActive) && !LCDebugIsOwnDebugRequestURL(request.URL)) {
+            LCGetOrCreateTaskContext(task, request, bodyData);
+        }
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionWebSocketTask *)lcDebug_webSocketTaskWithRequest:(NSURLRequest *)request {
-    NSURLSessionWebSocketTask *task = [self lcDebug_webSocketTaskWithRequest:request];
-    if (atomic_load(&gLCDebugAgentActive) && request.URL && !LCDebugIsOwnDebugRequestURL(request.URL)) {
-        [LCDebugServer.shared recordNetworkEvent:@{
-            @"id": NSUUID.UUID.UUIDString,
-            @"timestamp": @(CFAbsoluteTimeGetCurrent()),
-            @"source": @"websocket",
-            @"method": @"WS",
-            @"url": request.URL.absoluteString ?: @"",
-            @"statusCode": @(101),
-            @"mimeType": @"websocket",
-            @"durationMs": @(0),
-            @"bytes": @(0),
-            @"requestHeaders": request.allHTTPHeaderFields ?: @{},
-            @"responseHeaders": @{},
-            @"requestBodyPreview": @"",
-            @"responseBodyPreview": @"WebSocket task created",
-            @"curl": LCBuildCurlCommand(request, nil),
-            @"error": @""
-        }];
+    if (gLCInURLSessionTaskCreate) {
+        return [self lcDebug_webSocketTaskWithRequest:request];
     }
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLSessionWebSocketTask *task = [self lcDebug_webSocketTaskWithRequest:request];
+        if (atomic_load(&gLCDebugAgentActive)) {
+            LCRecordWebSocketEvent(request);
+        }
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 - (NSURLSessionWebSocketTask *)lcDebug_webSocketTaskWithURL:(NSURL *)url {
-    NSURLSessionWebSocketTask *task = [self lcDebug_webSocketTaskWithURL:url];
-    if (atomic_load(&gLCDebugAgentActive) && url && !LCDebugIsOwnDebugRequestURL(url)) {
-        NSURLRequest *req = [NSURLRequest requestWithURL:url];
-        [LCDebugServer.shared recordNetworkEvent:@{
-            @"id": NSUUID.UUID.UUIDString,
-            @"timestamp": @(CFAbsoluteTimeGetCurrent()),
-            @"source": @"websocket",
-            @"method": @"WS",
-            @"url": url.absoluteString ?: @"",
-            @"statusCode": @(101),
-            @"mimeType": @"websocket",
-            @"durationMs": @(0),
-            @"bytes": @(0),
-            @"requestHeaders": @{},
-            @"responseHeaders": @{},
-            @"requestBodyPreview": @"",
-            @"responseBodyPreview": @"WebSocket task created",
-            @"curl": LCBuildCurlCommand(req, nil),
-            @"error": @""
-        }];
+    if (gLCInURLSessionTaskCreate) {
+        return [self lcDebug_webSocketTaskWithURL:url];
     }
-    return task;
+    gLCInURLSessionTaskCreate = YES;
+    @try {
+        NSURLSessionWebSocketTask *task = [self lcDebug_webSocketTaskWithURL:url];
+        if (atomic_load(&gLCDebugAgentActive) && url) {
+            LCRecordWebSocketEvent([NSURLRequest requestWithURL:url]);
+        }
+        return task;
+    } @finally {
+        gLCInURLSessionTaskCreate = NO;
+    }
 }
 
 @end
 
-static void (*g_orig_task_resume)(id, SEL) = NULL;
-static void LCDebugHook_TaskResume(id selfObj, SEL _cmd) {
-    if (atomic_load(&gLCDebugAgentActive) && [selfObj isKindOfClass:NSURLSessionTask.class]) {
-        NSURLSessionTask *task = (NSURLSessionTask *)selfObj;
-        NSURLRequest *req = task.originalRequest ?: task.currentRequest;
-        if (req && !LCDebugIsOwnDebugRequestURL(req.URL)) {
-            LCDebugNetworkTaskContext *ctx = LCGetOrCreateTaskContext(task, req, nil);
-            ctx.startTime = CFAbsoluteTimeGetCurrent();
+static void LCDebugOnTaskResume(NSURLSessionTask *task) {
+    if (!atomic_load(&gLCDebugAgentActive) || !task) return;
+    NSURLRequest *req = task.originalRequest ?: task.currentRequest;
+    if (req && !LCDebugIsOwnDebugRequestURL(req.URL)) {
+        LCDebugNetworkTaskContext *ctx = LCGetOrCreateTaskContext(task, req, nil);
+        [ctx markStartedIfNeeded];
+    }
+}
+
+@implementation NSURLSessionTask (LCDebugResumeHook)
+
+- (void)lcDebug_resume {
+    LCDebugOnTaskResume(self);
+    [self lcDebug_resume];
+}
+
+@end
+
+static void LCHookTaskClusterResumeClass(Class cls) {
+    if (!cls) return;
+    SEL resumeSel = @selector(resume);
+    Class owner = LCOwningClassForSelector(cls, resumeSel);
+    if (!owner || owner == NSURLSessionTask.class) return;
+    if (!LCMarkDelegateMethodHooked(owner, resumeSel)) return;
+    Method m = class_getInstanceMethod(owner, resumeSel);
+    if (!m) return;
+    IMP origIMP = method_getImplementation(m);
+    id block = ^(id selfObj) {
+        if ([selfObj isKindOfClass:NSURLSessionTask.class]) {
+            LCDebugOnTaskResume((NSURLSessionTask *)selfObj);
         }
-    }
-    if (g_orig_task_resume) {
-        g_orig_task_resume(selfObj, _cmd);
-    }
+        ((void (*)(id, SEL))origIMP)(selfObj, resumeSel);
+    };
+    class_replaceMethod(owner, resumeSel, imp_implementationWithBlock(block), method_getTypeEncoding(m));
 }
 
 // MARK: - WKWebView Console & Fetch/XHR Bridge
@@ -750,7 +961,7 @@ static NSString *const kLCDebugWKHandlerName = @"lcDebugBridge";
             @"responseHeaders": @{},
             @"requestBodyPreview": reqBody,
             @"responseBodyPreview": resp,
-            @"curl": [NSString stringWithFormat:@"curl -X %@ '%@'", method, url],
+            @"curl": [NSString stringWithFormat:@"curl -X %@ '%@'", method, LCEscapeSingleQuotes(url)],
             @"error": err
         }];
     }
@@ -763,13 +974,14 @@ static NSString *LCDebugWebViewHookScript(void) {
     "(function(){"
     "if(window.__lcDebugHooked)return;window.__lcDebugHooked=true;"
     "function post(o){try{window.webkit.messageHandlers.lcDebugBridge.postMessage(o);}catch(e){}}"
+    "function strUrl(u){if(typeof u==='string')return u;if(u&&(u.url||u.href))return String(u.url||u.href);return String(u||'');}"
     "function fmt(args){return Array.prototype.slice.call(args).map(function(a){try{return typeof a==='object'?JSON.stringify(a):String(a);}catch(e){return String(a);}}).join(' ');}"
     "['log','info','warn','error','debug'].forEach(function(lv){var orig=console[lv];console[lv]=function(){post({kind:'console',level:lv==='log'?'info':lv,text:fmt(arguments)});if(orig)return orig.apply(console,arguments);};});"
     "window.addEventListener('error',function(ev){post({kind:'console',level:'error',text:'JS Error: '+(ev.message||'')+' @ '+(ev.filename||'')+':'+(ev.lineno||0)});});"
-    "if(window.fetch){var origFetch=window.fetch;window.fetch=function(input,init){var t0=Date.now();var url=(typeof input==='string')?input:(input&&input.url||'');var method=(init&&init.method)||(input&&input.method)||'GET';var reqBody=(init&&typeof init.body==='string')?init.body.slice(0,2048):'';return origFetch.apply(this,arguments).then(function(res){var clone=res.clone();clone.text().then(function(txt){post({kind:'network',method:method.toUpperCase(),url:url,statusCode:res.status,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:(txt||'').slice(0,4096),error:''});}).catch(function(){});return res;}).catch(function(err){post({kind:'network',method:method.toUpperCase(),url:url,statusCode:-1,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:'',error:String(err)});throw err;});};}"
+    "if(window.fetch){var origFetch=window.fetch;window.fetch=function(input,init){var t0=Date.now();var url=strUrl(input);var method=((init&&init.method)||(input&&input.method)||'GET').toUpperCase();var reqBody=(init&&typeof init.body==='string')?init.body.slice(0,2048):'';return origFetch.apply(this,arguments).then(function(res){var ct=(res.headers&&res.headers.get('content-type'))||'';var cl=parseInt((res.headers&&res.headers.get('content-length'))||'0',10)||0;var textLike=!ct||/json|text|xml|javascript|form/i.test(ct);if(textLike&&cl<=262144){try{res.clone().text().then(function(txt){post({kind:'network',method:method,url:url,statusCode:res.status,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:(txt||'').slice(0,4096),error:''});}).catch(function(){});}catch(e){post({kind:'network',method:method,url:url,statusCode:res.status,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:'',error:''});}}else{post({kind:'network',method:method,url:url,statusCode:res.status,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:'<Non-text or large response: '+ct+'>',error:''});}return res;}).catch(function(err){post({kind:'network',method:method,url:url,statusCode:-1,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:'',error:String(err)});throw err;});};}"
     "var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;"
-    "XMLHttpRequest.prototype.open=function(m,u){this.__lcM=m;this.__lcU=u;return origOpen.apply(this,arguments);};"
-    "XMLHttpRequest.prototype.send=function(b){var xhr=this;var t0=Date.now();var reqBody=(typeof b==='string')?b.slice(0,2048):'';xhr.addEventListener('loadend',function(){var txt='';try{txt=(typeof xhr.responseText==='string')?xhr.responseText.slice(0,4096):'';}catch(e){}post({kind:'network',method:(xhr.__lcM||'GET').toUpperCase(),url:xhr.__lcU||'',statusCode:xhr.status||0,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:txt,error:''});});return origSend.apply(this,arguments);};"
+    "XMLHttpRequest.prototype.open=function(m,u){this.__lcM=m;this.__lcU=strUrl(u);return origOpen.apply(this,arguments);};"
+    "XMLHttpRequest.prototype.send=function(b){var xhr=this;var t0=Date.now();var reqBody=(typeof b==='string')?b.slice(0,2048):'';xhr.addEventListener('loadend',function(){var txt='';try{if(!xhr.responseType||xhr.responseType==='text'){txt=(typeof xhr.responseText==='string')?xhr.responseText.slice(0,4096):'';}}catch(e){}post({kind:'network',method:(xhr.__lcM||'GET').toUpperCase(),url:xhr.__lcU||'',statusCode:xhr.status||0,durationMs:Date.now()-t0,requestBodyPreview:reqBody,responseBodyPreview:txt,error:''});});return origSend.apply(this,arguments);};"
     "})();";
 }
 
@@ -809,12 +1021,20 @@ static void LCDebugHook_NSLogv(NSString *format, va_list args) {
         gLCInNSLogHook = YES;
         va_list copyArgs;
         va_copy(copyArgs, args);
-        NSString *formatted = [[NSString alloc] initWithFormat:format arguments:copyArgs];
-        va_end(copyArgs);
-        if (formatted.length > 0) {
-            [LCDebugServer.shared appendLogStream:@"nslog" level:@"info" subsystem:nil category:nil text:formatted];
+        @autoreleasepool {
+            @try {
+                NSString *formatted = [[NSString alloc] initWithFormat:format arguments:copyArgs];
+                if (formatted.length > 0) {
+                    LCRecordRecentNSLogMessage(formatted);
+                    [LCDebugServer.shared appendLogStream:@"nslog" level:@"info" subsystem:nil category:nil text:formatted];
+                }
+            } @catch (__unused NSException *ex) {
+                // Never crash a guest app while formatting a debug log
+            } @finally {
+                va_end(copyArgs);
+                gLCInNSLogHook = NO;
+            }
         }
-        gLCInNSLogHook = NO;
     }
     if (g_orig_NSLogv) {
         g_orig_NSLogv(format, args);
@@ -915,6 +1135,9 @@ static void LCApplyXRayToSingleView(UIView *view, BOOL enabled) {
     CALayer *layer = view.layer;
     NSArray *saved = objc_getAssociatedObject(view, &kLCXRaySavedBorderKey);
     if (enabled) {
+        if (saved && layer.borderWidth == 1.0) {
+            return; // Already styled; avoid redundant layer churn on every layoutSubviews
+        }
         if (!saved) {
             id savedColor = layer.borderColor ? [UIColor colorWithCGColor:layer.borderColor] : NSNull.null;
             objc_setAssociatedObject(view, &kLCXRaySavedBorderKey, @[@(layer.borderWidth), savedColor], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -942,6 +1165,9 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     [self lcDebug_layoutSubviews];
     if (atomic_load(&gLCDebugXRayAtomic)) {
         LCApplyXRayToSingleView(self, YES);
+    } else if (objc_getAssociatedObject(self, &kLCXRaySavedBorderKey) != nil) {
+        // Restore recycled/previously-detached cells cleanly once X-Ray is disabled
+        LCApplyXRayToSingleView(self, NO);
     }
 }
 @end
@@ -952,8 +1178,8 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
         for (UITouch *touch in event.allTouches) {
             if (touch.phase == UITouchPhaseBegan) {
                 UIWindow *win = touch.window;
-                if (win && !LCDebugIsInternalDebugClass(win.class)) {
-                    UIView *target = touch.view;
+                UIView *target = touch.view;
+                if (win && !LCDebugIsInternalDebugClass(win.class) && (!target || !LCDebugIsInternalDebugClass(target.class))) {
                     CGPoint pt = [touch locationInView:win];
                     NSString *targetName = target ? (NSStringFromClass(target.class) ?: @"UIView") : @"UIWindow";
                     NSString *accId = target.accessibilityIdentifier ?: @"";
@@ -986,24 +1212,26 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     }
     NSString *title = self.title ?: self.navigationItem.title ?: @"";
     NSString *detail = title.length > 0 ? [NSString stringWithFormat:@"title=\"%@\"", title] : @"appeared";
+    UIWindow *win = self.viewIfLoaded.window;
     [LCDebugServer.shared recordUIEventKind:@"vc"
                                       title:[NSString stringWithFormat:@"Appear %@", clsName]
                                      detail:detail
                                      target:clsName
                              viewController:clsName
-                                     window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+                                     window:win ? NSStringFromClass(win.class) : @""];
 }
 
 - (void)lcDebug_presentViewController:(UIViewController *)vcToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
     if (atomic_load(&gLCDebugAgentActive) && vcToPresent && !LCDebugIsInternalDebugClass(vcToPresent.class) && !LCDebugIsInternalDebugClass(self.class)) {
         NSString *fromName = NSStringFromClass(self.class) ?: @"";
         NSString *toName = NSStringFromClass(vcToPresent.class) ?: @"";
+        UIWindow *win = self.viewIfLoaded.window;
         [LCDebugServer.shared recordUIEventKind:@"modal"
                                           title:[NSString stringWithFormat:@"Present %@", toName]
                                          detail:[NSString stringWithFormat:@"from %@", fromName]
                                          target:toName
                                  viewController:fromName
-                                         window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+                                         window:win ? NSStringFromClass(win.class) : @""];
     }
     [self lcDebug_presentViewController:vcToPresent animated:flag completion:completion];
 }
@@ -1011,32 +1239,52 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 
 @implementation UITabBarController (LCDebugTabHook)
 - (void)lcDebug_setSelectedIndex:(NSUInteger)selectedIndex {
-    NSUInteger prev = self.selectedIndex;
-    [self lcDebug_setSelectedIndex:selectedIndex];
-    if (atomic_load(&gLCDebugAgentActive) && prev != selectedIndex && !LCDebugIsInternalDebugClass(self.class)) {
-        UIViewController *selVC = (selectedIndex < self.viewControllers.count) ? self.viewControllers[selectedIndex] : nil;
-        NSString *vcName = selVC ? NSStringFromClass(selVC.class) : @"";
-        [LCDebugServer.shared recordUIEventKind:@"tab"
-                                          title:[NSString stringWithFormat:@"Tab %lu → %lu", (unsigned long)prev, (unsigned long)selectedIndex]
-                                         detail:vcName
-                                         target:NSStringFromClass(self.class) ?: @"UITabBarController"
-                                 viewController:vcName
-                                         window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+    if (gLCInTabSelectHook) {
+        [self lcDebug_setSelectedIndex:selectedIndex];
+        return;
+    }
+    gLCInTabSelectHook = YES;
+    @try {
+        NSUInteger prev = self.selectedIndex;
+        [self lcDebug_setSelectedIndex:selectedIndex];
+        if (atomic_load(&gLCDebugAgentActive) && prev != selectedIndex && !LCDebugIsInternalDebugClass(self.class)) {
+            UIViewController *selVC = (selectedIndex < self.viewControllers.count) ? self.viewControllers[selectedIndex] : nil;
+            NSString *vcName = selVC ? NSStringFromClass(selVC.class) : @"";
+            UIWindow *win = self.viewIfLoaded.window;
+            [LCDebugServer.shared recordUIEventKind:@"tab"
+                                              title:[NSString stringWithFormat:@"Tab %lu → %lu", (unsigned long)prev, (unsigned long)selectedIndex]
+                                             detail:vcName
+                                             target:NSStringFromClass(self.class) ?: @"UITabBarController"
+                                     viewController:vcName
+                                             window:win ? NSStringFromClass(win.class) : @""];
+        }
+    } @finally {
+        gLCInTabSelectHook = NO;
     }
 }
 
 - (void)lcDebug_setSelectedViewController:(UIViewController *)selectedViewController {
-    UIViewController *prevVC = self.selectedViewController;
-    [self lcDebug_setSelectedViewController:selectedViewController];
-    if (atomic_load(&gLCDebugAgentActive) && prevVC != selectedViewController && selectedViewController && !LCDebugIsInternalDebugClass(self.class)) {
-        NSString *toName = NSStringFromClass(selectedViewController.class) ?: @"";
-        NSString *fromName = prevVC ? NSStringFromClass(prevVC.class) : @"none";
-        [LCDebugServer.shared recordUIEventKind:@"tab"
-                                          title:[NSString stringWithFormat:@"Tab → %@", toName]
-                                         detail:[NSString stringWithFormat:@"from %@", fromName]
-                                         target:NSStringFromClass(self.class) ?: @"UITabBarController"
-                                 viewController:toName
-                                         window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+    if (gLCInTabSelectHook) {
+        [self lcDebug_setSelectedViewController:selectedViewController];
+        return;
+    }
+    gLCInTabSelectHook = YES;
+    @try {
+        UIViewController *prevVC = self.selectedViewController;
+        [self lcDebug_setSelectedViewController:selectedViewController];
+        if (atomic_load(&gLCDebugAgentActive) && prevVC != selectedViewController && selectedViewController && !LCDebugIsInternalDebugClass(self.class)) {
+            NSString *toName = NSStringFromClass(selectedViewController.class) ?: @"";
+            NSString *fromName = prevVC ? NSStringFromClass(prevVC.class) : @"none";
+            UIWindow *win = self.viewIfLoaded.window;
+            [LCDebugServer.shared recordUIEventKind:@"tab"
+                                              title:[NSString stringWithFormat:@"Tab → %@", toName]
+                                             detail:[NSString stringWithFormat:@"from %@", fromName]
+                                             target:NSStringFromClass(self.class) ?: @"UITabBarController"
+                                     viewController:toName
+                                             window:win ? NSStringFromClass(win.class) : @""];
+        }
+    } @finally {
+        gLCInTabSelectHook = NO;
     }
 }
 @end
@@ -1045,12 +1293,13 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 - (void)lcDebug_pushViewController:(UIViewController *)viewController animated:(BOOL)animated {
     if (atomic_load(&gLCDebugAgentActive) && viewController && !LCDebugIsInternalDebugClass(viewController.class) && !LCDebugIsInternalDebugClass(self.class)) {
         NSString *vcName = NSStringFromClass(viewController.class) ?: @"";
+        UIWindow *win = self.viewIfLoaded.window;
         [LCDebugServer.shared recordUIEventKind:@"nav"
                                           title:[NSString stringWithFormat:@"Push %@", vcName]
                                          detail:[NSString stringWithFormat:@"stack depth %lu", (unsigned long)(self.viewControllers.count + 1)]
                                          target:NSStringFromClass(self.class) ?: @"UINavigationController"
                                  viewController:vcName
-                                         window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+                                         window:win ? NSStringFromClass(win.class) : @""];
     }
     [self lcDebug_pushViewController:viewController animated:animated];
 }
@@ -1059,12 +1308,13 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     UIViewController *popped = [self lcDebug_popViewControllerAnimated:animated];
     if (atomic_load(&gLCDebugAgentActive) && popped && !LCDebugIsInternalDebugClass(popped.class) && !LCDebugIsInternalDebugClass(self.class)) {
         NSString *vcName = NSStringFromClass(popped.class) ?: @"";
+        UIWindow *win = self.viewIfLoaded.window;
         [LCDebugServer.shared recordUIEventKind:@"nav"
                                           title:[NSString stringWithFormat:@"Pop %@", vcName]
                                          detail:[NSString stringWithFormat:@"stack depth %lu", (unsigned long)self.viewControllers.count]
                                          target:NSStringFromClass(self.class) ?: @"UINavigationController"
                                  viewController:vcName
-                                         window:self.view.window ? NSStringFromClass(self.view.window.class) : @""];
+                                         window:win ? NSStringFromClass(win.class) : @""];
     }
     return popped;
 }
@@ -1092,14 +1342,17 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     if (atomic_load(&gLCDebugNotifMonitorAtomic) && !gLCInNotifHook && aName.length > 0) {
         if (![aName hasPrefix:@"_UI"] && ![aName hasPrefix:@"NSWillBecomeMultiThreaded"]) {
             gLCInNotifHook = YES;
-            NSString *objCls = anObject ? NSStringFromClass([anObject class]) : @"nil";
-            [LCDebugServer.shared recordUIEventKind:@"notification"
-                                              title:aName
-                                             detail:[NSString stringWithFormat:@"object=%@ keys=%lu", objCls, (unsigned long)aUserInfo.count]
-                                             target:objCls
-                                     viewController:@""
-                                             window:@""];
-            gLCInNotifHook = NO;
+            @try {
+                NSString *objCls = anObject ? NSStringFromClass([anObject class]) : @"nil";
+                [LCDebugServer.shared recordUIEventKind:@"notification"
+                                                  title:aName
+                                                 detail:[NSString stringWithFormat:@"object=%@ keys=%lu", objCls, (unsigned long)aUserInfo.count]
+                                                 target:objCls
+                                         viewController:@""
+                                                 window:@""];
+            } @finally {
+                gLCInNotifHook = NO;
+            }
         }
     }
 }
@@ -1110,6 +1363,7 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 @interface LCDebugInspectOverlayView : UIView
 @property (nonatomic, strong) UIView *highlightBox;
 @property (nonatomic, copy) void (^onInspectView)(NSDictionary *info);
+- (void)handleTap:(UITapGestureRecognizer *)tap;
 @end
 
 @implementation LCDebugInspectOverlayView
@@ -1194,13 +1448,22 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 @property (nonatomic, strong) UISegmentedControl *logFilterControl;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UILabel *metricsLabel;
-@property (nonatomic, strong) UIStackView *actionBar;
+@property (nonatomic, strong) UIStackView *headerStack;
 @property (nonatomic, strong) UIButton *xrayBtn;
 @property (nonatomic, strong) UIButton *notifBtn;
 @property (nonatomic, strong) UIButton *lanBtn;
 @property (nonatomic, strong) NSTimer *refreshTimer;
 @property (nonatomic, strong) NSArray<NSDictionary *> *displayRows;
-@property (nonatomic, copy) void (^onDismiss)(void);
+@property (nonatomic, strong) NSArray<NSDictionary *> *cachedRuntimeRows;
+- (void)reloadDataNow;
+- (void)handleTabOrFilterChanged;
+- (void)handleCopy;
+- (void)handleClear;
+- (void)handleClose;
+- (void)toggleXRay;
+- (void)toggleNotifs;
+- (void)toggleLAN;
+- (void)triggerMemWarn;
 @end
 
 @implementation LCDebugInAppDrawerViewController
@@ -1220,28 +1483,31 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     self.metricsLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
     self.metricsLabel.textColor = UIColor.systemCyanColor;
     self.metricsLabel.textAlignment = NSTextAlignmentCenter;
-    self.metricsLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Console", @"Network", @"UI/Events", @"Runtime"]];
     self.tabControl.selectedSegmentIndex = 0;
-    self.tabControl.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.tabControl addTarget:self action:@selector(reloadDataNow) forControlEvents:UIControlEventValueChanged];
+    [self.tabControl addTarget:self action:@selector(handleTabOrFilterChanged) forControlEvents:UIControlEventValueChanged];
 
     self.logFilterControl = [[UISegmentedControl alloc] initWithItems:@[@"All", @"Logs", @"OSLog", @"Web", @"Err"]];
     self.logFilterControl.selectedSegmentIndex = 0;
-    self.logFilterControl.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.logFilterControl addTarget:self action:@selector(reloadDataNow) forControlEvents:UIControlEventValueChanged];
+    [self.logFilterControl addTarget:self action:@selector(handleTabOrFilterChanged) forControlEvents:UIControlEventValueChanged];
 
     self.xrayBtn = [self makeActionButton:@"X-Ray" action:@selector(toggleXRay)];
     self.notifBtn = [self makeActionButton:@"Notifs" action:@selector(toggleNotifs)];
     self.lanBtn = [self makeActionButton:@"LAN" action:@selector(toggleLAN)];
     UIButton *memBtn = [self makeActionButton:@"MemWarn" action:@selector(triggerMemWarn)];
 
-    self.actionBar = [[UIStackView alloc] initWithArrangedSubviews:@[self.xrayBtn, self.notifBtn, self.lanBtn, memBtn]];
-    self.actionBar.axis = UILayoutConstraintAxisHorizontal;
-    self.actionBar.distribution = UIStackViewDistributionFillEqually;
-    self.actionBar.spacing = 6;
-    self.actionBar.translatesAutoresizingMaskIntoConstraints = NO;
+    UIStackView *actionBar = [[UIStackView alloc] initWithArrangedSubviews:@[self.xrayBtn, self.notifBtn, self.lanBtn, memBtn]];
+    actionBar.axis = UILayoutConstraintAxisHorizontal;
+    actionBar.distribution = UIStackViewDistributionFillEqually;
+    actionBar.spacing = 6;
+    [actionBar.heightAnchor constraintEqualToConstant:30].active = YES;
+
+    // Vertical stack collapses logFilterControl cleanly when hidden (no blank gap on other tabs)
+    self.headerStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.metricsLabel, self.tabControl, self.logFilterControl, actionBar]];
+    self.headerStack.axis = UILayoutConstraintAxisVertical;
+    self.headerStack.spacing = 6;
+    self.headerStack.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1252,32 +1518,16 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     self.tableView.estimatedRowHeight = 44;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
 
-    [self.view addSubview:self.metricsLabel];
-    [self.view addSubview:self.tabControl];
-    [self.view addSubview:self.logFilterControl];
-    [self.view addSubview:self.actionBar];
+    [self.view addSubview:self.headerStack];
     [self.view addSubview:self.tableView];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [self.metricsLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:6],
-        [self.metricsLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.metricsLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.headerStack.topAnchor constraintEqualToAnchor:safe.topAnchor constant:6],
+        [self.headerStack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.headerStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
 
-        [self.tabControl.topAnchor constraintEqualToAnchor:self.metricsLabel.bottomAnchor constant:8],
-        [self.tabControl.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.tabControl.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-
-        [self.logFilterControl.topAnchor constraintEqualToAnchor:self.tabControl.bottomAnchor constant:6],
-        [self.logFilterControl.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.logFilterControl.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-
-        [self.actionBar.topAnchor constraintEqualToAnchor:self.logFilterControl.bottomAnchor constant:6],
-        [self.actionBar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.actionBar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.actionBar.heightAnchor constraintEqualToConstant:30],
-
-        [self.tableView.topAnchor constraintEqualToAnchor:self.actionBar.bottomAnchor constant:8],
+        [self.tableView.topAnchor constraintEqualToAnchor:self.headerStack.bottomAnchor constant:8],
         [self.tableView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
@@ -1285,7 +1535,7 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 
     [self reloadDataNow];
     __weak typeof(self) weakSelf = self;
-    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.8 repeats:YES block:^(NSTimer * _Nonnull timer) {
+    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) {
             [timer invalidate];
@@ -1300,11 +1550,6 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
         [self.refreshTimer invalidate];
         self.refreshTimer = nil;
-        if (self.onDismiss) {
-            void (^cb)(void) = self.onDismiss;
-            self.onDismiss = nil;
-            cb();
-        }
     }
 }
 
@@ -1323,6 +1568,41 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     return btn;
 }
 
+- (void)handleTabOrFilterChanged {
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        self.cachedRuntimeRows = nil; // Refresh runtime snapshot on explicit switch to Runtime tab
+    }
+    [self reloadDataNow];
+}
+
+- (NSArray<NSDictionary *> *)buildRuntimeRowsFromStatus:(NSDictionary *)st {
+    BOOL jit = [st[@"isJIT"] boolValue];
+    BOOL lan = [st[@"lanEnabled"] boolValue];
+    NSMutableArray *rows = [NSMutableArray array];
+    [rows addObject:@{ @"k": @"Bundle ID", @"v": st[@"bundleId"] ?: @"" }];
+    [rows addObject:@{ @"k": @"Mode", @"v": jit ? @"JIT Attached (CS_DEBUGGED)" : @"JIT-Less (100% Native Runtime Hooks)" }];
+    [rows addObject:@{ @"k": @"Local Port", @"v": [NSString stringWithFormat:@"127.0.0.1:%@", st[@"localPort"]] }];
+    if (lan && [st[@"lanIP"] length] > 0) {
+        NSString *url = [NSString stringWithFormat:@"http://%@:%@?token=%@", st[@"lanIP"], st[@"lanPort"], st[@"authToken"] ?: @""];
+        [rows addObject:@{ @"k": @"Mac LAN Console (Tap to Copy)", @"v": url, @"copy": url }];
+    } else {
+        [rows addObject:@{ @"k": @"Mac LAN Console", @"v": @"Off (tap LAN button above to enable)" }];
+    }
+    NSArray *dylibs = [LCDebugServer.shared captureLoadedDylibs];
+    NSUInteger appImages = 0;
+    for (NSDictionary *d in dylibs) {
+        if (![d[@"isSystem"] boolValue]) appImages++;
+    }
+    [rows addObject:@{ @"k": @"Loaded Images", @"v": [NSString stringWithFormat:@"%lu total (%lu app/tweaks)", (unsigned long)dylibs.count, (unsigned long)appImages] }];
+    [rows addObject:@{ @"k": @"Active Windows", @"v": [NSString stringWithFormat:@"%lu visible guest windows", (unsigned long)LCVisibleGuestWindows().count] }];
+    for (NSDictionary *d in dylibs) {
+        if (![d[@"isSystem"] boolValue]) {
+            [rows addObject:@{ @"k": d[@"name"] ?: @"image", @"v": [NSString stringWithFormat:@"%@ · %@", d[@"base"] ?: @"", d[@"path"] ?: @""] }];
+        }
+    }
+    return rows;
+}
+
 - (void)reloadDataNow {
     NSDictionary *st = [LCDebugServer.shared currentStatusDictionary];
     BOOL jit = [st[@"isJIT"] boolValue];
@@ -1339,6 +1619,7 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     self.logFilterControl.hidden = (tab != 0);
 
+    NSArray<NSDictionary *> *nextRows = nil;
     if (tab == 0) {
         NSArray<NSDictionary *> *allLogs = [LCDebugServer.shared logsSnapshot];
         NSInteger filter = self.logFilterControl.selectedSegmentIndex;
@@ -1354,39 +1635,23 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
             [filtered addObject:entry];
             if (filtered.count >= 400) break;
         }
-        self.displayRows = filtered;
+        nextRows = filtered;
     } else if (tab == 1) {
-        self.displayRows = [LCDebugServer.shared networkSnapshot];
+        nextRows = [LCDebugServer.shared networkSnapshot];
     } else if (tab == 2) {
-        self.displayRows = [LCDebugServer.shared uiEventsSnapshot];
+        nextRows = [LCDebugServer.shared uiEventsSnapshot];
     } else {
-        NSMutableArray *rows = [NSMutableArray array];
-        [rows addObject:@{ @"k": @"Bundle ID", @"v": st[@"bundleId"] ?: @"" }];
-        [rows addObject:@{ @"k": @"Mode", @"v": jit ? @"JIT Attached (CS_DEBUGGED)" : @"JIT-Less (100% Native Runtime Hooks)" }];
-        [rows addObject:@{ @"k": @"Local Port", @"v": [NSString stringWithFormat:@"127.0.0.1:%@", st[@"localPort"]] }];
-        if (lan && [st[@"lanIP"] length] > 0) {
-            NSString *url = [NSString stringWithFormat:@"http://%@:%@?token=%@", st[@"lanIP"], st[@"lanPort"], st[@"authToken"] ?: @""];
-            [rows addObject:@{ @"k": @"Mac LAN Console (Tap to Copy)", @"v": url, @"copy": url }];
-        } else {
-            [rows addObject:@{ @"k": @"Mac LAN Console", @"v": @"Off (tap LAN button above to enable)" }];
+        if (!self.cachedRuntimeRows) {
+            self.cachedRuntimeRows = [self buildRuntimeRowsFromStatus:st];
         }
-        NSArray *dylibs = [LCDebugServer.shared captureLoadedDylibs];
-        NSUInteger appImages = 0;
-        for (NSDictionary *d in dylibs) {
-            if (![d[@"isSystem"] boolValue]) appImages++;
-        }
-        [rows addObject:@{ @"k": @"Loaded Images", @"v": [NSString stringWithFormat:@"%lu total (%lu app/tweaks)", (unsigned long)dylibs.count, (unsigned long)appImages] }];
-        NSDictionary *hier = [LCDebugServer.shared captureViewHierarchy];
-        NSArray *wins = hier[@"windows"];
-        [rows addObject:@{ @"k": @"Active Windows", @"v": [NSString stringWithFormat:@"%lu visible guest windows", (unsigned long)wins.count] }];
-        for (NSDictionary *d in dylibs) {
-            if (![d[@"isSystem"] boolValue]) {
-                [rows addObject:@{ @"k": d[@"name"] ?: @"image", @"v": [NSString stringWithFormat:@"%@ · %@", d[@"base"] ?: @"", d[@"path"] ?: @""] }];
-            }
-        }
-        self.displayRows = rows;
+        nextRows = self.cachedRuntimeRows;
     }
-    [self.tableView reloadData];
+
+    // Avoid interrupting active user scrolling unless row content actually changed
+    if (!self.tableView.isDragging && !self.tableView.isDecelerating) {
+        self.displayRows = nextRows;
+        [self.tableView reloadData];
+    }
 }
 
 - (void)toggleXRay {
@@ -1404,14 +1669,16 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 - (void)toggleLAN {
     NSDictionary *st = [LCDebugServer.shared currentStatusDictionary];
     [LCDebugServer.shared setLANEnabled:![st[@"lanEnabled"] boolValue]];
+    self.cachedRuntimeRows = nil;
+    __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self reloadDataNow];
+        weakSelf.cachedRuntimeRows = nil;
+        [weakSelf reloadDataNow];
     });
 }
 
 - (void)triggerMemWarn {
-    [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidReceiveMemoryWarningNotification object:UIApplication.sharedApplication];
-    [LCDebugServer.shared appendLogStream:@"debug" level:@"notice" subsystem:@"LiveContainer" category:@"memory" text:@"Simulated UIApplication memory warning"];
+    [LCDebugServer.shared simulateMemoryWarning];
     [self reloadDataNow];
 }
 
@@ -1441,16 +1708,14 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     if (tab == 0) [LCDebugServer.shared clearLogs];
     else if (tab == 1) [LCDebugServer.shared clearNetwork];
     else if (tab == 2) [LCDebugServer.shared clearUIEvents];
+    else self.cachedRuntimeRows = nil;
     [self reloadDataNow];
 }
 
 - (void)handleClose {
     [self.refreshTimer invalidate];
     self.refreshTimer = nil;
-    __weak typeof(self) weakSelf = self;
-    [self dismissViewControllerAnimated:YES completion:^{
-        if (weakSelf.onDismiss) weakSelf.onDismiss();
-    }];
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1463,43 +1728,49 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cellID];
         cell.backgroundColor = UIColor.clearColor;
-        cell.textLabel.numberOfLines = 3;
-        cell.detailTextLabel.numberOfLines = 2;
-        cell.textLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
-        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.72 alpha:1.0];
     }
+
     NSDictionary *row = self.displayRows[(NSUInteger)indexPath.row];
     NSInteger tab = self.tabControl.selectedSegmentIndex;
+
+    UIListContentConfiguration *cfg = [UIListContentConfiguration subtitleCellConfiguration];
+    cfg.textProperties.numberOfLines = 3;
+    cfg.textProperties.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+    cfg.secondaryTextProperties.numberOfLines = 2;
+    cfg.secondaryTextProperties.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    cfg.secondaryTextProperties.color = [UIColor colorWithWhite:0.72 alpha:1.0];
+
     if (tab == 0) {
         NSString *stream = row[@"stream"] ?: @"log";
         NSString *level = row[@"level"] ?: @"info";
         NSString *sub = row[@"subsystem"] ?: @"";
-        cell.textLabel.text = [NSString stringWithFormat:@"[%@%@] %@", stream.uppercaseString, sub.length > 0 ? [@":" stringByAppendingString:sub] : @"", row[@"text"] ?: @""];
+        cfg.text = [NSString stringWithFormat:@"[%@%@] %@", stream.uppercaseString, sub.length > 0 ? [@":" stringByAppendingString:sub] : @"", row[@"text"] ?: @""];
         if ([stream isEqualToString:@"crash"] || [stream isEqualToString:@"stderr"] || [level isEqualToString:@"error"] || [level isEqualToString:@"fault"]) {
-            cell.textLabel.textColor = UIColor.systemRedColor;
+            cfg.textProperties.color = UIColor.systemRedColor;
         } else if ([level isEqualToString:@"warn"] || [stream isEqualToString:@"nslog"]) {
-            cell.textLabel.textColor = UIColor.systemYellowColor;
+            cfg.textProperties.color = UIColor.systemYellowColor;
         } else if ([stream isEqualToString:@"oslog"]) {
-            cell.textLabel.textColor = UIColor.systemMintColor;
+            cfg.textProperties.color = UIColor.systemMintColor;
         } else {
-            cell.textLabel.textColor = UIColor.whiteColor;
+            cfg.textProperties.color = UIColor.whiteColor;
         }
-        cell.detailTextLabel.text = nil;
+        cfg.secondaryText = nil;
     } else if (tab == 1) {
         NSInteger code = [row[@"statusCode"] integerValue];
-        cell.textLabel.text = [NSString stringWithFormat:@"%@ [%ld] %@ms · %@", row[@"method"] ?: @"GET", (long)code, row[@"durationMs"] ?: @0, row[@"url"] ?: @""];
-        cell.textLabel.textColor = (code >= 200 && code < 300) ? UIColor.systemGreenColor : (code == 101 ? UIColor.systemCyanColor : UIColor.systemRedColor);
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@ B · %@", row[@"source"] ?: @"urlsession", row[@"bytes"] ?: @0, row[@"mimeType"] ?: @""];
+        cfg.text = [NSString stringWithFormat:@"%@ [%ld] %@ms · %@", row[@"method"] ?: @"GET", (long)code, row[@"durationMs"] ?: @0, row[@"url"] ?: @""];
+        cfg.textProperties.color = (code >= 200 && code < 300) ? UIColor.systemGreenColor : (code == 101 ? UIColor.systemCyanColor : UIColor.systemRedColor);
+        cfg.secondaryText = [NSString stringWithFormat:@"%@ · %@ B · %@", row[@"source"] ?: @"urlsession", row[@"bytes"] ?: @0, row[@"mimeType"] ?: @""];
     } else if (tab == 2) {
-        cell.textLabel.text = [NSString stringWithFormat:@"[%@] %@", [row[@"kind"] uppercaseString] ?: @"UI", row[@"title"] ?: @""];
-        cell.textLabel.textColor = UIColor.systemCyanColor;
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · VC: %@", row[@"detail"] ?: @"", row[@"viewController"] ?: @"-"];
+        cfg.text = [NSString stringWithFormat:@"[%@] %@", [row[@"kind"] uppercaseString] ?: @"UI", row[@"title"] ?: @""];
+        cfg.textProperties.color = UIColor.systemCyanColor;
+        cfg.secondaryText = [NSString stringWithFormat:@"%@ · VC: %@", row[@"detail"] ?: @"", row[@"viewController"] ?: @"-"];
     } else {
-        cell.textLabel.text = row[@"k"] ?: @"";
-        cell.textLabel.textColor = UIColor.whiteColor;
-        cell.detailTextLabel.text = row[@"v"] ?: @"";
+        cfg.text = row[@"k"] ?: @"";
+        cfg.textProperties.color = UIColor.whiteColor;
+        cfg.secondaryText = row[@"v"] ?: @"";
     }
+
+    cell.contentConfiguration = cfg;
     return cell;
 }
 
@@ -1532,16 +1803,47 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
 
 @end
 
+@interface LCDebugOverlayRootViewController : UIViewController
+@property (nonatomic, weak) UIView *pillContainer;
+- (void)clampPillToSafeArea;
+@end
+
+@implementation LCDebugOverlayRootViewController
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self clampPillToSafeArea];
+}
+
+- (void)clampPillToSafeArea {
+    UIView *pill = self.pillContainer;
+    if (!pill) return;
+    CGRect bounds = self.view.bounds;
+    if (CGRectIsEmpty(bounds)) return;
+    UIEdgeInsets insets = self.view.safeAreaInsets;
+    CGFloat halfW = pill.bounds.size.width * 0.5 + 8;
+    CGFloat halfH = pill.bounds.size.height * 0.5 + 8;
+    CGFloat minX = MAX(halfW, insets.left + halfW);
+    CGFloat maxX = MAX(minX, bounds.size.width - MAX(halfW, insets.right + halfW));
+    CGFloat minY = MAX(halfH, insets.top + halfH);
+    CGFloat maxY = MAX(minY, bounds.size.height - MAX(halfH, insets.bottom + halfH));
+    CGPoint c = pill.center;
+    c.x = MAX(minX, MIN(maxX, c.x));
+    c.y = MAX(minY, MIN(maxY, c.y));
+    pill.center = c;
+}
+
+@end
+
 @interface LCDebugOverlayWindow : UIWindow
 @property (nonatomic, strong) UIView *pillContainer;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, assign) BOOL isPresentingDrawer;
 @end
 
 @implementation LCDebugOverlayWindow
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.isPresentingDrawer) {
+    if (self.rootViewController.presentedViewController != nil) {
         return [super hitTest:point withEvent:event];
     }
     UIView *hit = [super hitTest:point withEvent:event];
@@ -1600,7 +1902,8 @@ static NSString *LCDebugWebConsoleHTML(void) {
     "let logs=[],nets=[],evs=[];"
     "function showTab(id,el){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');el.classList.add('active');}"
     "function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
-    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT-Less';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);document.getElementById('b-notif').classList.toggle('on',!!s.notificationMonitorEnabled);if(s.selectedView){let b=document.getElementById('tapbanner');b.style.display='block';b.innerHTML='<strong>Inspected View:</strong> <code>'+esc(s.selectedView.class)+'</code> | VC: <code>'+esc(s.selectedView.viewController||'-')+'</code> | '+esc(s.selectedView.frame);}}"
+    "function renderSelectedView(v){if(!v)return;let b=document.getElementById('tapbanner');b.style.display='block';b.innerHTML='<strong>Inspected View:</strong> <code>'+esc(v.class)+'</code> | VC: <code>'+esc(v.viewController||'-')+'</code> | '+esc(v.frame);}"
+    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT-Less';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);document.getElementById('b-notif').classList.toggle('on',!!s.notificationMonitorEnabled);if(s.selectedView)renderSelectedView(s.selectedView);}"
     "function renderLogs(){let q=document.getElementById('logFilter').value.toLowerCase();let el=document.getElementById('logbox');el.textContent=logs.filter(l=>!q||(l.text||'').toLowerCase().includes(q)||(l.stream||'').toLowerCase().includes(q)||(l.subsystem||'').toLowerCase().includes(q)).map(l=>'['+l.stream+(l.subsystem?':'+l.subsystem:'')+'] '+l.text).join('\\n');el.scrollTop=el.scrollHeight;}"
     "function renderNets(){let el=document.getElementById('netlist');el.innerHTML=nets.map(n=>'<div class=\"row\"><div><strong>'+esc(n.method)+'</strong> ['+esc(n.statusCode)+'] '+esc(n.durationMs)+'ms · '+esc(n.bytes)+'B · <code>'+esc(n.url)+'</code></div><details style=\"margin-top:6px\"><summary>Headers, Body & cURL</summary><pre>'+esc((n.curl||'')+'\\n\\nRequest Headers: '+JSON.stringify(n.requestHeaders||{},null,2)+'\\n\\nResponse Headers: '+JSON.stringify(n.responseHeaders||{},null,2)+'\\n\\nRequest Body:\\n'+(n.requestBodyPreview||'')+'\\n\\nResponse Preview:\\n'+(n.responseBodyPreview||''))+'</pre></details></div>').join('');}"
     "function renderEvs(){let el=document.getElementById('evlist');el.innerHTML=evs.map(e=>'<div class=\"row\"><strong>['+esc((e.kind||'ui').toUpperCase())+']</strong> '+esc(e.title)+' <span style=\"color:var(--sub)\">'+esc(e.detail||'')+' · VC: '+esc(e.viewController||'-')+'</span></div>').join('');}"
@@ -1620,7 +1923,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
     "es.addEventListener('log',e=>{logs.push(JSON.parse(e.data));if(logs.length>2000)logs.shift();renderLogs();});"
     "es.addEventListener('network',e=>{nets.unshift(JSON.parse(e.data));if(nets.length>500)nets.pop();renderNets();});"
     "es.addEventListener('uievent',e=>{evs.unshift(JSON.parse(e.data));if(evs.length>500)evs.pop();renderEvs();});"
-    "es.addEventListener('tap',e=>{let s={bundleId:document.getElementById('title').textContent,selectedView:JSON.parse(e.data)};applyStatus(s);});"
+    "es.addEventListener('tap',e=>renderSelectedView(JSON.parse(e.data)));"
     "}"
     "boot();"
     "</script></body></html>";
@@ -1649,6 +1952,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (nonatomic, strong) dispatch_source_t lanAcceptSource;
 @property (nonatomic, assign) DNSServiceRef bonjourRef;
 @property (nonatomic, strong) dispatch_source_t bonjourSource;
+@property (nonatomic, copy) NSString *lastPublishedLANIP;
 
 @property (nonatomic, assign) int savedStdoutFD;
 @property (nonatomic, assign) int savedStderrFD;
@@ -1657,6 +1961,8 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (nonatomic, strong) dispatch_source_t osLogTimer;
 @property (nonatomic, strong) OSLogStore *osLogStore;
 @property (nonatomic, strong) NSDate *lastOSLogDate;
+@property (nonatomic, strong) NSMutableSet<NSString *> *seenAtLastOSLogDate;
+@property (atomic, assign) BOOL osLogPaused;
 
 @property (nonatomic, strong) dispatch_source_t telemetryTimer;
 @property (nonatomic, strong) CADisplayLink *displayLink;
@@ -1678,6 +1984,14 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (nonatomic, strong) LCDebugInspectOverlayView *inspectOverlay;
 @property (nonatomic, strong) LCDebugOverlayWindow *overlayWindow;
 @property (nonatomic, assign) BOOL shouldShowInAppOverlay;
+
+// Forward declarations to avoid -Wundeclared-selector warnings
+- (void)onDisplayLinkTick:(CADisplayLink *)link;
+- (void)handleSceneOrWindowActivated:(NSNotification *)note;
+- (void)handleAppDidEnterBackground:(NSNotification *)note;
+- (void)handleAppWillEnterForeground:(NSNotification *)note;
+- (void)handleOverlayPillPan:(UIPanGestureRecognizer *)pan;
+- (void)handleOverlayPillTap;
 @end
 
 static NSString *LCDebugGenerateRandomToken(void) {
@@ -1705,6 +2019,15 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         diff |= (uint8_t)ca[i] ^ (uint8_t)cb[i];
     }
     return diff == 0;
+}
+
+static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t n = send(fd, bytes + sent, length - sent, 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
 }
 
 @implementation LCDebugServer
@@ -1737,6 +2060,7 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         _bonjourRef = NULL;
         _authToken = LCDebugGenerateRandomToken();
         _lastOSLogDate = [NSDate dateWithTimeIntervalSinceNow:-2.0];
+        _seenAtLastOSLogDate = [NSMutableSet set];
     }
     return self;
 }
@@ -1745,6 +2069,7 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
     signal(SIGPIPE, SIG_IGN);
     atomic_store(&gLCDebugAgentActive, YES);
 
+    [self pruneDeadSessionFiles];
     [self installCrashHooks];
     [self installLogTee];
     [self installNSLogHook];
@@ -1787,7 +2112,6 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         strlcpy(gLCCrashLogPath, crashPath.UTF8String, sizeof(gLCCrashLogPath));
     }
 
-    // Surface crash log from previous run if present
     if ([NSFileManager.defaultManager fileExistsAtPath:crashPath]) {
         NSString *prevCrash = [NSString stringWithContentsOfFile:crashPath encoding:NSUTF8StringEncoding error:nil];
         if (prevCrash.length > 0) {
@@ -1807,69 +2131,64 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
     }
 }
 
-- (void)installLogTee {
-    int outPipe[2];
-    if (pipe(outPipe) == 0) {
-        self.savedStdoutFD = dup(STDOUT_FILENO);
-        dup2(outPipe[1], STDOUT_FILENO);
-        close(outPipe[1]);
-        // Force line buffering on stdout so printf/Swift print flush immediately over pipe!
-        setvbuf(stdout, NULL, _IOLBF, 0);
-        fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
-        int readFD = outPipe[0];
-        int passthroughFD = self.savedStdoutFD;
-        self.stdoutSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)readFD, 0, self.serverQueue);
-        __weak typeof(self) weakSelf = self;
-        dispatch_source_set_event_handler(self.stdoutSource, ^{
-            char buf[4096];
-            for (;;) {
-                ssize_t n = read(readFD, buf, sizeof(buf) - 1);
-                if (n <= 0) break;
-                if (passthroughFD >= 0) write(passthroughFD, buf, (size_t)n);
-                buf[n] = '\0';
-                NSString *chunk = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding]
-                    ?: [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSISOLatin1StringEncoding];
-                if (chunk.length > 0) [weakSelf consumePipeChunk:chunk isStderr:NO];
-            }
-        });
-        dispatch_source_set_cancel_handler(self.stdoutSource, ^{
-            close(readFD);
-        });
-        dispatch_resume(self.stdoutSource);
-    }
+- (dispatch_source_t)installPipeTeeForFD:(int)targetFD
+                               isStderr:(BOOL)isStderr
+                           savedFDOut:(int *)savedFDOut {
+    int pfd[2];
+    if (pipe(pfd) != 0) return nil;
 
-    int errPipe[2];
-    if (pipe(errPipe) == 0) {
-        self.savedStderrFD = dup(STDERR_FILENO);
-        dup2(errPipe[1], STDERR_FILENO);
-        close(errPipe[1]);
+    int saved = dup(targetFD);
+    if (savedFDOut) *savedFDOut = saved;
+    dup2(pfd[1], targetFD);
+    close(pfd[1]);
+    // Force immediate flushing over pipe instead of 4KB libc block buffering
+    if (isStderr) {
         setvbuf(stderr, NULL, _IONBF, 0);
-        fcntl(errPipe[0], F_SETFL, O_NONBLOCK);
-        int readFD = errPipe[0];
-        int passthroughFD = self.savedStderrFD;
-        self.stderrSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)readFD, 0, self.serverQueue);
-        __weak typeof(self) weakSelf = self;
-        dispatch_source_set_event_handler(self.stderrSource, ^{
-            char buf[4096];
-            for (;;) {
-                ssize_t n = read(readFD, buf, sizeof(buf) - 1);
-                if (n <= 0) break;
-                if (passthroughFD >= 0) write(passthroughFD, buf, (size_t)n);
+    } else {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+    }
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    int readFD = pfd[0];
+
+    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)readFD, 0, self.serverQueue);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(source, ^{
+        char buf[4096];
+        for (;;) {
+            ssize_t n = read(readFD, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                if (saved >= 0) write(saved, buf, (size_t)n);
                 buf[n] = '\0';
                 NSString *chunk = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding]
                     ?: [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSISOLatin1StringEncoding];
-                if (chunk.length > 0) [weakSelf consumePipeChunk:chunk isStderr:YES];
+                if (chunk.length > 0) [weakSelf consumePipeChunk:chunk isStderr:isStderr];
+            } else if (n == 0) {
+                // EOF: cancel source so dispatch does not busy-spin at 100% CPU
+                dispatch_source_cancel(source);
+                break;
+            } else {
+                break;
             }
-        });
-        dispatch_source_set_cancel_handler(self.stderrSource, ^{
-            close(readFD);
-        });
-        dispatch_resume(self.stderrSource);
-    }
+        }
+    });
+    dispatch_source_set_cancel_handler(source, ^{
+        close(readFD);
+    });
+    dispatch_resume(source);
+    return source;
+}
+
+- (void)installLogTee {
+    int savedOut = -1;
+    self.stdoutSource = [self installPipeTeeForFD:STDOUT_FILENO isStderr:NO savedFDOut:&savedOut];
+    self.savedStdoutFD = savedOut;
+
+    int savedErr = -1;
+    self.stderrSource = [self installPipeTeeForFD:STDERR_FILENO isStderr:YES savedFDOut:&savedErr];
+    self.savedStderrFD = savedErr;
 }
 
 - (void)consumePipeChunk:(NSString *)chunk isStderr:(BOOL)isStderr {
-    // Runs on self.serverQueue
     NSMutableString *buffer = isStderr ? self.stderrLineBuffer : self.stdoutLineBuffer;
     [buffer appendString:chunk];
     NSString *stream = isStderr ? @"stderr" : @"stdout";
@@ -1884,10 +2203,12 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         }
         [buffer deleteCharactersInRange:NSMakeRange(0, NSMaxRange(nl))];
         if (line.length > 0) {
+            if (isStderr && LCMatchesRecentNSLogMessage(line)) {
+                continue; // Suppress duplicate stderr echo of already-captured NSLog
+            }
             [self appendLogEntryOnServerQueueStream:stream level:level subsystem:nil category:nil text:line];
         }
     }
-    // Flush very long non-newline lines so output isn't held indefinitely
     if (buffer.length > 2048) {
         NSString *line = [buffer copy];
         [buffer setString:@""];
@@ -1908,9 +2229,13 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
 }
 
 - (void)startOSLogPolling {
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:self selector:@selector(handleAppDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(handleAppWillEnterForeground:) name:UIApplicationWillEnterForegroundNotification object:nil];
+
     dispatch_async(self.osLogQueue, ^{
         NSError *err = nil;
-        OSLogStore *store = [OSLogStore storeWithScope:OSLogStoreScopeCurrentProcessIdentifier error:&err];
+        OSLogStore *store = [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier error:&err];
         if (!store || err) {
             return;
         }
@@ -1922,10 +2247,20 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
                                   (uint64_t)(0.15 * NSEC_PER_SEC));
         __weak typeof(self) weakSelf = self;
         dispatch_source_set_event_handler(self.osLogTimer, ^{
-            [weakSelf pollOSLogStore];
+            if (!weakSelf.osLogPaused) {
+                [weakSelf pollOSLogStore];
+            }
         });
         dispatch_resume(self.osLogTimer);
     });
+}
+
+- (void)handleAppDidEnterBackground:(NSNotification *)note {
+    self.osLogPaused = YES;
+}
+
+- (void)handleAppWillEnterForeground:(NSNotification *)note {
+    self.osLogPaused = NO;
 }
 
 - (void)pollOSLogStore {
@@ -1943,14 +2278,33 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         while ((obj = [enumerator nextObject]) != nil) {
             if (![obj isKindOfClass:OSLogEntryLog.class]) continue;
             OSLogEntryLog *entry = (OSLogEntryLog *)obj;
-            if (!entry.date || [entry.date compare:cursor] != NSOrderedDescending) continue;
-            if ([entry.date compare:newest] == NSOrderedDescending) {
-                newest = entry.date;
-            }
+            if (!entry.date) continue;
+
+            NSComparisonResult cmp = [entry.date compare:cursor];
+            if (cmp == NSOrderedAscending) continue;
+
             NSString *msg = entry.composedMessage;
             if (msg.length == 0) continue;
+
+            NSString *fingerprint = [NSString stringWithFormat:@"%llu:%llu:%@",
+                                     (unsigned long long)entry.threadIdentifier,
+                                     (unsigned long long)entry.activityIdentifier,
+                                     msg];
+            if (cmp == NSOrderedSame && [self.seenAtLastOSLogDate containsObject:fingerprint]) {
+                continue;
+            }
+
+            if ([entry.date compare:newest] == NSOrderedDescending) {
+                newest = entry.date;
+                [self.seenAtLastOSLogDate removeAllObjects];
+            }
+            if ([entry.date isEqualToDate:newest]) {
+                [self.seenAtLastOSLogDate addObject:fingerprint];
+            }
+
             NSString *subsystem = entry.subsystem ?: @"";
             if ([subsystem hasPrefix:@"com.kdt.livecontainer.debug"]) continue;
+            if (subsystem.length == 0 && LCMatchesRecentNSLogMessage(msg)) continue;
 
             NSString *level = @"info";
             switch (entry.level) {
@@ -2006,13 +2360,12 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
                                          @selector(webSocketTaskWithURL:),
                                          @selector(lcDebug_webSocketTaskWithURL:));
 
-        // Hook -resume on the concrete NSURLSessionTask cluster class so startTime is accurate
-        Class taskClass = NSClassFromString(@"__NSCFLocalSessionTask") ?: NSURLSessionTask.class;
-        Method resumeMethod = class_getInstanceMethod(taskClass, @selector(resume));
-        if (resumeMethod) {
-            g_orig_task_resume = (void (*)(id, SEL))method_getImplementation(resumeMethod);
-            method_setImplementation(resumeMethod, (IMP)LCDebugHook_TaskResume);
-        }
+        // Safe swizzle for base NSURLSessionTask + concrete local/background cluster subclasses
+        LCDebugSafeSwizzleInstanceMethod(NSURLSessionTask.class,
+                                         @selector(resume),
+                                         @selector(lcDebug_resume));
+        LCHookTaskClusterResumeClass(NSClassFromString(@"__NSCFLocalSessionTask"));
+        LCHookTaskClusterResumeClass(NSClassFromString(@"__NSCFBackgroundSessionTask"));
     });
 }
 
@@ -2270,15 +2623,20 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
     self.lastThreadCount = threadCount;
     self.lastJITState = jit;
 
-    [self publishSharedSessionInfo];
+    // Only re-write session file if LAN IP actually changed (avoid 1Hz disk & cfprefsd churn)
+    if (self.lanEnabled) {
+        NSString *currentIP = LCBestLANIPv4Address() ?: @"";
+        if (![currentIP isEqualToString:(self.lastPublishedLANIP ?: @"")]) {
+            [self publishSharedSessionInfoWithLANIP:currentIP];
+        }
+    }
     [self broadcastSSEEvent:"telemetry" payload:[self currentStatusDictionary]];
 }
 
 - (NSDictionary *)currentStatusDictionary {
-    // Lock-free atomic reads + microsecond dataLock for selectedViewInfo — never deadlocks with main thread!
     NSString *bundleId = NSBundle.mainBundle.bundleIdentifier ?: @"Unknown";
     BOOL lan = self.lanEnabled;
-    NSString *lanIP = lan ? (LCBestLANIPv4Address() ?: @"") : @"";
+    NSString *lanIP = lan ? (self.lastPublishedLANIP.length > 0 ? self.lastPublishedLANIP : (LCBestLANIPv4Address() ?: @"")) : @"";
 
     os_unfair_lock_lock(&_dataLock);
     NSDictionary *selView = self.selectedViewInfo;
@@ -2305,10 +2663,27 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
     };
 }
 
-- (void)publishSharedSessionInfo {
+- (void)pruneDeadSessionFiles {
+    if (![NSUserDefaults respondsToSelector:@selector(lcAppGroupPath)]) return;
+    NSString *groupPath = [NSUserDefaults lcAppGroupPath];
+    if (groupPath.length == 0) return;
+    NSString *dir = [groupPath stringByAppendingPathComponent:@"Library/Caches/LCDebugSessions"];
+    NSArray<NSString *> *files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+    for (NSString *name in files) {
+        if (![name hasPrefix:@"pid-"] || ![name hasSuffix:@".json"]) continue;
+        NSString *numPart = [[name substringFromIndex:4] stringByDeletingPathExtension];
+        pid_t filePID = (pid_t)numPart.intValue;
+        if (filePID > 0 && filePID != getpid() && kill(filePID, 0) != 0 && errno == ESRCH) {
+            [NSFileManager.defaultManager removeItemAtPath:[dir stringByAppendingPathComponent:name] error:nil];
+        }
+    }
+}
+
+- (void)publishSharedSessionInfoWithLANIP:(NSString *)resolvedLANIP {
     uint16_t port = self.localPort;
     if (port == 0) return;
-    NSString *lanIP = self.lanEnabled ? (LCBestLANIPv4Address() ?: @"") : @"";
+    NSString *lanIP = self.lanEnabled ? (resolvedLANIP ?: LCBestLANIPv4Address() ?: @"") : @"";
+    self.lastPublishedLANIP = lanIP;
     NSDictionary *session = @{
         @"pid": @(getpid()),
         @"bundleId": NSBundle.mainBundle.bundleIdentifier ?: @"Unknown",
@@ -2320,7 +2695,6 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         @"updatedAt": @(CFAbsoluteTimeGetCurrent())
     };
 
-    // 1. Deterministic per-PID session file in App Group caches (immune to stale PID overwrite or NSUserDefaults redirection)
     if ([NSUserDefaults respondsToSelector:@selector(lcAppGroupPath)]) {
         NSString *groupPath = [NSUserDefaults lcAppGroupPath];
         if (groupPath.length > 0) {
@@ -2332,7 +2706,6 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         }
     }
 
-    // 2. Fallback UserDefaults key
     if ([NSUserDefaults respondsToSelector:@selector(lcSharedDefaults)]) {
         [[NSUserDefaults lcSharedDefaults] setObject:session forKey:@"LCDebugActiveSession"];
     }
@@ -2377,7 +2750,7 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         self.localPort = port;
         atomic_store(&gLCDebugLocalPort, port);
         self.localAcceptSource = [self makeAcceptSourceForSocket:fd];
-        [self publishSharedSessionInfo];
+        [self publishSharedSessionInfoWithLANIP:nil];
     });
 }
 
@@ -2407,7 +2780,7 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
             self.lanPort = 0;
             atomic_store(&gLCDebugLANPort, 0);
         }
-        [self publishSharedSessionInfo];
+        [self publishSharedSessionInfoWithLANIP:nil];
         [self broadcastSSEEvent:"telemetry" payload:[self currentStatusDictionary]];
     });
 }
@@ -2422,9 +2795,13 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         int sockFD = DNSServiceRefSockFD(ref);
         if (sockFD >= 0) {
             self.bonjourSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)sockFD, 0, self.serverQueue);
+            __weak typeof(self) weakSelf = self;
             dispatch_source_set_event_handler(self.bonjourSource, ^{
-                if (self.bonjourRef) {
-                    DNSServiceProcessResult(self.bonjourRef);
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf.bonjourRef) return;
+                if (DNSServiceProcessResult(strongSelf.bonjourRef) != kDNSServiceErr_NoError) {
+                    // Prevent 100% CPU spin if mDNSResponder disconnects on suspend
+                    [strongSelf stopBonjourService];
                 }
             });
             dispatch_source_set_cancel_handler(self.bonjourSource, ^{
@@ -2471,8 +2848,10 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
 - (void)handleClientSocket:(int)clientFD isLoopback:(BOOL)isLoopback {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct timeval rcvTV = { .tv_sec = 2, .tv_usec = 0 };
+        struct timeval sndTV = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &rcvTV, sizeof(rcvTV));
+        setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &sndTV, sizeof(sndTV));
 
         NSMutableData *raw = [NSMutableData data];
         char buf[4096];
@@ -2585,21 +2964,17 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         "Connection: close\r\n\r\n",
         status, statusText, ctype, (unsigned long)body.length, cookieHeader];
     NSData *hdrData = [hdr dataUsingEncoding:NSUTF8StringEncoding];
-    send(fd, hdrData.bytes, hdrData.length, 0);
+    if (hdrData.length > 0) {
+        LCSendAllBlocking(fd, hdrData.bytes, hdrData.length);
+    }
     if (body.length > 0) {
-        size_t sent = 0;
-        const uint8_t *ptr = body.bytes;
-        while (sent < body.length) {
-            ssize_t n = send(fd, ptr + sent, body.length - sent, 0);
-            if (n <= 0) break;
-            sent += (size_t)n;
-        }
+        LCSendAllBlocking(fd, body.bytes, body.length);
     }
     close(fd);
 }
 
 - (void)broadcastSSEEvent:(const char *)eventType payload:(id)payload {
-    // Runs on self.serverQueue — non-blocking writes so a slow client never stalls log ingestion!
+    // Runs on self.serverQueue — non-blocking writes; partial writes close cleanly so framing never corrupts!
     if (self.sseClientFDs.count == 0) return;
     NSString *json = LCJSONStringFromObject(payload);
     NSString *frame = [NSString stringWithFormat:@"event: %s\ndata: %@\n\n", eventType, json];
@@ -2610,11 +2985,12 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         ssize_t n = send(fd, data.bytes, data.length, MSG_DONTWAIT);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue; // Drop frame for congested client rather than blocking or disconnecting
+                continue; // Buffer momentarily full — drop whole frame cleanly
             }
             [deadIndices addIndex:i];
             close(fd);
-        } else if (n == 0) {
+        } else if (n == 0 || (size_t)n < data.length) {
+            // Partial frame write would corrupt JSON framing -> disconnect client so it reconnects cleanly
             [deadIndices addIndex:i];
             close(fd);
         }
@@ -2639,17 +3015,22 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: keep-alive\r\n\r\n";
-        if (send(clientFD, sseHeader, strlen(sseHeader), 0) <= 0) {
+        size_t hdrLen = strlen(sseHeader);
+        if (send(clientFD, sseHeader, hdrLen, 0) != (ssize_t)hdrLen) {
             close(clientFD);
             return;
         }
         fcntl(clientFD, F_SETFL, O_NONBLOCK);
         dispatch_async(self.serverQueue, ^{
-            [self.sseClientFDs addObject:@(clientFD)];
             NSDictionary *status = [self currentStatusDictionary];
             NSString *initFrame = [NSString stringWithFormat:@"event: telemetry\ndata: %@\n\n", LCJSONStringFromObject(status)];
             NSData *initData = [initFrame dataUsingEncoding:NSUTF8StringEncoding];
-            send(clientFD, initData.bytes, initData.length, MSG_DONTWAIT);
+            ssize_t sent = send(clientFD, initData.bytes, initData.length, MSG_DONTWAIT);
+            if (sent == (ssize_t)initData.length || (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                [self.sseClientFDs addObject:@(clientFD)];
+            } else {
+                close(clientFD);
+            }
         });
         return;
     }
@@ -2734,14 +3115,7 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
         } else if ([action isEqualToString:@"toggle_notifications"]) {
             [self setNotificationMonitorEnabled:!self.notificationMonitorEnabled];
         } else if ([action isEqualToString:@"memory_warning"]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidReceiveMemoryWarningNotification object:UIApplication.sharedApplication];
-                SEL memSel = sel_registerName("_performMemoryWarning");
-                if ([UIApplication.sharedApplication respondsToSelector:memSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, memSel);
-                }
-            });
-            [self appendLogStream:@"debug" level:@"notice" subsystem:@"LiveContainer" category:@"memory" text:@"Simulated UIApplication memory warning"];
+            [self simulateMemoryWarning];
         } else if ([action isEqualToString:@"clear_logs"]) {
             [self clearLogs];
         } else if ([action isEqualToString:@"clear_network"]) {
@@ -2757,6 +3131,17 @@ static BOOL LCDebugConstantTimeEquals(NSString *a, NSString *b) {
 }
 
 // MARK: - Runtime & UI Introspection
+
+- (void)simulateMemoryWarning {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidReceiveMemoryWarningNotification object:UIApplication.sharedApplication];
+        SEL memSel = sel_registerName("_performMemoryWarning");
+        if ([UIApplication.sharedApplication respondsToSelector:memSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, memSel);
+        }
+    });
+    [self appendLogStream:@"debug" level:@"notice" subsystem:@"LiveContainer" category:@"memory" text:@"Simulated UIApplication memory warning"];
+}
 
 - (void)setXRayEnabled:(BOOL)enabled {
     self.xrayEnabled = enabled;
@@ -3069,7 +3454,7 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
     win.windowLevel = UIWindowLevelAlert + 50;
     win.backgroundColor = UIColor.clearColor;
 
-    UIViewController *rootVC = [[UIViewController alloc] init];
+    LCDebugOverlayRootViewController *rootVC = [[LCDebugOverlayRootViewController alloc] init];
     rootVC.view.backgroundColor = UIColor.clearColor;
 
     UIView *pillContainer = [[UIView alloc] initWithFrame:CGRectMake(16, 62, 168, 34)];
@@ -3106,35 +3491,31 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
     [pillContainer addGestureRecognizer:tap];
 
     [rootVC.view addSubview:pillContainer];
+    rootVC.pillContainer = pillContainer;
     win.rootViewController = rootVC;
     win.pillContainer = pillContainer;
     win.statusLabel = lbl;
     win.hidden = NO;
     self.overlayWindow = win;
+    [rootVC clampPillToSafeArea];
 }
 
 - (void)handleOverlayPillPan:(UIPanGestureRecognizer *)pan {
     UIView *pill = self.overlayWindow.pillContainer;
-    UIView *host = self.overlayWindow.rootViewController.view;
+    LCDebugOverlayRootViewController *rootVC = [self.overlayWindow.rootViewController isKindOfClass:LCDebugOverlayRootViewController.class]
+        ? (LCDebugOverlayRootViewController *)self.overlayWindow.rootViewController
+        : nil;
+    UIView *host = rootVC.view;
     if (!pill || !host) return;
     CGPoint t = [pan translationInView:host];
-    CGPoint next = CGPointMake(pill.center.x + t.x, pill.center.y + t.y);
-    CGRect bounds = host.bounds;
-    CGFloat halfW = pill.bounds.size.width * 0.5 + 8;
-    CGFloat halfH = pill.bounds.size.height * 0.5 + 8;
-    next.x = MAX(halfW, MIN(bounds.size.width - halfW, next.x));
-    next.y = MAX(halfH + 36, MIN(bounds.size.height - halfH, next.y));
-    pill.center = next;
+    pill.center = CGPointMake(pill.center.x + t.x, pill.center.y + t.y);
+    [rootVC clampPillToSafeArea];
     [pan setTranslation:CGPointZero inView:host];
 }
 
 - (void)handleOverlayPillTap {
-    if (!self.overlayWindow || self.overlayWindow.isPresentingDrawer) return;
+    if (!self.overlayWindow || self.overlayWindow.rootViewController.presentedViewController != nil) return;
     LCDebugInAppDrawerViewController *drawer = [[LCDebugInAppDrawerViewController alloc] init];
-    __weak typeof(self) weakSelf = self;
-    drawer.onDismiss = ^{
-        weakSelf.overlayWindow.isPresentingDrawer = NO;
-    };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:drawer];
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -3145,7 +3526,6 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
         ];
         nav.sheetPresentationController.prefersGrabberVisible = YES;
     }
-    self.overlayWindow.isPresentingDrawer = YES;
     [self.overlayWindow.rootViewController presentViewController:nav animated:YES completion:nil];
 }
 

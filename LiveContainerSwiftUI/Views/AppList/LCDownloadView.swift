@@ -653,10 +653,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
 
     @MainActor
     public func activeTask(forBundleId bundleId: String) -> LCDownloadTaskItem? {
-        items.first { item in
-            guard item.state.isActive else { return false }
-            return item.targetBundleId == bundleId
-        }
+        activeTask(forTargetId: bundleId)
     }
 
     @MainActor
@@ -677,16 +674,37 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         targetRelativePath: String? = nil,
         ignoreUpdateKeyAfterInstall: String? = nil
     ) -> LCDownloadTaskItem {
-        if let existing = items.first(where: { $0.url == url && $0.state.isActive }) {
+        let targetId = targetRelativePath ?? targetAppBundleId
+        let matchingKeys = Set([targetRelativePath, targetAppBundleId].compactMap { value -> String? in
+            guard let value, !value.isEmpty else { return nil }
+            return value
+        })
+
+        // Deduplicate by (url, targetId) so updating two clones with the same IPA URL does not collide.
+        if let idx = items.firstIndex(where: { $0.url == url && $0.targetBundleId == targetId && $0.state.isActive }) {
+            if let ignoreUpdateKeyAfterInstall,
+               case let .ipa(sURL, ver, build, tId, existingIgnore) = items[idx].kind,
+               existingIgnore != ignoreUpdateKeyAfterInstall {
+                items[idx].kind = .ipa(
+                    sourceURL: sURL,
+                    version: ver,
+                    buildVersion: build,
+                    targetAppBundleId: tId,
+                    ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall
+                )
+                persistQueue()
+            }
             isPillDismissed = false
-            return existing
+            return items[idx]
         }
 
-        let targetId = targetRelativePath ?? targetAppBundleId
-        // Prevent two different versions of the exact same target app from racing to overwrite each other.
-        if let targetId, !targetId.isEmpty {
-            let conflicting = items.filter {
-                $0.targetBundleId == targetId && $0.url != url && $0.state.isActive
+        // Prevent two different versions (including paused tasks) of the same target app from racing.
+        if !matchingKeys.isEmpty {
+            let conflicting = items.filter { item in
+                guard let existingTarget = item.targetBundleId, matchingKeys.contains(existingTarget) else {
+                    return false
+                }
+                return (item.url != url || existingTarget != targetId) && (item.state.isActive || item.state == .paused)
             }
             for item in conflicting {
                 if case .installing = item.state {
@@ -812,6 +830,10 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
 
     @MainActor
     public func cancel(_ item: LCDownloadTaskItem) {
+        if let live = items.first(where: { $0.id == item.id }), case .installing = live.state {
+            // Do not orphan an in-progress installation while files are being replaced/signed.
+            return
+        }
         if let taskId = item.taskIdentifier {
             backgroundSession.getAllTasks { tasks in
                 tasks.first(where: { $0.taskIdentifier == taskId })?.cancel()
