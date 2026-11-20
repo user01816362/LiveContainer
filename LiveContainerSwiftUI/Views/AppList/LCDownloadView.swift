@@ -10,8 +10,70 @@ import SwiftUI
 import UIKit
 
 public enum LCDownloadKind: Codable, Hashable, Sendable {
-    case ipa(sourceURL: String?, version: String?, buildVersion: String?, targetAppBundleId: String?)
+    case ipa(
+        sourceURL: String?,
+        version: String?,
+        buildVersion: String?,
+        targetAppBundleId: String?,
+        ignoreUpdateKeyAfterInstall: String? = nil
+    )
     case tweak(destinationFolderPath: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case ipa
+        case tweak
+    }
+
+    private enum IPACodingKeys: String, CodingKey {
+        case sourceURL
+        case version
+        case buildVersion
+        case targetAppBundleId
+        case ignoreUpdateKeyAfterInstall
+    }
+
+    private enum TweakCodingKeys: String, CodingKey {
+        case destinationFolderPath
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.ipa) {
+            let nested = try container.nestedContainer(keyedBy: IPACodingKeys.self, forKey: .ipa)
+            self = .ipa(
+                sourceURL: try nested.decodeIfPresent(String.self, forKey: .sourceURL),
+                version: try nested.decodeIfPresent(String.self, forKey: .version),
+                buildVersion: try nested.decodeIfPresent(String.self, forKey: .buildVersion),
+                targetAppBundleId: try nested.decodeIfPresent(String.self, forKey: .targetAppBundleId),
+                ignoreUpdateKeyAfterInstall: try nested.decodeIfPresent(String.self, forKey: .ignoreUpdateKeyAfterInstall)
+            )
+        } else if container.contains(.tweak) {
+            let nested = try container.nestedContainer(keyedBy: TweakCodingKeys.self, forKey: .tweak)
+            self = .tweak(
+                destinationFolderPath: try nested.decode(String.self, forKey: .destinationFolderPath)
+            )
+        } else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Unknown LCDownloadKind case")
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .ipa(sourceURL, version, buildVersion, targetAppBundleId, ignoreUpdateKeyAfterInstall):
+            var nested = container.nestedContainer(keyedBy: IPACodingKeys.self, forKey: .ipa)
+            try nested.encodeIfPresent(sourceURL, forKey: .sourceURL)
+            try nested.encodeIfPresent(version, forKey: .version)
+            try nested.encodeIfPresent(buildVersion, forKey: .buildVersion)
+            try nested.encodeIfPresent(targetAppBundleId, forKey: .targetAppBundleId)
+            try nested.encodeIfPresent(ignoreUpdateKeyAfterInstall, forKey: .ignoreUpdateKeyAfterInstall)
+        case let .tweak(destinationFolderPath):
+            var nested = container.nestedContainer(keyedBy: TweakCodingKeys.self, forKey: .tweak)
+            try nested.encode(destinationFolderPath, forKey: .destinationFolderPath)
+        }
+    }
 }
 
 public struct LCDownloadTaskItem: Identifiable, Codable, Hashable, Sendable {
@@ -55,14 +117,14 @@ public struct LCDownloadTaskItem: Identifiable, Codable, Hashable, Sendable {
     public let createdAt: Date
 
     var targetBundleId: String? {
-        if case let .ipa(_, _, _, targetId) = kind {
+        if case let .ipa(_, _, _, targetId, _) = kind {
             return targetId
         }
         return nil
     }
 
     var targetVersion: String? {
-        if case let .ipa(_, version, _, _) = kind {
+        if case let .ipa(_, version, _, _, _) = kind {
             return version
         }
         return nil
@@ -239,6 +301,7 @@ final class LCAppInstaller {
         sourceVersion: String? = nil,
         sourceBuildVersion: String? = nil,
         preferredTargetRelativePath: String? = nil,
+        ignoreUpdateKeyAfterInstall: String? = nil,
         chooseAppToReplace: (@MainActor ([AppReplaceOption]) async -> AppReplaceOption?)? = nil,
         progressHandler: (@MainActor (Double, String) -> Void)? = nil
     ) async throws -> LCAppInstallOutcome {
@@ -351,16 +414,14 @@ final class LCAppInstaller {
         // Abort safely before modifying files if any container of the app to replace is actively running.
         if isReplace, let appToReplace {
             if sharedModel.activeDebugApp == appToReplace {
-                throw "Cannot update \(appToReplace.displayName) while Debug Studio is open. Close Debug Studio and retry."
+                throw "Cannot replace \(appToReplace.displayName) while Debug Studio is open. Close Debug Studio and retry."
             }
             for container in appToReplace.appInfo.containers {
                 if MultitaskManager.isUsing(container: container.folderName) {
-                    throw "Cannot update \(appToReplace.displayName) while it is running in Multitask. Close the app and retry."
+                    throw "Cannot replace \(appToReplace.displayName) while it is running in Multitask. Close the app and retry."
                 }
-            }
-            for runningFolder in LCSharedUtils.getContainerUsingLCScheme(withFolderName: appToReplace.uiDefaultDataFolder ?? "") != nil ? [appToReplace.uiDefaultDataFolder ?? ""] : [] {
-                if !runningFolder.isEmpty {
-                    throw "Cannot update \(appToReplace.displayName) while it is running in another LiveContainer."
+                if LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) != nil {
+                    throw "Cannot replace \(appToReplace.displayName) while it is running in another LiveContainer."
                 }
             }
         }
@@ -381,7 +442,7 @@ final class LCAppInstaller {
         if sourceURL != nil || sourceVersion != nil {
             stagedAppInfo.installedSourceVersion = sourceVersion ?? stagedAppInfo.shortVersion() ?? stagedAppInfo.version()
             stagedAppInfo.installedSourceBuildVersion = sourceBuildVersion ?? stagedAppInfo.buildVersion()
-            stagedAppInfo.ignoredUpdateVersion = nil
+            stagedAppInfo.ignoredUpdateVersion = ignoreUpdateKeyAfterInstall
         }
         stagedAppInfo.installationDate = Date.now
         stagedAppInfo.save()
@@ -583,6 +644,14 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
     }
 
     @MainActor
+    public func activeTask(forTargetId targetId: String) -> LCDownloadTaskItem? {
+        items.first { item in
+            guard item.state.isActive else { return false }
+            return item.targetBundleId == targetId
+        }
+    }
+
+    @MainActor
     public func activeTask(forBundleId bundleId: String) -> LCDownloadTaskItem? {
         items.first { item in
             guard item.state.isActive else { return false }
@@ -605,7 +674,8 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         version: String? = nil,
         buildVersion: String? = nil,
         targetAppBundleId: String? = nil,
-        targetRelativePath: String? = nil
+        targetRelativePath: String? = nil,
+        ignoreUpdateKeyAfterInstall: String? = nil
     ) -> LCDownloadTaskItem {
         if let existing = items.first(where: { $0.url == url && $0.state.isActive }) {
             isPillDismissed = false
@@ -613,12 +683,33 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         }
 
         let targetId = targetRelativePath ?? targetAppBundleId
+        // Prevent two different versions of the exact same target app from racing to overwrite each other.
+        if let targetId, !targetId.isEmpty {
+            let conflicting = items.filter {
+                $0.targetBundleId == targetId && $0.url != url && $0.state.isActive
+            }
+            for item in conflicting {
+                if case .installing = item.state {
+                    // Installation is already writing to disk; keep the in-flight install alive.
+                    isPillDismissed = false
+                    return item
+                }
+                cancel(item)
+            }
+        }
+
         let item = LCDownloadTaskItem(
             id: UUID(),
             url: url,
             displayName: displayName.isEmpty ? url.lastPathComponent : displayName,
             iconURL: iconURL,
-            kind: .ipa(sourceURL: sourceURL, version: version, buildVersion: buildVersion, targetAppBundleId: targetId),
+            kind: .ipa(
+                sourceURL: sourceURL,
+                version: version,
+                buildVersion: buildVersion,
+                targetAppBundleId: targetId,
+                ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall
+            ),
             state: .downloading,
             progress: 0,
             receivedBytes: 0,
@@ -919,7 +1010,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
 
         do {
             switch item.kind {
-            case let .ipa(sourceURL, version, buildVersion, targetAppId):
+            case let .ipa(sourceURL, version, buildVersion, targetAppId, ignoreUpdateKeyAfterInstall):
                 let allApps = DataManager.shared.model.apps + DataManager.shared.model.hiddenApps
                 let targetRelPath = allApps.first {
                     $0.appInfo.relativeBundlePath == targetAppId || $0.appInfo.bundleIdentifier() == targetAppId
@@ -931,6 +1022,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                     sourceVersion: version,
                     sourceBuildVersion: buildVersion,
                     preferredTargetRelativePath: targetRelPath,
+                    ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall,
                     progressHandler: { [weak self] fraction, label in
                         guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == item.id }) else { return }
                         self.items[liveIdx].progress = 0.70 + (fraction * 0.30)

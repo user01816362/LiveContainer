@@ -149,23 +149,36 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         let appInfo = model.appInfo
         var menuChildren: [UIMenuElement] = []
 
-        // Update Menu Section
+        // Update & Version History Menu Section
+        let versionCount = AltStoreSourcesViewModel.shared.availableVersionCount(forBundleId: model.bundleIdentifier)
+        var versionActions: [UIMenuElement] = []
         if let candidate = configuration.updateCandidate {
-            let updateActions = [
-                UIAction(
-                    title: "Update to \(candidate.latestDisplayVersion)",
-                    image: UIImage(systemName: "arrow.down.circle.fill")
-                ) { _ in
-                    AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
-                },
-                UIAction(
-                    title: "Ignore Version \(candidate.latestVersion.version)",
-                    image: UIImage(systemName: "eye.slash")
-                ) { _ in
-                    AltStoreSourcesViewModel.shared.ignoreUpdate(candidate)
-                }
-            ]
-            menuChildren.append(UIMenu(title: "Update Available", options: .displayInline, children: updateActions))
+            versionActions.append(UIAction(
+                title: "Update to \(candidate.latestDisplayVersion)",
+                image: UIImage(systemName: "arrow.down.circle.fill")
+            ) { _ in
+                AltStoreSourcesViewModel.shared.enqueueUpdate(candidate)
+            })
+            versionActions.append(UIAction(
+                title: "Ignore Version \(candidate.latestVersion.version)",
+                image: UIImage(systemName: "eye.slash")
+            ) { _ in
+                AltStoreSourcesViewModel.shared.ignoreUpdate(candidate)
+            })
+        }
+        if versionCount > 0 || configuration.updateCandidate != nil || appInfo.ignoredUpdateVersion != nil {
+            let versionsAction = UIAction(
+                title: "Versions…",
+                subtitle: versionCount > 0 ? "\(versionCount) available" : nil,
+                image: UIImage(systemName: "clock.arrow.circlepath")
+            ) { [weak self] _ in
+                self?.openVersionHistory()
+            }
+            versionActions.append(versionsAction)
+        }
+        if !versionActions.isEmpty {
+            let sectionTitle = configuration.updateCandidate != nil ? "Update Available" : ""
+            menuChildren.append(UIMenu(title: sectionTitle, options: .displayInline, children: versionActions))
         }
 
         // 1. Containers Picker (Equivalent to a Menu with single selection)
@@ -319,6 +332,19 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
 
     private func openSettings() {
         delegate.openNavigationView(view: AnyView(LCAppSettingsView(model: configuration.model)))
+    }
+
+    private func openVersionHistory() {
+        guard presentedViewController == nil else {
+            return
+        }
+        let target = LCVersionHistoryTarget(app: configuration.model)
+        let rootView = LCAppVersionsView(target: target, isPresentedAsSheet: true)
+            .environmentObject(DataManager.shared.model)
+            .environmentObject(LCDownloadManager.shared)
+        let controller = UIHostingController(rootView: rootView)
+        controller.modalPresentationStyle = .formSheet
+        present(controller, animated: true)
     }
 
     private func openDataFolder() {

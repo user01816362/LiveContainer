@@ -66,6 +66,7 @@ struct LCAppSettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .textSelection(.enabled)
                 }
+                LCAppSettingsVersionRow(model: model)
                 HStack {
                     Text("lc.appSettings.remark".loc)
                     Spacer()
