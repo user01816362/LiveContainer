@@ -465,7 +465,7 @@ struct LCHexPageViewer: View {
                     offset: off,
                     pageSize: size
                 )
-                return (p, LCHexPageViewer.formatHexDump(data: p.data, baseOffset: p.offset))
+                return (p, LCFileExplorerService.formatHexDump(data: p.data, baseOffset: p.offset))
             }
             if !Task.isCancelled {
                 page = loaded
@@ -478,39 +478,5 @@ struct LCHexPageViewer: View {
                 isLoading = false
             }
         }
-    }
-
-    static func formatHexDump(data: Data, baseOffset: UInt64) -> String {
-        guard !data.isEmpty else { return "(Empty file)" }
-        let bytesPerLine = 16
-        var lines: [String] = []
-        lines.reserveCapacity((data.count + bytesPerLine - 1) / bytesPerLine)
-
-        data.withUnsafeBytes { raw in
-            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            var idx = 0
-            while idx < data.count {
-                let rowLen = min(bytesPerLine, data.count - idx)
-                var hexPart = ""
-                hexPart.reserveCapacity(bytesPerLine * 3 + 1)
-                var asciiPart = ""
-                asciiPart.reserveCapacity(bytesPerLine)
-
-                for col in 0..<bytesPerLine {
-                    if col == 8 { hexPart.append(" ") }
-                    if col < rowLen {
-                        let b = ptr[idx + col]
-                        hexPart.append(String(format: "%02X ", b))
-                        asciiPart.append((b >= 0x20 && b <= 0x7E) ? Character(UnicodeScalar(b)) : ".")
-                    } else {
-                        hexPart.append("   ")
-                        asciiPart.append(" ")
-                    }
-                }
-                lines.append(String(format: "%08llX  %@ |%@|", baseOffset + UInt64(idx), hexPart, asciiPart))
-                idx += bytesPerLine
-            }
-        }
-        return lines.joined(separator: "\n")
     }
 }
