@@ -725,6 +725,9 @@ final class LCDebugStudioManager {
                 networkStore.settings.paused = np
             }
         }
+        if let nr = status.networkRedactSensitive, networkStore.settings.redactSensitive != nr {
+            networkStore.settings.redactSensitive = nr
+        }
         if let sv = status.selectedView, sv != lastStatusSelectedView {
             lastStatusSelectedView = sv
             inspectorStore.selectedView = sv
@@ -792,6 +795,16 @@ final class LCDebugStudioManager {
         await refreshStatusOnly()
     }
 
+    func setNetworkRedactSensitive(_ redact: Bool) async {
+        networkStore.settings.redactSensitive = redact
+        await postAction([
+            "action": "set_network_settings",
+            "redactSensitive": redact,
+            "redactExports": redact
+        ])
+        await refreshStatusOnly()
+    }
+
     func loadNetworkSettings() async {
         guard let base = baseURL else { return }
         if let cfg: LCDebugNetworkSettings = await fetchJSON(url: base.appendingPathComponent("api/network/settings")) {
@@ -809,7 +822,8 @@ final class LCDebugStudioManager {
             "cacheMediaBodies": settings.cacheMediaBodies,
             "cacheLimitMB": settings.cacheLimitMB,
             "maxTransactions": settings.maxTransactions,
-            "redactExports": settings.redactExports,
+            "redactSensitive": settings.redactSensitive,
+            "redactExports": settings.redactSensitive,
             "excludedHosts": settings.excludedHosts
         ]
         await postAction(dict)

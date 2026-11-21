@@ -1121,8 +1121,9 @@ static void LCApplyXRayToView(UIView *view, BOOL enabled) {
     NSString *detailText = nil;
     if (tab == 1) {
         NSString *txId = row[@"id"] ?: @"";
-        NSDictionary *reqFull = txId.length > 0 ? [LCDebugNetworkEngine.shared bodyPayloadForTransactionId:txId part:@"request" redact:NO] : nil;
-        NSDictionary *respFull = txId.length > 0 ? [LCDebugNetworkEngine.shared bodyPayloadForTransactionId:txId part:@"response" redact:NO] : nil;
+        BOOL redact = LCDebugNetworkEngine.shared.redactSensitive;
+        NSDictionary *reqFull = txId.length > 0 ? [LCDebugNetworkEngine.shared bodyPayloadForTransactionId:txId part:@"request" redact:redact] : nil;
+        NSDictionary *respFull = txId.length > 0 ? [LCDebugNetworkEngine.shared bodyPayloadForTransactionId:txId part:@"response" redact:redact] : nil;
         NSString *reqText = ([reqFull[@"text"] length] > 0) ? reqFull[@"text"] : (row[@"requestBodyPreview"] ?: @"");
         NSString *respText = ([respFull[@"text"] length] > 0) ? respFull[@"text"] : (([respFull[@"hexPreview"] length] > 0) ? respFull[@"hexPreview"] : (row[@"responseBodyPreview"] ?: @""));
         if (respText.length > 4000) {
@@ -1239,11 +1240,12 @@ static NSString *LCDebugWebConsoleHTML(void) {
     "<div class='pills' style='margin-bottom:10px'>"
     "<input class='search' style='margin:0;flex:1' id='netFilter' placeholder='Filter URL, host, method, status, MIME...' oninput='renderNets()'/>"
     "<button class='btn on' id='b-net-pause' onclick='toggleNetPause()'>Capture ON</button>"
+    "<button class='btn on' id='b-net-redact' onclick='toggleNetRedact()'>Real Data (No Redact)</button>"
     "<button class='btn' onclick=\"setNetScope('all',this)\">All</button>"
     "<button class='btn' onclick=\"setNetScope('err',this)\">Errors</button>"
     "<button class='btn' onclick=\"setNetScope('gql',this)\">GQL</button>"
     "<button class='btn' onclick=\"setNetScope('ws',this)\">WS</button>"
-    "<a class='btn' style='text-decoration:none' href='/api/network/har' target='_blank'>Export HAR</a>"
+    "<a class='btn' id='a-net-har' style='text-decoration:none' href='/api/network/har?redact=0' target='_blank'>Export HAR</a>"
     "<button class='btn' onclick=\"act('clear_network')\">Clear</button>"
     "</div>"
     "<div class='pill' id='netStats' style='margin-bottom:10px;display:inline-block'>0 requests</div>"
@@ -1256,16 +1258,17 @@ static NSString *LCDebugWebConsoleHTML(void) {
     "<div id='frida' class='panel'><div class='logbox' id='fbox'>Loading...</div></div>"
     "</main>"
     "<script>"
-    "let logs=[],nets=[],evs=[],netScope='all',netPaused=false;"
+    "let logs=[],nets=[],evs=[],netScope='all',netPaused=false,netRedact=false;"
     "function showTab(id,el){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');el.classList.add('active');}"
     "function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
     "function fmtBytes(b){b=Number(b||0);if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(2)+' MB';}"
     "function setNetScope(s,btn){netScope=s;renderNets();}"
     "function upsertNet(n){const i=nets.findIndex(x=>x.id===n.id);if(i>=0){nets[i]=n;}else{nets.unshift(n);if(nets.length>1000)nets.pop();}renderNets();}"
     "function renderSelectedView(v){if(!v)return;let b=document.getElementById('tapbanner');b.style.display='block';b.innerHTML='<strong>Inspected View:</strong> <code>'+esc(v.class)+'</code> | VC: <code>'+esc(v.viewController||'-')+'</code> | '+esc(v.frame);}"
-    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT-Less';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);document.getElementById('b-notif').classList.toggle('on',!!s.notificationMonitorEnabled);netPaused=!!s.networkPaused;const np=document.getElementById('b-net-pause');if(np){np.textContent=netPaused?'Capture Paused':'Capture ON';np.classList.toggle('on',!netPaused);}if(s.selectedView)renderSelectedView(s.selectedView);}"
+    "function applyStatus(s){document.getElementById('title').textContent=s.bundleId||'LiveContainer';document.getElementById('p-pid').textContent='PID '+s.pid;document.getElementById('p-cpu').textContent='CPU '+(s.cpuPercent||0).toFixed(1)+'%';document.getElementById('p-ram').textContent='RAM '+(s.memoryMB||0).toFixed(1)+' MB';document.getElementById('p-fps').textContent=(s.fps||0)+' FPS';document.getElementById('p-jit').textContent=s.isJIT?'JIT ON':'JIT-Less';document.getElementById('b-xray').classList.toggle('on',!!s.xrayEnabled);document.getElementById('b-tap').classList.toggle('on',!!s.tapInspectEnabled);document.getElementById('b-notif').classList.toggle('on',!!s.notificationMonitorEnabled);netPaused=!!s.networkPaused;const np=document.getElementById('b-net-pause');if(np){np.textContent=netPaused?'Capture Paused':'Capture ON';np.classList.toggle('on',!netPaused);}if(typeof s.networkRedactSensitive==='boolean'){netRedact=s.networkRedactSensitive;const nr=document.getElementById('b-net-redact');if(nr){nr.textContent=netRedact?'Redact ON':'Real Data (No Redact)';nr.classList.toggle('on',!netRedact);}const har=document.getElementById('a-net-har');if(har){har.href='/api/network/har?redact='+(netRedact?'1':'0');}}if(s.selectedView)renderSelectedView(s.selectedView);}"
     "async function toggleNetPause(){await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'set_network_paused',paused:!netPaused})});applyStatus(await(await fetch('/api/status')).json());}"
-    "async function loadFullNetBody(id,el){if(el.dataset.loaded)return;el.dataset.loaded='1';const [rq,rs]=await Promise.all([fetch('/api/network/body?id='+encodeURIComponent(id)+'&part=request').then(r=>r.json()),fetch('/api/network/body?id='+encodeURIComponent(id)+'&part=response').then(r=>r.json())]);const n=nets.find(x=>x.id===id)||{};let rqTxt=rq.text||rq.hexPreview||n.requestBodyPreview||'';let rsTxt=rs.text||rs.hexPreview||n.responseBodyPreview||'';try{if(rqTxt.trim().startsWith('{')||rqTxt.trim().startsWith('['))rqTxt=JSON.stringify(JSON.parse(rqTxt),null,2);}catch(e){}try{if(rsTxt.trim().startsWith('{')||rsTxt.trim().startsWith('['))rsTxt=JSON.stringify(JSON.parse(rsTxt),null,2);}catch(e){}let imgHtml=(rs.isImage&&rs.base64)?'<div style=\"margin:8px 0\"><img style=\"max-width:260px;max-height:220px;border-radius:8px;border:1px solid var(--b)\" src=\"data:'+(rs.mimeType||'image/png')+';base64,'+rs.base64+'\"/></div>':'';const m=n.metrics?('\\nMetrics: DNS '+n.metrics.dnsMs+'ms · TCP '+n.metrics.connectMs+'ms · TLS '+n.metrics.tlsMs+'ms · Wait '+n.metrics.waitMs+'ms · DL '+n.metrics.responseMs+'ms · '+(n.metrics.protocolName||'-')+' '+(n.metrics.remoteAddress||'')):'';el.querySelector('pre').textContent=(n.curl||'')+m+'\\n\\nRequest Headers:\\n'+JSON.stringify(n.requestHeaders||{},null,2)+'\\n\\nResponse Headers:\\n'+JSON.stringify(n.responseHeaders||{},null,2)+'\\n\\nRequest Body ('+rq.byteCount+' B):\\n'+rqTxt+'\\n\\nResponse ('+rs.byteCount+' B):\\n'+rsTxt;if(imgHtml){el.insertAdjacentHTML('beforeend',imgHtml);}}"
+    "async function toggleNetRedact(){await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'set_network_settings',redactSensitive:!netRedact})});applyStatus(await(await fetch('/api/status')).json());renderNets();}"
+    "async function loadFullNetBody(id,el){if(el.dataset.loaded)return;el.dataset.loaded='1';const rFlag=netRedact?'1':'0';const [rq,rs]=await Promise.all([fetch('/api/network/body?id='+encodeURIComponent(id)+'&part=request&redact='+rFlag).then(r=>r.json()),fetch('/api/network/body?id='+encodeURIComponent(id)+'&part=response&redact='+rFlag).then(r=>r.json())]);const n=nets.find(x=>x.id===id)||{};let rqTxt=rq.text||rq.hexPreview||n.requestBodyPreview||'';let rsTxt=rs.text||rs.hexPreview||n.responseBodyPreview||'';try{if(rqTxt.trim().startsWith('{')||rqTxt.trim().startsWith('['))rqTxt=JSON.stringify(JSON.parse(rqTxt),null,2);}catch(e){}try{if(rsTxt.trim().startsWith('{')||rsTxt.trim().startsWith('['))rsTxt=JSON.stringify(JSON.parse(rsTxt),null,2);}catch(e){}let imgHtml=(rs.isImage&&rs.base64)?'<div style=\"margin:8px 0\"><img style=\"max-width:260px;max-height:220px;border-radius:8px;border:1px solid var(--b)\" src=\"data:'+(rs.mimeType||'image/png')+';base64,'+rs.base64+'\"/></div>':'';const m=n.metrics?('\\nMetrics: DNS '+n.metrics.dnsMs+'ms · TCP '+n.metrics.connectMs+'ms · TLS '+n.metrics.tlsMs+'ms · Wait '+n.metrics.waitMs+'ms · DL '+n.metrics.responseMs+'ms · '+(n.metrics.protocolName||'-')+' '+(n.metrics.remoteAddress||'')):'';const reqH=rq.requestHeaders||n.requestHeaders||{};const respH=rs.responseHeaders||n.responseHeaders||{};const curlStr=rs.curl||rq.curl||n.curl||'';el.querySelector('pre').textContent=curlStr+m+'\\n\\nRequest Headers:\\n'+JSON.stringify(reqH,null,2)+'\\n\\nResponse Headers:\\n'+JSON.stringify(respH,null,2)+'\\n\\nRequest Body ('+rq.byteCount+' B):\\n'+rqTxt+'\\n\\nResponse ('+rs.byteCount+' B):\\n'+rsTxt;if(imgHtml){el.insertAdjacentHTML('beforeend',imgHtml);}}"
     "async function replayNet(id){const n=nets.find(x=>x.id===id);if(!n)return;await fetch('/api/network/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:n.id,method:n.method,url:n.url,headers:n.requestHeaders||{}})});}"
     "function copyCurl(id){const n=nets.find(x=>x.id===id);if(n&&n.curl&&navigator.clipboard){navigator.clipboard.writeText(n.curl);}}"
     "function renderLogs(){let q=document.getElementById('logFilter').value.toLowerCase();let el=document.getElementById('logbox');el.textContent=logs.filter(l=>!q||(l.text||'').toLowerCase().includes(q)||(l.stream||'').toLowerCase().includes(q)||(l.subsystem||'').toLowerCase().includes(q)).map(l=>'['+l.stream+(l.subsystem?':'+l.subsystem:'')+'] '+l.text).join('\\n');el.scrollTop=el.scrollHeight;}"
@@ -2383,7 +2386,7 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
     if ([path isEqualToString:@"/api/network/body"]) {
         NSString *txId = nil;
         NSString *part = @"response";
-        BOOL redact = LCDebugNetworkEngine.shared.redactExports;
+        BOOL redact = LCDebugNetworkEngine.shared.redactSensitive;
         for (NSURLQueryItem *qi in comp.queryItems) {
             if ([qi.name isEqualToString:@"id"]) txId = qi.value;
             if ([qi.name isEqualToString:@"part"] && qi.value.length > 0) part = qi.value;
@@ -2395,7 +2398,7 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
     }
 
     if ([path isEqualToString:@"/api/network/har"]) {
-        BOOL redact = LCDebugNetworkEngine.shared.redactExports;
+        BOOL redact = LCDebugNetworkEngine.shared.redactSensitive;
         for (NSURLQueryItem *qi in comp.queryItems) {
             if ([qi.name isEqualToString:@"redact"] && qi.value.length > 0) redact = [qi.value boolValue];
         }
@@ -2756,23 +2759,44 @@ static NSDictionary *LCSerializeViewNode(UIView *view, NSInteger depth, NSIntege
 
     NSDictionary *defaultsDict = LCSanitizeJSONValue([NSUserDefaults.standardUserDefaults dictionaryRepresentation] ?: @{});
 
+    BOOL redactSensitive = LCDebugNetworkEngine.shared.redactSensitive;
     NSMutableArray *keychainItems = [NSMutableArray array];
     for (id secClass in @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword]) {
-        NSDictionary *query = @{
+        NSMutableDictionary *query = [@{
             (__bridge id)kSecClass: secClass,
             (__bridge id)kSecReturnAttributes: @YES,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-        };
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecUseAuthenticationUI: (__bridge id)kSecUseAuthenticationUISkip
+        } mutableCopy];
+        if (!redactSensitive) {
+            query[(__bridge id)kSecReturnData] = @YES;
+        }
         CFTypeRef resultRef = NULL;
-        if (SecItemCopyMatching((__bridge CFDictionaryRef)query, &resultRef) == errSecSuccess && resultRef) {
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &resultRef);
+        if (st != errSecSuccess && !redactSensitive) {
+            [query removeObjectForKey:(__bridge id)kSecReturnData];
+            st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &resultRef);
+        }
+        if (st == errSecSuccess && resultRef) {
             NSArray *items = CFBridgingRelease(resultRef);
             if ([items isKindOfClass:NSArray.class]) {
                 for (NSDictionary *item in items) {
                     if (keychainItems.count >= 80) break;
+                    NSString *valStr = redactSensitive ? @"<Redacted — disable Redact Sensitive Data to view>" : @"";
+                    if (!redactSensitive) {
+                        NSData *vData = [item[(__bridge id)kSecValueData] isKindOfClass:NSData.class] ? item[(__bridge id)kSecValueData] : nil;
+                        if (vData.length > 0) {
+                            NSString *utf8 = [[NSString alloc] initWithData:vData encoding:NSUTF8StringEncoding];
+                            valStr = (utf8 && [utf8 rangeOfString:@"\0"].location == NSNotFound)
+                                ? utf8
+                                : LCDebugFormatHexPreview(vData, 512);
+                        }
+                    }
                     [keychainItems addObject:@{
                         @"account": item[(__bridge id)kSecAttrAccount] ?: @"",
                         @"service": item[(__bridge id)kSecAttrService] ?: item[(__bridge id)kSecAttrServer] ?: @"",
-                        @"accessGroup": item[(__bridge id)kSecAttrAccessGroup] ?: @""
+                        @"accessGroup": item[(__bridge id)kSecAttrAccessGroup] ?: @"",
+                        @"value": valStr ?: @""
                     }];
                 }
             }

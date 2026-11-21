@@ -21,6 +21,7 @@ static NSString *const kLCNetDefaultsPausedKey = @"LCDebugNetworkPaused";
 static NSString *const kLCNetDefaultsMediaKey = @"LCDebugNetworkCacheMedia";
 static NSString *const kLCNetDefaultsCacheLimitMBKey = @"LCDebugNetworkCacheLimitMB";
 static NSString *const kLCNetDefaultsMaxRowsKey = @"LCDebugNetworkMaxRows";
+static NSString *const kLCNetDefaultsRedactSensitiveKey = @"LCDebugNetworkRedactSensitive";
 static NSString *const kLCNetDefaultsRedactKey = @"LCDebugNetworkRedactExports";
 static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcludedHosts";
 
@@ -71,7 +72,12 @@ static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcluded
         NSInteger savedMaxRows = [defaults integerForKey:kLCNetDefaultsMaxRowsKey];
         _maxTransactions = (savedMaxRows >= 100 && savedMaxRows <= 2000) ? savedMaxRows : 500;
 
-        _redactExports = [defaults boolForKey:kLCNetDefaultsRedactKey];
+        if ([defaults objectForKey:kLCNetDefaultsRedactSensitiveKey] != nil) {
+            _redactSensitive = [defaults boolForKey:kLCNetDefaultsRedactSensitiveKey];
+        } else {
+            _redactSensitive = NO;
+        }
+        _redactExports = _redactSensitive;
 
         NSArray<NSString *> *savedHosts = [defaults stringArrayForKey:kLCNetDefaultsExcludedHostsKey];
         _excludedHosts = [NSMutableSet set];
@@ -149,9 +155,15 @@ static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcluded
     os_unfair_lock_unlock(&_storeLock);
 }
 
+- (void)setRedactSensitive:(BOOL)redactSensitive {
+    _redactSensitive = redactSensitive;
+    _redactExports = redactSensitive;
+    [NSUserDefaults.standardUserDefaults setBool:redactSensitive forKey:kLCNetDefaultsRedactSensitiveKey];
+    [NSUserDefaults.standardUserDefaults setBool:redactSensitive forKey:kLCNetDefaultsRedactKey];
+}
+
 - (void)setRedactExports:(BOOL)redactExports {
-    _redactExports = redactExports;
-    [NSUserDefaults.standardUserDefaults setBool:redactExports forKey:kLCNetDefaultsRedactKey];
+    [self setRedactSensitive:redactExports];
 }
 
 - (NSDictionary<NSString *, id> *)settingsDictionary {
@@ -160,7 +172,8 @@ static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcluded
         @"cacheMediaBodies": @(self.cacheMediaBodies),
         @"cacheLimitMB": @(self.cacheLimitMB),
         @"maxTransactions": @(self.maxTransactions),
-        @"redactExports": @(self.redactExports),
+        @"redactSensitive": @(self.redactSensitive),
+        @"redactExports": @(self.redactSensitive),
         @"excludedHosts": [self excludedHostsSnapshot]
     };
 }
@@ -179,8 +192,10 @@ static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcluded
     if (updates[@"maxTransactions"] != nil) {
         self.maxTransactions = [updates[@"maxTransactions"] integerValue];
     }
-    if (updates[@"redactExports"] != nil) {
-        self.redactExports = [updates[@"redactExports"] boolValue];
+    if (updates[@"redactSensitive"] != nil) {
+        self.redactSensitive = [updates[@"redactSensitive"] boolValue];
+    } else if (updates[@"redactExports"] != nil) {
+        self.redactSensitive = [updates[@"redactExports"] boolValue];
     }
     if ([updates[@"excludedHosts"] isKindOfClass:NSArray.class]) {
         os_unfair_lock_lock(&_storeLock);
@@ -279,6 +294,7 @@ static NSString *const kLCNetDefaultsExcludedHostsKey = @"LCDebugNetworkExcluded
     os_unfair_lock_unlock(&_storeLock);
     return @{
         @"networkPaused": @(self.isRecordingPaused),
+        @"networkRedactSensitive": @(self.redactSensitive),
         @"networkCount": @(count),
         @"networkErrorCount": @(errCount),
         @"networkInFlightCount": @(inFlight),

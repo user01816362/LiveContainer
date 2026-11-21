@@ -21,10 +21,14 @@ struct LCDebugNetworkSettingsSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Capture") {
+                Section {
                     Toggle("Capture Network Traffic", isOn: $draft.isCaptureEnabled)
                     Toggle("Cache Image Responses", isOn: $draft.cacheMediaBodies)
-                    Toggle("Redact Sensitive Headers on Export", isOn: $draft.redactExports)
+                    Toggle("Redact Sensitive Data (Headers & Tokens)", isOn: $draft.redactSensitive)
+                } header: {
+                    Text("Capture & Developer Privacy")
+                } footer: {
+                    Text("Redaction is disabled by default so real Authorization headers, Cookies, API keys, cURL commands, and Keychain values are shown in full during development.")
                 }
 
                 Section("Limits") {

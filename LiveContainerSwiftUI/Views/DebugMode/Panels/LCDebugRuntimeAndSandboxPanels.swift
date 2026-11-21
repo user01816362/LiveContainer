@@ -399,18 +399,30 @@ struct LCDebugSandboxPanel: View {
 
                     case .keychain:
                         let kc = q.isEmpty ? summary.keychainItems : summary.keychainItems.filter {
-                            $0.service.localizedCaseInsensitiveContains(q) || $0.account.localizedCaseInsensitiveContains(q)
+                            $0.service.localizedCaseInsensitiveContains(q)
+                                || $0.account.localizedCaseInsensitiveContains(q)
+                                || $0.value.localizedCaseInsensitiveContains(q)
                         }
                         ForEach(kc) { item in
                             Button {
+                                var detail = "Service: \(item.service)\nAccount: \(item.account)\nAccess Group: \(item.accessGroup)"
+                                if !item.value.isEmpty {
+                                    detail += "\n\nValue:\n\(item.value)"
+                                }
                                 inspectedItem = LCSandboxInspectItem(
                                     title: item.service.isEmpty ? item.account : item.service,
-                                    value: "Service: \(item.service)\nAccount: \(item.account)\nAccess Group: \(item.accessGroup)"
+                                    value: detail
                                 )
                             } label: {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("\(item.service) · \(item.account)")
                                         .font(.caption2.bold().monospaced())
+                                    if !item.value.isEmpty {
+                                        Text(item.value)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(.cyan)
+                                            .lineLimit(1)
+                                    }
                                     if !item.accessGroup.isEmpty {
                                         Text(item.accessGroup)
                                             .font(.system(size: 9, design: .monospaced))

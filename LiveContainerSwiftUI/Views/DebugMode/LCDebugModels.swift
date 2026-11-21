@@ -175,8 +175,13 @@ struct LCDebugNetworkSettings: Codable, Equatable, Sendable {
     var cacheMediaBodies: Bool
     var cacheLimitMB: Int
     var maxTransactions: Int
-    var redactExports: Bool
+    var redactSensitive: Bool
     var excludedHosts: [String]
+
+    var redactExports: Bool {
+        get { redactSensitive }
+        set { redactSensitive = newValue }
+    }
 
     var isCaptureEnabled: Bool {
         get { !paused }
@@ -188,12 +193,63 @@ struct LCDebugNetworkSettings: Codable, Equatable, Sendable {
         set { cacheLimitMB = Int(newValue.rounded()) }
     }
 
+    enum CodingKeys: String, CodingKey {
+        case paused
+        case cacheMediaBodies
+        case cacheLimitMB
+        case maxTransactions
+        case redactSensitive
+        case redactExports
+        case excludedHosts
+    }
+
+    init(
+        paused: Bool,
+        cacheMediaBodies: Bool,
+        cacheLimitMB: Int,
+        maxTransactions: Int,
+        redactSensitive: Bool = false,
+        excludedHosts: [String]
+    ) {
+        self.paused = paused
+        self.cacheMediaBodies = cacheMediaBodies
+        self.cacheLimitMB = cacheLimitMB
+        self.maxTransactions = maxTransactions
+        self.redactSensitive = redactSensitive
+        self.excludedHosts = excludedHosts
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        paused = (try? c.decode(Bool.self, forKey: .paused)) ?? false
+        cacheMediaBodies = (try? c.decode(Bool.self, forKey: .cacheMediaBodies)) ?? true
+        cacheLimitMB = (try? c.decode(Int.self, forKey: .cacheLimitMB)) ?? 16
+        maxTransactions = (try? c.decode(Int.self, forKey: .maxTransactions)) ?? 500
+        if let rs = try? c.decode(Bool.self, forKey: .redactSensitive) {
+            redactSensitive = rs
+        } else {
+            redactSensitive = (try? c.decode(Bool.self, forKey: .redactExports)) ?? false
+        }
+        excludedHosts = (try? c.decode([String].self, forKey: .excludedHosts)) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(paused, forKey: .paused)
+        try c.encode(cacheMediaBodies, forKey: .cacheMediaBodies)
+        try c.encode(cacheLimitMB, forKey: .cacheLimitMB)
+        try c.encode(maxTransactions, forKey: .maxTransactions)
+        try c.encode(redactSensitive, forKey: .redactSensitive)
+        try c.encode(redactSensitive, forKey: .redactExports)
+        try c.encode(excludedHosts, forKey: .excludedHosts)
+    }
+
     static let `default` = LCDebugNetworkSettings(
         paused: false,
         cacheMediaBodies: true,
         cacheLimitMB: 16,
         maxTransactions: 500,
-        redactExports: false,
+        redactSensitive: false,
         excludedHosts: []
     )
 }
@@ -279,6 +335,7 @@ struct LCDebugStatusSnapshot: Decodable, Sendable {
     let tapInspectEnabled: Bool?
     let notificationMonitorEnabled: Bool?
     let networkPaused: Bool?
+    let networkRedactSensitive: Bool?
     let selectedView: LCDebugSelectedView?
 }
 
@@ -355,12 +412,14 @@ struct LCDebugKeychainItem: Identifiable, Hashable, Equatable, Sendable {
     let account: String
     let service: String
     let accessGroup: String
+    let value: String
 }
 
 private struct LCRawKeychainItem: Decodable, Sendable {
     let account: String
     let service: String
     let accessGroup: String
+    let value: String?
 }
 
 struct LCDebugSandboxSummary: Decodable, Equatable, Sendable {
@@ -389,7 +448,8 @@ struct LCDebugSandboxSummary: Decodable, Equatable, Sendable {
                 id: "\(base)#\(occ)",
                 account: raw.account,
                 service: raw.service,
-                accessGroup: raw.accessGroup
+                accessGroup: raw.accessGroup,
+                value: raw.value ?? ""
             )
         }
 

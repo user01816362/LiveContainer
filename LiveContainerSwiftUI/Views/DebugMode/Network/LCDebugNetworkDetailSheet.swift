@@ -31,12 +31,15 @@ struct LCDebugNetworkDetailSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var selectedSection: LCNetworkDetailSectionTab = .response
-    @State private var redactSensitive = false
     @State private var reqBodyPayload: LCDebugNetworkBodyPayload? = nil
     @State private var respBodyPayload: LCDebugNetworkBodyPayload? = nil
     @State private var isLoadingBodies = false
     @State private var toastMessage: String? = nil
     @State private var localReplayTarget: LCDebugNetworkReplayTarget? = nil
+
+    private var redactSensitive: Bool {
+        manager.networkStore.settings.redactSensitive
+    }
 
     private var liveEntry: LCDebugNetworkEntry {
         if let current = manager.networkStore.selectedTransaction, current.id == entry.id {
@@ -47,13 +50,20 @@ struct LCDebugNetworkDetailSheet: View {
 
     var body: some View {
         let currentEntry = liveEntry
+        let isRedacting = redactSensitive
         NavigationStack {
             VStack(spacing: 0) {
                 LCNetworkHeroHeader(
                     entry: currentEntry,
+                    redactSensitive: isRedacting,
+                    onToggleRedact: {
+                        toggleRedactSensitive()
+                    },
                     onCopyCurl: {
-                        let cmd = respBodyPayload?.curl ?? reqBodyPayload?.curl ?? currentEntry.curl
-                        copyWithToast(cmd, message: "Copied cURL")
+                        let cmd = isRedacting
+                            ? (respBodyPayload?.curl ?? reqBodyPayload?.curl ?? currentEntry.curl)
+                            : currentEntry.curl
+                        copyWithToast(cmd, message: isRedacting ? "Copied Redacted cURL" : "Copied Full cURL")
                     },
                     onReplay: {
                         let initialBody = (reqBodyPayload?.text.isEmpty == false)
@@ -91,7 +101,7 @@ struct LCDebugNetworkDetailSheet: View {
                                 entry: currentEntry,
                                 bodyPayload: reqBodyPayload,
                                 isLoading: isLoadingBodies,
-                                redactSensitive: redactSensitive,
+                                redactSensitive: isRedacting,
                                 onCopy: copyWithToast
                             )
                         case .response:
@@ -99,7 +109,7 @@ struct LCDebugNetworkDetailSheet: View {
                                 entry: currentEntry,
                                 bodyPayload: respBodyPayload,
                                 isLoading: isLoadingBodies,
-                                redactSensitive: redactSensitive,
+                                redactSensitive: isRedacting,
                                 onCopy: copyWithToast
                             )
                         }
@@ -113,12 +123,11 @@ struct LCDebugNetworkDetailSheet: View {
             .toolbar {
                 ToolbarOverflowMenu {
                     Button {
-                        redactSensitive.toggle()
-                        Task { await loadFullBodies() }
+                        toggleRedactSensitive()
                     } label: {
                         Label(
-                            redactSensitive ? "Show Sensitive Headers" : "Redact Sensitive Headers",
-                            systemImage: redactSensitive ? "eye" : "eye.slash"
+                            isRedacting ? "Disable Redaction (Show Real Data)" : "Enable Sensitive Data Redaction",
+                            systemImage: isRedacting ? "eye" : "eye.slash"
                         )
                     }
                     Button {
@@ -153,12 +162,20 @@ struct LCDebugNetworkDetailSheet: View {
                         .padding(.top, 8)
                 }
             }
-            .task(id: "\(currentEntry.id)-\(currentEntry.state ?? "")-\(redactSensitive)") {
+            .task(id: "\(currentEntry.id)-\(currentEntry.state ?? "")-\(isRedacting)") {
                 await loadFullBodies()
             }
             .sheet(item: $localReplayTarget) { target in
                 LCDebugNetworkReplaySheet(initialTarget: target, manager: manager)
             }
+        }
+    }
+
+    private func toggleRedactSensitive() {
+        let next = !redactSensitive
+        Task {
+            await manager.setNetworkRedactSensitive(next)
+            showToast(next ? "Sensitive Redaction ON" : "Redaction OFF (Showing Real Data)")
         }
     }
 
@@ -190,6 +207,8 @@ struct LCDebugNetworkDetailSheet: View {
 
 private struct LCNetworkHeroHeader: View {
     let entry: LCDebugNetworkEntry
+    let redactSensitive: Bool
+    let onToggleRedact: () -> Void
     let onCopyCurl: () -> Void
     let onReplay: () -> Void
 
@@ -217,6 +236,18 @@ private struct LCNetworkHeroHeader: View {
                 }
 
                 Spacer()
+
+                Button {
+                    onToggleRedact()
+                } label: {
+                    Label(
+                        redactSensitive ? "Redacted" : "Real Data",
+                        systemImage: redactSensitive ? "eye.slash" : "eye"
+                    )
+                    .foregroundStyle(redactSensitive ? Color.orange : Color.green)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.mini)
 
                 Button("cURL", systemImage: "terminal", action: onCopyCurl)
                     .buttonStyle(.glass)
@@ -408,7 +439,7 @@ private struct LCNetworkRequestSection: View {
 
     var body: some View {
         let queryPairs = LCDebugFormatting.parseQueryItems(from: entry.url)
-        let headerDict = bodyPayload?.requestHeaders ?? entry.requestHeaders
+        let headerDict = redactSensitive ? (bodyPayload?.requestHeaders ?? entry.requestHeaders) : entry.requestHeaders
         let headerPairs = LCDebugFormatting.sortedHeaderPairs(headerDict)
         let rawBody = (bodyPayload?.text.isEmpty == false) ? (bodyPayload?.text ?? "") : entry.requestBodyPreview
 
@@ -453,7 +484,7 @@ private struct LCNetworkResponseSection: View {
     let onCopy: (String, String) -> Void
 
     var body: some View {
-        let headerDict = bodyPayload?.responseHeaders ?? entry.responseHeaders
+        let headerDict = redactSensitive ? (bodyPayload?.responseHeaders ?? entry.responseHeaders) : entry.responseHeaders
         let headerPairs = LCDebugFormatting.sortedHeaderPairs(headerDict)
 
         VStack(alignment: .leading, spacing: 12) {

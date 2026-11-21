@@ -25,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL cacheMediaBodies;
 @property (nonatomic, assign) NSInteger cacheLimitMB;
 @property (nonatomic, assign) NSInteger maxTransactions;
+@property (nonatomic, assign) BOOL redactSensitive;
 @property (nonatomic, assign) BOOL redactExports;
 @property (nonatomic, readonly) NSUInteger maxSingleBodyBytes;
 

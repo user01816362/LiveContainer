@@ -21,10 +21,21 @@ struct LCDebugNetworkPanelView: View {
             LCDebugNetworkToolbar(
                 searchQuery: $networkStore.searchQuery,
                 isPaused: networkStore.settings.paused,
+                redactSensitive: networkStore.settings.redactSensitive,
                 isExportingHAR: isExportingHAR,
                 hasActiveFilters: hasActiveFilters,
                 onTogglePause: {
                     Task { await manager.setNetworkPaused(!networkStore.settings.paused) }
+                },
+                onToggleRedact: {
+                    let next = !networkStore.settings.redactSensitive
+                    Task {
+                        await manager.setNetworkRedactSensitive(next)
+                        onCopyWithFeedback(
+                            "",
+                            next ? "Sensitive Redaction Enabled" : "Redaction Disabled (Showing Real Data)"
+                        )
+                    }
                 },
                 onOpenSettings: {
                     Task { await manager.loadNetworkSettings() }
@@ -119,9 +130,11 @@ private struct LCDebugShareFileURL: Identifiable {
 private struct LCDebugNetworkToolbar: View {
     @Binding var searchQuery: String
     let isPaused: Bool
+    let redactSensitive: Bool
     let isExportingHAR: Bool
     let hasActiveFilters: Bool
     let onTogglePause: () -> Void
+    let onToggleRedact: () -> Void
     let onOpenSettings: () -> Void
     let onExportHAR: (Bool) -> Void
     let onCopySummary: () -> Void
@@ -164,7 +177,14 @@ private struct LCDebugNetworkToolbar: View {
             .accessibilityLabel(isPaused ? "Resume Network Capture" : "Pause Network Capture")
 
             Menu {
-                Button("Export HAR (.har)", systemImage: "square.and.arrow.up") {
+                Button(
+                    redactSensitive ? "Disable Redaction (Show Real Data)" : "Enable Sensitive Data Redaction",
+                    systemImage: redactSensitive ? "eye" : "eye.slash"
+                ) {
+                    onToggleRedact()
+                }
+                Divider()
+                Button("Export Full HAR (Real Data)", systemImage: "square.and.arrow.up") {
                     onExportHAR(false)
                 }
                 Button("Export Redacted HAR", systemImage: "eye.slash") {
