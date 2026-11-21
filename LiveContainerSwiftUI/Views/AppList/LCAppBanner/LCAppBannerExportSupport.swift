@@ -54,7 +54,7 @@ func lcSanitizeStagedAppBundle(
     if fileManager.fileExists(atPath: lcAppInfoURL.path),
        let lcData = try? Data(contentsOf: lcAppInfoURL),
        let lcDict = try? PropertyListSerialization.propertyList(from: lcData, format: nil) as? [String: Any],
-       (lcDict["doUseLCBundleId"] as? Bool) == true,
+       (lcDict["doUseLCBundleId"] as? NSNumber)?.boolValue == true,
        let originalBundleId = lcDict["LCOrignalBundleIdentifier"] as? String,
        !originalBundleId.isEmpty,
        fileManager.fileExists(atPath: infoPlistURL.path),
@@ -105,14 +105,21 @@ private func lcUnpatchBundleExecutableIfPresent(at bundleURL: URL, fileManager: 
           !execName.isEmpty else {
         return
     }
+    let standardizedRoot = bundleURL.standardizedFileURL.path
+    let rootPrefix = standardizedRoot.hasSuffix("/") ? standardizedRoot : standardizedRoot + "/"
     let execURL = bundleURL.appendingPathComponent(execName)
-    guard fileManager.fileExists(atPath: execURL.path) else {
+    let standardizedExecPath = execURL.standardizedFileURL.path
+    guard standardizedExecPath.hasPrefix(rootPrefix) else {
         return
     }
-    if let err = execURL.path.withCString({ LCUnpatchMachOExecutableAtPath($0) }) {
+    let values = try? execURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+    guard values?.isSymbolicLink != true, values?.isRegularFile == true else {
+        return
+    }
+    if let err = standardizedExecPath.withCString({ LCUnpatchMachOExecutableAtPath($0) }) {
         throw err
     }
-    try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: execURL.path)
+    try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: standardizedExecPath)
 }
 
 func lcListExportableBinaries(bundlePath: String) throws -> [AppBinaryExportItem] {

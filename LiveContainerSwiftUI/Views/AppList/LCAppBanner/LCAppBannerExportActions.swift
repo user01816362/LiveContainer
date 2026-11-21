@@ -369,7 +369,7 @@ extension LCAppBannerViewController {
             }
 
             let fileName = includeData ? "\(appName)-with-data.ipa" : "\(appName).ipa"
-            let exportURL = try lcExportArtifactFileURL(fileName: fileName, fileManager: fm)
+            let exportURL = try Self.makeScopedExportArtifactURL(fileName: fileName, fileManager: fm)
             if let archiveError = LCCreateZipArchive(exportURL.path, mappings) {
                 throw archiveError
             }
@@ -408,7 +408,7 @@ extension LCAppBannerViewController {
                 throw "Selected container path is not a directory."
             }
 
-            let exportURL = try lcExportArtifactFileURL(fileName: "\(appName)-\(containerName)-data.zip", fileManager: fm)
+            let exportURL = try Self.makeScopedExportArtifactURL(fileName: "\(appName)-\(containerName)-data.zip", fileManager: fm)
             let mappings: [[String: Any]] = [[
                 "sourcePath": containerURL.path,
                 "archivePrefix": "",
@@ -444,7 +444,7 @@ extension LCAppBannerViewController {
                 try fm.copyItem(at: item.url, to: destinationURL)
             }
 
-            let archiveURL = try lcExportArtifactFileURL(fileName: "\(appName)-dylibs-frameworks.zip", fileManager: fm)
+            let archiveURL = try Self.makeScopedExportArtifactURL(fileName: "\(appName)-dylibs-frameworks.zip", fileManager: fm)
             let mappings: [[String: Any]] = [[
                 "sourcePath": contentRoot.path,
                 "archivePrefix": "",
@@ -455,6 +455,13 @@ extension LCAppBannerViewController {
             }
             return archiveURL
         }.value
+    }
+
+    nonisolated private static func makeScopedExportArtifactURL(fileName: String, fileManager: FileManager) throws -> URL {
+        let baseDir = try lcEnsureExportArtifactDirectory(fileManager: fileManager)
+        let scopedDir = baseDir.appendingPathComponent("Export-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: scopedDir, withIntermediateDirectories: true)
+        return scopedDir.appendingPathComponent(fileName)
     }
 
     nonisolated private static func readExecutableName(at appBundleURL: URL) -> String? {
@@ -477,7 +484,7 @@ extension LCAppBannerViewController {
             popover.permittedArrowDirections = []
         }
         activityController.completionWithItemsHandler = { _, _, _, _ in
-            try? FileManager.default.removeItem(at: fileURL)
+            try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
         }
         present(activityController, animated: true)
     }
@@ -501,6 +508,6 @@ extension LCAppBannerViewController {
         if cleaned.isEmpty || cleaned == "." || cleaned == ".." {
             return "Export"
         }
-        return cleaned
+        return String(cleaned.prefix(80))
     }
 }

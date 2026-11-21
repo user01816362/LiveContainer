@@ -345,11 +345,11 @@ static NSString *LCWriteArchiveEntry(
         if (!entry) {
             return @"Out of memory allocating archive symlink entry.";
         }
-        archive_entry_set_pathname(entry, archivePath.UTF8String);
+        archive_entry_set_pathname_utf8(entry, archivePath.UTF8String);
         archive_entry_set_filetype(entry, AE_IFLNK);
         archive_entry_set_perm(entry, 0777);
         archive_entry_set_mtime(entry, st.st_mtime, 0);
-        archive_entry_set_symlink(entry, target.UTF8String);
+        archive_entry_set_symlink_utf8(entry, target.UTF8String);
 
         int r = archive_write_header(aw, entry);
         archive_entry_free(entry);
@@ -367,10 +367,10 @@ static NSString *LCWriteArchiveEntry(
         if (archivePath.length == 0) {
             return @"Regular file archive mapping requires a non-empty archive prefix.";
         }
-        int fd = open(cFsPath, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        int fd = open(cFsPath, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             int err = errno;
-            if (err == ENOENT || err == EPERM || err == EACCES) {
+            if (err == ENOENT || err == EPERM || err == EACCES || err == ELOOP) {
                 return nil;
             }
             return [NSString stringWithFormat:@"Failed to open %@: %s", fsPath.lastPathComponent, strerror(err)];
@@ -386,7 +386,7 @@ static NSString *LCWriteArchiveEntry(
             close(fd);
             return @"Out of memory allocating archive file entry.";
         }
-        archive_entry_set_pathname(entry, archivePath.UTF8String);
+        archive_entry_set_pathname_utf8(entry, archivePath.UTF8String);
         archive_entry_set_filetype(entry, AE_IFREG);
         archive_entry_set_perm(entry, fdStat.st_mode & 07777);
         archive_entry_set_size(entry, (la_int64_t)fdStat.st_size);
@@ -419,7 +419,8 @@ static NSString *LCWriteArchiveEntry(
                 }
                 remaining -= (off_t)nRead;
             } else if (nRead == 0) {
-                break;
+                close(fd);
+                return [NSString stringWithFormat:@"File changed size while archiving %@", fsPath.lastPathComponent];
             } else if (errno == EINTR) {
                 continue;
             } else {
@@ -444,7 +445,7 @@ static NSString *LCWriteArchiveEntry(
             if (!entry) {
                 return @"Out of memory allocating archive directory entry.";
             }
-            archive_entry_set_pathname(entry, dirArchivePath.UTF8String);
+            archive_entry_set_pathname_utf8(entry, dirArchivePath.UTF8String);
             archive_entry_set_filetype(entry, AE_IFDIR);
             archive_entry_set_perm(entry, st.st_mode & 07777);
             archive_entry_set_mtime(entry, st.st_mtime, 0);
@@ -460,13 +461,19 @@ static NSString *LCWriteArchiveEntry(
             }
         }
 
-        DIR *dir = opendir(cFsPath);
-        if (!dir) {
+        int dirFD = open(cFsPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dirFD < 0) {
             int err = errno;
-            if (err == ENOENT || err == EPERM || err == EACCES) {
+            if (err == ENOENT || err == EPERM || err == EACCES || err == ELOOP) {
                 return nil;
             }
             return [NSString stringWithFormat:@"Failed to open directory %@: %s", fsPath.lastPathComponent, strerror(err)];
+        }
+        DIR *dir = fdopendir(dirFD);
+        if (!dir) {
+            int err = errno;
+            close(dirFD);
+            return [NSString stringWithFormat:@"Failed to read directory %@: %s", fsPath.lastPathComponent, strerror(err)];
         }
 
         NSMutableArray<NSString *> *childNames = [NSMutableArray array];
@@ -546,6 +553,8 @@ NSString *LCCreateZipArchive(
         errorMessage = [NSString stringWithFormat:@"Failed to configure ZIP format: %s", archive_error_string(aw) ?: "unknown"];
     } else if (archive_write_zip_set_compression_deflate(aw) != ARCHIVE_OK) {
         errorMessage = [NSString stringWithFormat:@"Failed to enable deflate compression: %s", archive_error_string(aw) ?: "unknown"];
+    } else if (archive_write_set_options(aw, "zip:hdrcharset=UTF-8") != ARCHIVE_OK) {
+        errorMessage = [NSString stringWithFormat:@"Failed to set ZIP UTF-8 header charset: %s", archive_error_string(aw) ?: "unknown"];
     } else if (archive_write_open_filename(aw, destinationPath.fileSystemRepresentation) != ARCHIVE_OK) {
         errorMessage = [NSString stringWithFormat:@"Failed to create ZIP at %@: %s", destinationPath.lastPathComponent, archive_error_string(aw) ?: "unknown"];
     }
@@ -583,7 +592,7 @@ NSString *LCCreateZipArchive(
                             errorMessage = @"Out of memory allocating parent directory entry.";
                             break;
                         }
-                        archive_entry_set_pathname(parentEntry, dirPath.UTF8String);
+                        archive_entry_set_pathname_utf8(parentEntry, dirPath.UTF8String);
                         archive_entry_set_filetype(parentEntry, AE_IFDIR);
                         archive_entry_set_perm(parentEntry, 0755);
                         int hdrR = archive_write_header(aw, parentEntry);

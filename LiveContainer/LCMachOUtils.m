@@ -370,11 +370,17 @@ static bool lcIsLoadCommandPathEqual(const struct load_command *command, const c
     return strnlen(str, maxLen) < maxLen && strcmp(str, targetPath) == 0;
 }
 
-void LCUnpatchExecSlice(const char *path, struct mach_header_64 *header) {
+static void LCUnpatchExecSliceBounded(const char *path, struct mach_header_64 *header, uint64_t maxSliceBytes) {
     if (!path || !header || header->magic != MH_MAGIC_64 || header->filetype != MH_DYLIB) {
         return;
     }
+    if (maxSliceBytes < sizeof(struct mach_header_64)) {
+        return;
+    }
     if (header->ncmds == 0 || header->ncmds > 4096 || header->sizeofcmds > (16u * 1024u * 1024u)) {
+        return;
+    }
+    if ((uint64_t)header->sizeofcmds > maxSliceBytes - sizeof(struct mach_header_64)) {
         return;
     }
 
@@ -385,11 +391,11 @@ void LCUnpatchExecSlice(const char *path, struct mach_header_64 *header) {
     const char *dyldPath = "/usr/lib/dyld";
 
     // Pass 1: inspect load commands with strict bounds checks to confirm this slice is an
-    // executable patched by LiveContainer (never mutate genuine dylibs).
+    // executable patched by LiveContainer (require __PAGEZERO or LC_MAIN/LC_UNIXTHREAD so
+    // genuine .dylibs can never be converted into MH_EXECUTE).
     bool hasPageZero = false;
     bool hasMain = false;
     bool hasDylinker = false;
-    bool hasLiveContainerArtifact = false;
 
     uint8_t *scanPtr = imageHeaderPtr;
     for (uint32_t i = 0; i < header->ncmds && scanPtr + sizeof(struct load_command) <= cmdEnd; i++) {
@@ -406,15 +412,11 @@ void LCUnpatchExecSlice(const char *path, struct mach_header_64 *header) {
             hasMain = true;
         } else if (cmd->cmd == LC_LOAD_DYLINKER) {
             hasDylinker = true;
-        } else if (cmd->cmd == 0x114514 || cmd->cmd == 0x114515) {
-            hasLiveContainerArtifact = true;
-        } else if (cmd->cmd == LC_LOAD_DYLIB && lcIsLoadCommandPathEqual(cmd, tweakLoaderPath)) {
-            hasLiveContainerArtifact = true;
         }
         scanPtr += cmd->cmdsize;
     }
 
-    if (!hasPageZero && !hasMain && !hasLiveContainerArtifact) {
+    if (!hasPageZero && !hasMain) {
         return;
     }
 
@@ -485,14 +487,30 @@ void LCUnpatchExecSlice(const char *path, struct mach_header_64 *header) {
     header->sizeofcmds = (uint32_t)(writePtr - imageHeaderPtr);
 }
 
+void LCUnpatchExecSlice(const char *path, struct mach_header_64 *header) {
+    LCUnpatchExecSliceBounded(path, header, 16ULL * 1024ULL * 1024ULL + sizeof(struct mach_header_64));
+}
+
 NSString *LCUnpatchMachOExecutableAtPath(const char *path) {
     if (!path || path[0] == '\0') {
         return @"Invalid Mach-O path.";
     }
     return LCParseMachO(path, false, ^(const char *slicePath, struct mach_header_64 *header, int fd, void *filePtr) {
-        if (header && header->magic == MH_MAGIC_64 && header->cputype == CPU_TYPE_ARM64) {
-            LCUnpatchExecSlice(slicePath, header);
+        if (!header || header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64 || !filePtr) {
+            return;
         }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            return;
+        }
+        uintptr_t baseAddr = (uintptr_t)filePtr;
+        uintptr_t hdrAddr = (uintptr_t)header;
+        uint64_t totalSize = (uint64_t)st.st_size;
+        if (hdrAddr < baseAddr || (uint64_t)(hdrAddr - baseAddr) >= totalSize) {
+            return;
+        }
+        uint64_t availableBytes = totalSize - (uint64_t)(hdrAddr - baseAddr);
+        LCUnpatchExecSliceBounded(slicePath, header, availableBytes);
     });
 }
 
