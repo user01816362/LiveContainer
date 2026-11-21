@@ -393,11 +393,10 @@ struct LCSettingsView: View {
                             Text("Reset Symbol Offsets")
                         }
                         Button {
-                            presentFLEXOverlay()
+                            presentRuntimeInspectorOverlay()
                         } label: {
-                            Text("Show FLEX Overlay")
+                            Text("Show Runtime Inspector Overlay")
                         }
-                        .disabled(NSClassFromString("FLEXManager") == nil)
                     } header: {
                         Text("Developer Settings")
                     } footer: {
@@ -566,10 +565,14 @@ struct LCSettingsView: View {
         LCUtils.appGroupUserDefault.removeObject(forKey: "symbolOffsetCache")
     }
 
-    func presentFLEXOverlay() {
-        let manager = (NSClassFromString("FLEXManager") as? NSObject.Type)?.perform(NSSelectorFromString("sharedManager"))
-            .takeUnretainedValue() as? NSObject
-        manager?.perform(NSSelectorFromString("showExplorer"))
+    func presentRuntimeInspectorOverlay() {
+        if let serverCls = NSClassFromString("LCDebugServer") as? NSObject.Type,
+           let shared = serverCls.perform(NSSelectorFromString("shared"))?.takeUnretainedValue() as? NSObject {
+            let sel = NSSelectorFromString("handleOverlayPillTap")
+            if shared.responds(to: sel) {
+                shared.perform(sel)
+            }
+        }
     }
 
     func importCertificate() async {

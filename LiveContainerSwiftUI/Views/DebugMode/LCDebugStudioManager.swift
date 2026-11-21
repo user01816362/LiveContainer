@@ -2,268 +2,352 @@
 //  LCDebugStudioManager.swift
 //  LiveContainerSwiftUI
 //
-//  Connects over localhost (and mirrors Mac LAN state) to LCDebugAgent inside
-//  the running guest app via HTTP + Server-Sent Events (SSE).
+//  Observable per-domain stores & localhost/LAN SSE client communicating with
+//  LCDebugAgent inside the running guest app.
 //
 
 import Foundation
+import Observation
 import SwiftUI
-import Combine
 
-struct LCDebugLogEntry: Identifiable, Decodable, Hashable, Sendable {
-    let id: String
-    let timestamp: Double?
-    let stream: String
-    let level: String?
-    let subsystem: String?
-    let category: String?
-    let text: String
+// MARK: - Isolated Per-Domain Observable Stores
 
-    var effectiveLevel: String {
-        if let level, !level.isEmpty { return level }
-        if stream == "stderr" || stream == "crash" { return "error" }
-        return "info"
-    }
+@MainActor
+@Observable
+final class LCDebugTelemetryStore {
+    var pid: Int = 0
+    var localPort: Int = 0
+    var lanPort: Int = 0
+    var isMacLANEnabled: Bool = UserDefaults.lcShared().bool(forKey: "LCDebugLANEnabled")
+    var lanIP: String = ""
+    var authToken: String = ""
+    var cpuPercent: Double = 0
+    var memoryMB: Double = 0
+    var fps: Int = 0
+    var threadCount: Int = 0
+    var isJIT: Bool = false
+    var isXRayEnabled: Bool = false
+    var isTapInspectEnabled: Bool = false
+    var isNotificationMonitorEnabled: Bool = false
+    var networkPaused: Bool = false
 
-    var isErrorLike: Bool {
-        stream == "stderr" || stream == "crash" || effectiveLevel == "error" || effectiveLevel == "fault"
-    }
-}
-
-struct LCDebugNetworkEntry: Identifiable, Decodable, Hashable, Sendable {
-    let id: String
-    let timestamp: Double?
-    let source: String?
-    let method: String
-    let url: String
-    let statusCode: Int
-    let mimeType: String
-    let durationMs: Int
-    let bytes: Int
-    let requestHeaders: [String: String]
-    let responseHeaders: [String: String]
-    let requestBodyPreview: String
-    let responseBodyPreview: String
-    let curl: String
-    let error: String
-
-    var displaySource: String {
-        switch source?.lowercased() {
-        case "webview": return "WebView"
-        case "websocket": return "WebSocket"
-        default: return "URLSession"
+    var macLANURLString: String? {
+        guard isMacLANEnabled, !lanIP.isEmpty, lanPort > 0 else { return nil }
+        if !authToken.isEmpty {
+            return "http://\(lanIP):\(lanPort)?token=\(authToken)"
         }
+        return "http://\(lanIP):\(lanPort)"
     }
 }
 
-struct LCDebugUIEventEntry: Identifiable, Decodable, Hashable, Sendable {
-    let id: String
-    let timestamp: Double?
-    let kind: String
-    let title: String
-    let detail: String
-    let target: String
-    let viewController: String
-    let window: String
-}
-
-struct LCDebugSelectedView: Decodable, Hashable, Sendable {
-    let viewClass: String
-    let viewController: String
-    let windowClass: String?
-    let frame: String
-    let bounds: String
-    let accessibilityIdentifier: String
-    let accessibilityLabel: String
-    let alpha: Double
-    let hidden: Bool
-    let tag: Int
-    let backgroundColor: String
-    let subviewCount: Int
-    let constraintsCount: Int?
-    let isSwiftUI: Bool?
-    let responderChain: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case viewClass = "class"
-        case viewController
-        case windowClass
-        case frame
-        case bounds
-        case accessibilityIdentifier
-        case accessibilityLabel
-        case alpha
-        case hidden
-        case tag
-        case backgroundColor
-        case subviewCount
-        case constraintsCount
-        case isSwiftUI
-        case responderChain
+@MainActor
+@Observable
+final class LCDebugConsoleStore {
+    var logs: [LCDebugLogEntry] = []
+    var filteredLogs: [LCDebugLogEntry] = []
+    var searchQuery: String = "" {
+        didSet { recomputeFilteredLogs() }
     }
-}
-
-struct LCDebugStatusSnapshot: Decodable, Sendable {
-    let pid: Int?
-    let bundleId: String?
-    let localPort: Int?
-    let lanPort: Int?
-    let lanEnabled: Bool?
-    let lanIP: String?
-    let authToken: String?
-    let cpuPercent: Double?
-    let memoryMB: Double?
-    let fps: Int?
-    let threadCount: Int?
-    let isJIT: Bool?
-    let xrayEnabled: Bool?
-    let tapInspectEnabled: Bool?
-    let notificationMonitorEnabled: Bool?
-    let selectedView: LCDebugSelectedView?
-}
-
-struct LCDebugDylibEntry: Identifiable, Decodable, Hashable, Sendable {
-    var id: String { "\(index)-\(base)" }
-    let index: Int
-    let base: String
-    let path: String
-    let name: String
-    let isSystem: Bool
-}
-
-struct LCDebugClassDetail: Decodable, Hashable, Sendable {
-    let className: String
-    let superclassName: String
-    let image: String
-    let methods: [String]
-    let properties: [String]
-    let ivars: [String]
-
-    enum CodingKeys: String, CodingKey {
-        case className = "class"
-        case superclassName = "superclass"
-        case image
-        case methods
-        case properties
-        case ivars
+    var streamFilter: LCDebugLogStreamFilter = .all {
+        didSet { recomputeFilteredLogs() }
     }
-}
+    var isPaused: Bool = false
+    var autoScroll: Bool = true
+    var selectedLog: LCDebugLogEntry? = nil
 
-struct LCDebugSandboxFile: Identifiable, Decodable, Hashable, Sendable {
-    var id: String { path }
-    let path: String
-    let size: Int64
-    let type: String
-}
+    private(set) var totalCount: Int = 0
+    private(set) var errorCount: Int = 0
 
-struct LCDebugKeychainItem: Identifiable, Decodable, Hashable, Sendable {
-    let id = UUID()
-    let account: String
-    let service: String
-    let accessGroup: String
-
-    enum CodingKeys: String, CodingKey {
-        case account, service, accessGroup
-    }
-}
-
-struct LCDebugSandboxSummary: Decodable, Sendable {
-    let home: String
-    let files: [LCDebugSandboxFile]
-    let userDefaults: [String: String]
-    let keychainItems: [LCDebugKeychainItem]
-
-    enum CodingKeys: String, CodingKey {
-        case home, files, userDefaults, keychainItems
+    func replaceAll(_ entries: [LCDebugLogEntry]) {
+        logs = entries
+        recomputeAllDerived()
     }
 
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        home = (try? container.decode(String.self, forKey: .home)) ?? ""
-        files = (try? container.decode([LCDebugSandboxFile].self, forKey: .files)) ?? []
-        keychainItems = (try? container.decode([LCDebugKeychainItem].self, forKey: .keychainItems)) ?? []
+    func appendBatch(_ incoming: [LCDebugLogEntry]) {
+        guard !incoming.isEmpty, !isPaused else { return }
+        logs.append(contentsOf: incoming)
+        if logs.count > 2000 {
+            logs.removeFirst(logs.count - 2000)
+        }
+        recomputeAllDerived()
+    }
 
-        if let rawDict = try? container.decode([String: LCDebugAnyCodable].self, forKey: .userDefaults) {
-            var coerced: [String: String] = [:]
-            for (k, v) in rawDict {
-                coerced[k] = v.stringSummary
+    func clear() {
+        logs.removeAll()
+        recomputeAllDerived()
+    }
+
+    private func recomputeAllDerived() {
+        totalCount = logs.count
+        var errs = 0
+        for item in logs where item.isErrorLike { errs += 1 }
+        errorCount = errs
+        recomputeFilteredLogs()
+    }
+
+    private func recomputeFilteredLogs() {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        filteredLogs = logs.filter { entry in
+            switch streamFilter {
+            case .all: break
+            case .stdio:
+                guard entry.stream == "stdout" || entry.stream == "stderr" else { return false }
+            case .nslog:
+                guard entry.stream == "nslog" else { return false }
+            case .oslog:
+                guard entry.stream == "oslog" else { return false }
+            case .webview:
+                guard entry.stream == "webview" else { return false }
+            case .errors:
+                guard entry.isErrorLike else { return false }
             }
-            userDefaults = coerced
-        } else {
-            userDefaults = [:]
+            guard !q.isEmpty else { return true }
+            return entry.text.localizedCaseInsensitiveContains(q)
+                || entry.stream.localizedCaseInsensitiveContains(q)
+                || (entry.subsystem?.localizedCaseInsensitiveContains(q) ?? false)
+                || (entry.category?.localizedCaseInsensitiveContains(q) ?? false)
         }
     }
 }
 
-private enum LCDebugAnyCodable: Decodable, Sendable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case other
+@MainActor
+@Observable
+final class LCDebugNetworkStore {
+    var transactions: [LCDebugNetworkEntry] = []
+    var filteredTransactions: [LCDebugNetworkEntry] = []
+    var availableHosts: [String] = []
 
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let s = try? container.decode(String.self) {
-            self = .string(s)
-        } else if let b = try? container.decode(Bool.self) {
-            self = .bool(b)
-        } else if let n = try? container.decode(Double.self) {
-            self = .number(n)
-        } else {
-            self = .other
-        }
+    var searchQuery: String = "" {
+        didSet { recomputeFiltered() }
+    }
+    var statusFilter: LCDebugNetworkStatusFilter = .all {
+        didSet { recomputeFiltered() }
+    }
+    var typeFilter: LCDebugNetworkTypeFilter = .all {
+        didSet { recomputeFiltered() }
+    }
+    var methodFilter: String = "ALL" {
+        didSet { recomputeFiltered() }
+    }
+    var hostFilter: String = "ALL" {
+        didSet { recomputeFiltered() }
     }
 
-    var stringSummary: String {
-        switch self {
-        case .string(let s): return s
-        case .bool(let b): return b ? "true" : "false"
-        case .number(let n):
-            if n.rounded() == n {
-                return String(Int64(n))
+    var settings: LCDebugNetworkSettings = .default
+    var selectedTransaction: LCDebugNetworkEntry? = nil
+    var replayTarget: LCDebugNetworkReplayTarget? = nil
+    var showSettingsSheet: Bool = false
+
+    private(set) var totalCount: Int = 0
+    private(set) var totalBytes: Int = 0
+    private(set) var errorCount: Int = 0
+    private(set) var inFlightCount: Int = 0
+    private(set) var averageDurationMs: Int = 0
+
+    func replaceAll(_ list: [LCDebugNetworkEntry]) {
+        transactions = list
+        recomputeAllDerived()
+    }
+
+    func applyUpserts(_ updates: [LCDebugNetworkEntry]) {
+        guard !updates.isEmpty else { return }
+        var indexById: [String: Int] = Dictionary(minimumCapacity: transactions.count)
+        for (idx, item) in transactions.enumerated() {
+            indexById[item.id] = idx
+        }
+        for tx in updates {
+            if let existingIdx = indexById[tx.id] {
+                transactions[existingIdx] = tx
+            } else {
+                transactions.insert(tx, at: 0)
+                // Re-sync indices only when inserting at front
+                indexById.removeAll(keepingCapacity: true)
+                for (i, item) in transactions.enumerated() {
+                    indexById[item.id] = i
+                }
             }
-            return String(n)
-        case .other: return "<Collection / Object>"
+        }
+        let maxKeep = max(100, settings.maxTransactions)
+        if transactions.count > maxKeep {
+            transactions.removeLast(transactions.count - maxKeep)
+        }
+        if let currentSel = selectedTransaction,
+           let refreshed = transactions.first(where: { $0.id == currentSel.id }) {
+            selectedTransaction = refreshed
+        }
+        recomputeAllDerived()
+    }
+
+    func clearAll() {
+        transactions.removeAll()
+        selectedTransaction = nil
+        recomputeAllDerived()
+    }
+
+    func clearFilteredOnly() {
+        let removeIDs = Set(filteredTransactions.map(\.id))
+        transactions.removeAll { removeIDs.contains($0.id) }
+        if let sel = selectedTransaction, removeIDs.contains(sel.id) {
+            selectedTransaction = nil
+        }
+        recomputeAllDerived()
+    }
+
+    func resetFilters() {
+        searchQuery = ""
+        statusFilter = .all
+        typeFilter = .all
+        methodFilter = "ALL"
+        hostFilter = "ALL"
+    }
+
+    private func recomputeAllDerived() {
+        var hosts = Set<String>()
+        var bytesSum = 0
+        var errSum = 0
+        var liveSum = 0
+        var durSum = 0
+        var durCount = 0
+
+        for tx in transactions {
+            let h = tx.resolvedHost
+            if !h.isEmpty { hosts.insert(h) }
+            bytesSum += tx.effectiveByteCount
+            if tx.isInFlight { liveSum += 1 }
+            if tx.isFailure { errSum += 1 }
+            if !tx.isInFlight && tx.durationMs > 0 {
+                durSum += tx.durationMs
+                durCount += 1
+            }
+        }
+
+        totalCount = transactions.count
+        availableHosts = hosts.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        totalBytes = bytesSum
+        errorCount = errSum
+        inFlightCount = liveSum
+        averageDurationMs = durCount > 0 ? (durSum / durCount) : 0
+        if hostFilter != "ALL" && !hosts.contains(hostFilter) {
+            hostFilter = "ALL"
+        }
+        recomputeFiltered()
+    }
+
+    private func recomputeFiltered() {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        filteredTransactions = transactions.filter { tx in
+            switch statusFilter {
+            case .all: break
+            case .inFlight:
+                guard tx.isInFlight else { return false }
+            case .ok2xx:
+                guard (200...299).contains(tx.statusCode) else { return false }
+            case .redir3xx:
+                guard (300...399).contains(tx.statusCode) else { return false }
+            case .errors:
+                guard tx.isFailure else { return false }
+            }
+
+            switch typeFilter {
+            case .all: break
+            case .urlsession:
+                guard tx.source == nil || tx.source == "urlsession" || tx.source == "urlconnection" else { return false }
+            case .graphql:
+                guard tx.isGraphQL == true else { return false }
+            case .webview:
+                guard tx.source == "webview" else { return false }
+            case .websocket:
+                guard tx.source == "websocket" else { return false }
+            case .json:
+                guard tx.mimeType.localizedCaseInsensitiveContains("json") else { return false }
+            case .media:
+                let m = tx.mimeType.lowercased()
+                guard m.hasPrefix("image/") || m.hasPrefix("audio/") || m.hasPrefix("video/") else { return false }
+            }
+
+            if methodFilter != "ALL" && tx.method.uppercased() != methodFilter {
+                return false
+            }
+            if hostFilter != "ALL" && tx.resolvedHost != hostFilter {
+                return false
+            }
+
+            guard !q.isEmpty else { return true }
+            return tx.url.localizedCaseInsensitiveContains(q)
+                || tx.method.localizedCaseInsensitiveContains(q)
+                || tx.displaySource.localizedCaseInsensitiveContains(q)
+                || tx.mimeType.localizedCaseInsensitiveContains(q)
+                || (tx.graphQLOperation?.localizedCaseInsensitiveContains(q) ?? false)
+                || "\(tx.statusCode)".contains(q)
         }
     }
 }
 
-struct LCDebugFridaInfo: Decodable, Sendable {
-    let pid: Int
-    let bundleId: String
-    let executablePath: String
-    let bundlePath: String
-    let isJIT: Bool
-    let fridaGadgetLoaded: Bool
-    let flexLoaded: Bool
-    let fridaAttachCmd: String
-    let fridaGadgetTip: String
-    let lldbCmd: String
-}
+@MainActor
+@Observable
+final class LCDebugInspectorStore {
+    var uiEvents: [LCDebugUIEventEntry] = []
+    var filteredUIEvents: [LCDebugUIEventEntry] = []
+    var eventSearch: String = "" {
+        didSet { recomputeFilteredEvents() }
+    }
+    var eventKindFilter: LCDebugUIEventKindFilter = .all {
+        didSet { recomputeFilteredEvents() }
+    }
+    var selectedEvent: LCDebugUIEventEntry? = nil
+    private(set) var totalEventCount: Int = 0
 
-enum LCDebugInspectorTab: String, CaseIterable, Identifiable, Sendable {
-    case console = "Console"
-    case network = "Network"
-    case events = "UI & Events"
-    case hierarchy = "Hierarchy"
-    case dylibs = "Dylibs & ObjC"
-    case sandbox = "Sandbox & Keys"
-    case frida = "Frida / LLDB"
+    var hierarchyWindows: [LCDebugHierarchyWindow] = []
+    var hierarchyText: String = ""
+    var isLoadingHierarchy: Bool = false
 
-    var id: String { rawValue }
+    var dylibs: [LCDebugDylibEntry] = []
+    var objcClasses: [String] = []
+    var selectedClassDetail: LCDebugClassDetail? = nil
+    var sandboxSummary: LCDebugSandboxSummary? = nil
+    var fridaInfo: LCDebugFridaInfo? = nil
 
-    var systemImage: String {
-        switch self {
-        case .console: return "terminal.fill"
-        case .network: return "network"
-        case .events: return "cursorarrow.click.2"
-        case .hierarchy: return "square.3.layers.3d"
-        case .dylibs: return "shippingbox.fill"
-        case .sandbox: return "folder.fill"
-        case .frida: return "ant.fill"
+    var selectedView: LCDebugSelectedView? = nil
+    var showSelectedViewSheet: Bool = false
+
+    func replaceEvents(_ list: [LCDebugUIEventEntry]) {
+        uiEvents = list
+        recomputeFilteredEvents()
+    }
+
+    func prependEvents(_ incoming: [LCDebugUIEventEntry]) {
+        guard !incoming.isEmpty else { return }
+        uiEvents.insert(contentsOf: incoming.reversed(), at: 0)
+        if uiEvents.count > 500 {
+            uiEvents.removeLast(uiEvents.count - 500)
+        }
+        recomputeFilteredEvents()
+    }
+
+    func clearEvents() {
+        uiEvents.removeAll()
+        recomputeFilteredEvents()
+    }
+
+    private func recomputeFilteredEvents() {
+        totalEventCount = uiEvents.count
+        let q = eventSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        filteredUIEvents = uiEvents.filter { ev in
+            if eventKindFilter != .all && ev.kind.lowercased() != eventKindFilter.rawValue.lowercased() {
+                if !(eventKindFilter == .notification && ev.kind.lowercased() == "notification") {
+                    return false
+                }
+            }
+            guard !q.isEmpty else { return true }
+            return ev.title.localizedCaseInsensitiveContains(q)
+                || ev.detail.localizedCaseInsensitiveContains(q)
+                || ev.kind.localizedCaseInsensitiveContains(q)
+                || ev.viewController.localizedCaseInsensitiveContains(q)
         }
     }
 }
+
+// MARK: - Main Connection & Coordination Controller
 
 private struct LCDebugSessionFilePayload: Decodable, Sendable {
     let pid: Int
@@ -280,62 +364,35 @@ private enum LCDecodedSSEMessage: Sendable {
 }
 
 @MainActor
-final class LCDebugStudioManager: ObservableObject {
-    @Published var isConnected = false
-    @Published var isConnecting = false
-    @Published var connectionError: String? = nil
-    @Published var pid: Int = 0
-    @Published var localPort: Int = 0
-    @Published var lanPort: Int = 0
-    @Published var isMacLANEnabled = false
-    @Published var lanIP: String = ""
-    @Published var authToken: String = ""
-    @Published var cpuPercent: Double = 0
-    @Published var memoryMB: Double = 0
-    @Published var fps: Int = 0
-    @Published var threadCount: Int = 0
-    @Published var isJIT = false
-    @Published var isXRayEnabled = false
-    @Published var isTapInspectEnabled = false
-    @Published var isNotificationMonitorEnabled = false
-    @Published var selectedView: LCDebugSelectedView? = nil
+@Observable
+final class LCDebugStudioManager {
+    var telemetryStore = LCDebugTelemetryStore()
+    var consoleStore = LCDebugConsoleStore()
+    var networkStore = LCDebugNetworkStore()
+    var inspectorStore = LCDebugInspectorStore()
 
-    @Published var logs: [LCDebugLogEntry] = []
-    @Published var networkEntries: [LCDebugNetworkEntry] = []
-    @Published var uiEvents: [LCDebugUIEventEntry] = []
-    @Published var hierarchyText: String = ""
-    @Published var dylibs: [LCDebugDylibEntry] = []
-    @Published var objcClasses: [String] = []
-    @Published var selectedClassDetail: LCDebugClassDetail? = nil
-    @Published var sandboxSummary: LCDebugSandboxSummary? = nil
-    @Published var fridaInfo: LCDebugFridaInfo? = nil
-    @Published var jitStatusBanner: String? = nil
+    var isConnected: Bool = false
+    var isConnecting: Bool = false
+    var connectionError: String? = nil
+    var jitStatusBanner: String? = nil
 
-    private var expectedPID: Int32 = 0
-    private var connectionTask: Task<Void, Never>? = nil
-    private var sseTask: Task<Void, Never>? = nil
-    private let session: URLSession
-    private let decoder = JSONDecoder()
+    @ObservationIgnored private var expectedPID: Int32 = 0
+    @ObservationIgnored private var lastStatusSelectedView: LCDebugSelectedView? = nil
+    @ObservationIgnored private nonisolated(unsafe) var connectionTask: Task<Void, Never>? = nil
+    @ObservationIgnored private nonisolated(unsafe) var sseTask: Task<Void, Never>? = nil
+    @ObservationIgnored private let session: URLSession
+    @ObservationIgnored private let decoder = JSONDecoder()
 
     init() {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 0
         self.session = URLSession(configuration: config)
-        self.isMacLANEnabled = UserDefaults.lcShared().bool(forKey: "LCDebugLANEnabled")
-    }
-
-    var macLANURLString: String? {
-        guard isMacLANEnabled, !lanIP.isEmpty, lanPort > 0 else { return nil }
-        if !authToken.isEmpty {
-            return "http://\(lanIP):\(lanPort)?token=\(authToken)"
-        }
-        return "http://\(lanIP):\(lanPort)"
     }
 
     private var baseURL: URL? {
-        guard localPort > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(localPort)")
+        guard telemetryStore.localPort > 0 else { return nil }
+        return URL(string: "http://127.0.0.1:\(telemetryStore.localPort)")
     }
 
     deinit {
@@ -393,7 +450,7 @@ final class LCDebugStudioManager: ObservableObject {
         self.connectionError = nil
         self.isConnecting = true
         if expectedPID > 0 {
-            self.pid = Int(expectedPID)
+            telemetryStore.pid = Int(expectedPID)
         }
 
         connectionTask = Task { [weak self] in
@@ -401,9 +458,9 @@ final class LCDebugStudioManager: ObservableObject {
             while !Task.isCancelled && Date() < deadline {
                 guard let self else { return }
                 if let discovered = self.discoverSession(expectedPID: expectedPID) {
-                    self.localPort = discovered.port
-                    self.pid = discovered.pid
-                    self.authToken = discovered.token
+                    self.telemetryStore.localPort = discovered.port
+                    self.telemetryStore.pid = discovered.pid
+                    self.telemetryStore.authToken = discovered.token
                     if await self.bootstrapConnection() {
                         self.isConnecting = false
                         return
@@ -429,7 +486,7 @@ final class LCDebugStudioManager: ObservableObject {
         isConnected = false
         isConnecting = false
         if clearPersistedSession {
-            Self.clearStaleSessionMetadata(forPID: expectedPID > 0 ? expectedPID : Int32(pid))
+            Self.clearStaleSessionMetadata(forPID: expectedPID > 0 ? expectedPID : Int32(telemetryStore.pid))
         }
     }
 
@@ -445,6 +502,7 @@ final class LCDebugStudioManager: ObservableObject {
         isConnected = true
         connectionError = nil
         await fetchInitialCollections(base: base)
+        await loadNetworkSettings()
         startSSEStream()
         return true
     }
@@ -465,13 +523,13 @@ final class LCDebugStudioManager: ObservableObject {
         async let evFetch: [LCDebugUIEventEntry]? = fetchJSON(url: base.appendingPathComponent("api/events"))
 
         if let initialLogs = await logsFetch {
-            self.logs = initialLogs
+            consoleStore.replaceAll(initialLogs)
         }
         if let initialNet = await netFetch {
-            self.networkEntries = initialNet
+            networkStore.replaceAll(initialNet)
         }
         if let initialEvents = await evFetch {
-            self.uiEvents = initialEvents
+            inspectorStore.replaceEvents(initialEvents)
         }
     }
 
@@ -479,7 +537,6 @@ final class LCDebugStudioManager: ObservableObject {
         sseTask?.cancel()
         let session = self.session
 
-        // Run raw SSE byte reading + JSON decoding off MainActor and batch-flush updates
         sseTask = Task.detached(priority: .utility) { [weak self] in
             let bgDecoder = JSONDecoder()
             while !Task.isCancelled {
@@ -506,11 +563,9 @@ final class LCDebugStudioManager: ObservableObject {
                     pendingBatch.reserveCapacity(32)
                     var lastFlushTime = CFAbsoluteTimeGetCurrent()
 
-                    // Read raw bytes instead of `bytes.lines` because Swift's AsyncLineSequence
-                    // strips blank lines (\n\n) that delimit SSE frames.
                     for try await byte in bytes {
                         if Task.isCancelled { break }
-                        if byte == 0x0A { // '\n'
+                        if byte == 0x0A {
                             if lineBuffer.last == 0x0D {
                                 lineBuffer.removeLast()
                             }
@@ -562,7 +617,6 @@ final class LCDebugStudioManager: ObservableObject {
                         }
                     }
 
-                    // Clean EOF from server -> mark disconnected so reconnect triggers cleanly
                     if !Task.isCancelled {
                         await MainActor.run { [weak self] in
                             self?.isConnected = false
@@ -638,52 +692,49 @@ final class LCDebugStudioManager: ObservableObject {
             case .uiEvent(let entry):
                 newEvents.append(entry)
             case .tap(let view):
-                selectedView = view
+                lastStatusSelectedView = view
+                inspectorStore.selectedView = view
             }
         }
 
-        if !newLogs.isEmpty {
-            logs.append(contentsOf: newLogs)
-            if logs.count > 2000 {
-                logs.removeFirst(logs.count - 2000)
-            }
-        }
-        if !newNets.isEmpty {
-            networkEntries.insert(contentsOf: newNets.reversed(), at: 0)
-            if networkEntries.count > 500 {
-                networkEntries.removeLast(networkEntries.count - 500)
-            }
-        }
-        if !newEvents.isEmpty {
-            uiEvents.insert(contentsOf: newEvents.reversed(), at: 0)
-            if uiEvents.count > 500 {
-                uiEvents.removeLast(uiEvents.count - 500)
-            }
-        }
+        consoleStore.appendBatch(newLogs)
+        networkStore.applyUpserts(newNets)
+        inspectorStore.prependEvents(newEvents)
     }
 
     private func apply(status: LCDebugStatusSnapshot) {
-        if let p = status.pid { pid = p }
-        if let lp = status.localPort { localPort = lp }
-        if let lanP = status.lanPort { lanPort = lanP }
-        if let lanEn = status.lanEnabled { isMacLANEnabled = lanEn }
-        if let ip = status.lanIP { lanIP = ip }
-        if let token = status.authToken, !token.isEmpty { authToken = token }
-        if let cpu = status.cpuPercent { cpuPercent = cpu }
-        if let mem = status.memoryMB { memoryMB = mem }
-        if let f = status.fps { fps = f }
-        if let tc = status.threadCount { threadCount = tc }
-        if let jit = status.isJIT { isJIT = jit }
-        if let xr = status.xrayEnabled { isXRayEnabled = xr }
-        if let ti = status.tapInspectEnabled { isTapInspectEnabled = ti }
-        if let nm = status.notificationMonitorEnabled { isNotificationMonitorEnabled = nm }
-        if let sv = status.selectedView { selectedView = sv }
+        if let p = status.pid { telemetryStore.pid = p }
+        if let lp = status.localPort { telemetryStore.localPort = lp }
+        if let lanP = status.lanPort { telemetryStore.lanPort = lanP }
+        if let lanEn = status.lanEnabled { telemetryStore.isMacLANEnabled = lanEn }
+        if let ip = status.lanIP { telemetryStore.lanIP = ip }
+        if let token = status.authToken, !token.isEmpty { telemetryStore.authToken = token }
+        if let cpu = status.cpuPercent { telemetryStore.cpuPercent = cpu }
+        if let mem = status.memoryMB { telemetryStore.memoryMB = mem }
+        if let f = status.fps { telemetryStore.fps = f }
+        if let tc = status.threadCount { telemetryStore.threadCount = tc }
+        if let jit = status.isJIT { telemetryStore.isJIT = jit }
+        if let xr = status.xrayEnabled { telemetryStore.isXRayEnabled = xr }
+        if let ti = status.tapInspectEnabled { telemetryStore.isTapInspectEnabled = ti }
+        if let nm = status.notificationMonitorEnabled { telemetryStore.isNotificationMonitorEnabled = nm }
+        if let np = status.networkPaused {
+            if telemetryStore.networkPaused != np {
+                telemetryStore.networkPaused = np
+            }
+            if networkStore.settings.paused != np {
+                networkStore.settings.paused = np
+            }
+        }
+        if let sv = status.selectedView, sv != lastStatusSelectedView {
+            lastStatusSelectedView = sv
+            inspectorStore.selectedView = sv
+        }
     }
 
     // MARK: - Actions & Introspection API
 
     func setMacLAN(enabled: Bool) async {
-        isMacLANEnabled = enabled
+        telemetryStore.isMacLANEnabled = enabled
         UserDefaults.lcShared().set(enabled, forKey: "LCDebugLANEnabled")
         await postAction(["action": "set_lan", "enabled": enabled])
         await refreshStatusOnly()
@@ -709,17 +760,21 @@ final class LCDebugStudioManager: ObservableObject {
     }
 
     func clearLogs() async {
-        logs.removeAll()
+        consoleStore.clear()
         await postAction(["action": "clear_logs"])
     }
 
-    func clearNetwork() async {
-        networkEntries.removeAll()
-        await postAction(["action": "clear_network"])
+    func clearNetwork(filteredOnly: Bool = false) async {
+        if filteredOnly {
+            networkStore.clearFilteredOnly()
+        } else {
+            networkStore.clearAll()
+            await postAction(["action": "clear_network"])
+        }
     }
 
     func clearUIEvents() async {
-        uiEvents.removeAll()
+        inspectorStore.clearEvents()
         await postAction(["action": "clear_events"])
     }
 
@@ -730,31 +785,176 @@ final class LCDebugStudioManager: ObservableObject {
         }
     }
 
+    func setNetworkPaused(_ paused: Bool) async {
+        telemetryStore.networkPaused = paused
+        networkStore.settings.paused = paused
+        await postAction(["action": "set_network_paused", "paused": paused])
+        await refreshStatusOnly()
+    }
+
+    func loadNetworkSettings() async {
+        guard let base = baseURL else { return }
+        if let cfg: LCDebugNetworkSettings = await fetchJSON(url: base.appendingPathComponent("api/network/settings")) {
+            networkStore.settings = cfg
+            telemetryStore.networkPaused = cfg.paused
+        }
+    }
+
+    func updateNetworkSettings(_ settings: LCDebugNetworkSettings) async {
+        networkStore.settings = settings
+        telemetryStore.networkPaused = settings.paused
+        let dict: [String: Any] = [
+            "action": "set_network_settings",
+            "paused": settings.paused,
+            "cacheMediaBodies": settings.cacheMediaBodies,
+            "cacheLimitMB": settings.cacheLimitMB,
+            "maxTransactions": settings.maxTransactions,
+            "redactExports": settings.redactExports,
+            "excludedHosts": settings.excludedHosts
+        ]
+        await postAction(dict)
+        await loadNetworkSettings()
+    }
+
+    func excludeHost(_ host: String) async {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return }
+        await postAction(["action": "exclude_host", "host": trimmed])
+        await loadNetworkSettings()
+    }
+
+    func removeExcludedHost(_ host: String) async {
+        await postAction(["action": "remove_excluded_host", "host": host])
+        await loadNetworkSettings()
+    }
+
+    func clearExcludedHosts() async {
+        await postAction(["action": "clear_excluded_hosts"])
+        await loadNetworkSettings()
+    }
+
+    func fetchNetworkBody(id: String, part: String, redact: Bool) async -> LCDebugNetworkBodyPayload? {
+        guard let base = baseURL else { return nil }
+        var comp = URLComponents(url: base.appendingPathComponent("api/network/body"), resolvingAgainstBaseURL: false)
+        comp?.queryItems = [
+            URLQueryItem(name: "id", value: id),
+            URLQueryItem(name: "part", value: part),
+            URLQueryItem(name: "redact", value: redact ? "1" : "0")
+        ]
+        guard let url = comp?.url else { return nil }
+        return await fetchJSON(url: url)
+    }
+
+    func exportHARFileURL(redact: Bool) async -> URL? {
+        guard let base = baseURL else { return nil }
+        var comp = URLComponents(url: base.appendingPathComponent("api/network/har"), resolvingAgainstBaseURL: false)
+        comp?.queryItems = [URLQueryItem(name: "redact", value: redact ? "1" : "0")]
+        guard let url = comp?.url else { return nil }
+        do {
+            let (data, response) = try await session.data(for: authorizedRequest(url: url))
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                return nil
+            }
+            let outURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("LiveContainer-Network-\(Int(Date().timeIntervalSince1970)).har")
+            try data.write(to: outURL, options: .atomic)
+            return outURL
+        } catch {
+            return nil
+        }
+    }
+
+    func exportLogsFileURL() -> URL? {
+        let content = consoleStore.filteredLogs.map { entry in
+            let stamp = LCDebugFormatting.formatTimestamp(entry.timestamp)
+            let sub = (entry.subsystem?.isEmpty == false) ? ":\(entry.subsystem!)" : ""
+            return "\(stamp.isEmpty ? "" : "[\(stamp)] ")[\(entry.stream.uppercased())\(sub)] \(entry.text)"
+        }.joined(separator: "\n")
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LiveContainer-Logs-\(Int(Date().timeIntervalSince1970)).log")
+        guard let data = content.data(using: .utf8) else { return nil }
+        do {
+            try data.write(to: outURL, options: .atomic)
+            return outURL
+        } catch {
+            return nil
+        }
+    }
+
+    func replayTransaction(_ target: LCDebugNetworkReplayTarget) async -> LCDebugNetworkReplayResult {
+        guard let base = baseURL else {
+            return LCDebugNetworkReplayResult(ok: false, statusCode: nil, durationMs: nil, bytes: nil, error: "Not connected")
+        }
+        var payload: [String: Any] = [
+            "method": target.method,
+            "url": target.url,
+            "headers": target.headers
+        ]
+        if let txId = target.transactionId {
+            payload["transactionId"] = txId
+        }
+        if !target.body.isEmpty {
+            payload["body"] = target.body
+        }
+        var req = authorizedRequest(url: base.appendingPathComponent("api/network/replay"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 35
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        do {
+            let (data, _) = try await session.data(for: req)
+            return try decoder.decode(LCDebugNetworkReplayResult.self, from: data)
+        } catch {
+            return LCDebugNetworkReplayResult(ok: false, statusCode: nil, durationMs: nil, bytes: nil, error: error.localizedDescription)
+        }
+    }
+
+    func openReplayComposer(for entry: LCDebugNetworkEntry) {
+        Task {
+            var initialBody = entry.requestBodyPreview
+            if entry.hasRequestBody == true {
+                if let full = await fetchNetworkBody(id: entry.id, part: "request", redact: false), !full.text.isEmpty {
+                    initialBody = full.text
+                }
+            }
+            networkStore.replayTarget = LCDebugNetworkReplayTarget(
+                id: UUID().uuidString,
+                transactionId: entry.id,
+                method: entry.method,
+                url: entry.url,
+                headers: entry.requestHeaders,
+                body: initialBody
+            )
+        }
+    }
+
     func loadEvents() async {
         guard let base = baseURL else { return }
         if let list: [LCDebugUIEventEntry] = await fetchJSON(url: base.appendingPathComponent("api/events")) {
-            uiEvents = list
+            inspectorStore.replaceEvents(list)
         }
     }
 
     func loadHierarchy() async {
         guard let base = baseURL else { return }
+        inspectorStore.isLoadingHierarchy = true
+        defer { inspectorStore.isLoadingHierarchy = false }
         do {
             let (data, _) = try await session.data(for: authorizedRequest(url: base.appendingPathComponent("api/hierarchy")))
-            if let obj = try? JSONSerialization.jsonObject(with: data),
-               let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
-               let text = String(data: pretty, encoding: .utf8) {
-                hierarchyText = text
-            }
+            let parsed = await Task.detached(priority: .userInitiated) {
+                LCDebugFormatting.parseHierarchyWindows(from: data)
+            }.value
+            inspectorStore.hierarchyWindows = parsed.windows
+            inspectorStore.hierarchyText = parsed.prettyJSON
         } catch {
-            hierarchyText = "Failed to capture view hierarchy: \(error.localizedDescription)"
+            inspectorStore.hierarchyText = "Failed to capture view hierarchy: \(error.localizedDescription)"
         }
     }
 
     func loadDylibs() async {
         guard let base = baseURL else { return }
         if let list: [LCDebugDylibEntry] = await fetchJSON(url: base.appendingPathComponent("api/dylibs")) {
-            dylibs = list
+            inspectorStore.dylibs = list
         }
     }
 
@@ -764,7 +964,7 @@ final class LCDebugStudioManager: ObservableObject {
         comp?.queryItems = [URLQueryItem(name: "q", value: query)]
         guard let url = comp?.url else { return }
         if let matches: [String] = await fetchJSON(url: url) {
-            objcClasses = matches
+            inspectorStore.objcClasses = matches
         }
     }
 
@@ -774,29 +974,30 @@ final class LCDebugStudioManager: ObservableObject {
         comp?.queryItems = [URLQueryItem(name: "class", value: className)]
         guard let url = comp?.url else { return }
         if let detail: LCDebugClassDetail = await fetchJSON(url: url) {
-            selectedClassDetail = detail
+            inspectorStore.selectedClassDetail = detail
         }
     }
 
     func loadSandbox() async {
         guard let base = baseURL else { return }
         if let summary: LCDebugSandboxSummary = await fetchJSON(url: base.appendingPathComponent("api/sandbox")) {
-            sandboxSummary = summary
+            inspectorStore.sandboxSummary = summary
         }
     }
 
     func loadFridaInfo() async {
         guard let base = baseURL else { return }
         if let info: LCDebugFridaInfo = await fetchJSON(url: base.appendingPathComponent("api/frida")) {
-            fridaInfo = info
+            inspectorStore.fridaInfo = info
         }
     }
 
     func attachJIT(for appModel: LCAppModel) async {
-        guard pid > 0 else {
-            jitStatusBanner = "Waiting for guest process PID..."
+        guard telemetryStore.pid > 0 else {
+            jitStatusBanner = "Waiting for guest process PID…"
             return
         }
+        let pid = telemetryStore.pid
         let enabler = JITEnablerType(rawValue: UserDefaults.lcShared().integer(forKey: "LCJITEnablerType"))
         let bundleId = Bundle.main.bundleIdentifier ?? ""
         let script = appModel.jitLaunchScriptJs?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
@@ -825,8 +1026,8 @@ final class LCDebugStudioManager: ObservableObject {
 
     private func authorizedRequest(url: URL) -> URLRequest {
         var req = URLRequest(url: url)
-        if !authToken.isEmpty {
-            req.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        if !telemetryStore.authToken.isEmpty {
+            req.setValue("Bearer \(telemetryStore.authToken)", forHTTPHeaderField: "Authorization")
         }
         return req
     }
