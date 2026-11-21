@@ -344,17 +344,56 @@ final class LCAppInstaller {
             throw "lc.appList.urlFileIsNotIpaError".loc
         }
 
-        let payloadPath = stagingDir.appendingPathComponent("Payload", isDirectory: true)
-        guard fm.fileExists(atPath: payloadPath.path) else {
-            throw "lc.appList.bundleNotFondError".loc
+        let archiveRootDir: URL
+        let directPayload = stagingDir.appendingPathComponent("Payload", isDirectory: true)
+        if fm.fileExists(atPath: directPayload.path) {
+            archiveRootDir = stagingDir
+        } else {
+            // Defensive fallback: rescue legacy single-wrapper archives if Payload/ sits one level down
+            let topItems = (try? fm.contentsOfDirectory(
+                at: stagingDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            let wrapperCandidates = topItems.filter { item in
+                item.lastPathComponent != "__MACOSX"
+                    && ((try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true)
+                    && fm.fileExists(atPath: item.appendingPathComponent("Payload", isDirectory: true).path)
+            }
+            guard wrapperCandidates.count == 1, let rescuedRoot = wrapperCandidates.first else {
+                throw "lc.appList.bundleNotFondError".loc
+            }
+            archiveRootDir = rescuedRoot
         }
 
+        let payloadPath = archiveRootDir.appendingPathComponent("Payload", isDirectory: true)
         let payloadContents = try fm.contentsOfDirectory(atPath: payloadPath.path)
         guard let appBundleName = payloadContents.first(where: { $0.hasSuffix(".app") }) else {
             throw "lc.appList.bundleNotFondError".loc
         }
 
         let stagedBundleURL = payloadPath.appendingPathComponent(appBundleName, isDirectory: true)
+
+        // Extract sibling LCContainerData (or legacy LCUserData) OUT of the bundle BEFORE
+        // LCAppInfo/ZSign touch it so user data is never signed as app bundle resources.
+        var importedDataURL: URL? = nil
+        let siblingDataURL = archiveRootDir.appendingPathComponent("LCContainerData", isDirectory: true)
+        var dataIsDir: ObjCBool = false
+        if fm.fileExists(atPath: siblingDataURL.path, isDirectory: &dataIsDir), dataIsDir.boolValue {
+            importedDataURL = siblingDataURL
+        } else {
+            let legacyUserDataURL = stagedBundleURL.appendingPathComponent("LCUserData", isDirectory: true)
+            var legacyIsDir: ObjCBool = false
+            if fm.fileExists(atPath: legacyUserDataURL.path, isDirectory: &legacyIsDir), legacyIsDir.boolValue {
+                let relocatedURL = stagingDir.appendingPathComponent("LCImportedLegacyData-\(UUID().uuidString)", isDirectory: true)
+                try fm.moveItem(at: legacyUserDataURL, to: relocatedURL)
+                importedDataURL = relocatedURL
+            }
+        }
+
+        // Strip any leaked LiveContainer metadata/icon caches and restore original bundle ID before LCAppInfo reads it.
+        try lcSanitizeStagedAppBundle(at: stagedBundleURL, unpatchExecutables: false, fileManager: fm)
+
         guard let stagedAppInfo = LCAppInfo(bundlePath: stagedBundleURL.path) else {
             throw "lc.appList.infoPlistCannotReadError".loc
         }
@@ -472,21 +511,6 @@ final class LCAppInstaller {
         let destinationURL = baseFolder.appendingPathComponent(appRelativePath, isDirectory: true)
 
         if isReplace, fm.fileExists(atPath: destinationURL.path) {
-            let existingUserDataURL = destinationURL.appendingPathComponent("LCUserData", isDirectory: true)
-            if fm.fileExists(atPath: existingUserDataURL.path) {
-                let stagedUserDataURL = stagedBundleURL.appendingPathComponent("LCUserData", isDirectory: true)
-                if !fm.fileExists(atPath: stagedUserDataURL.path) {
-                    try fm.copyItem(at: existingUserDataURL, to: stagedUserDataURL)
-                } else {
-                    let existingItems = (try? fm.contentsOfDirectory(at: existingUserDataURL, includingPropertiesForKeys: nil)) ?? []
-                    for item in existingItems {
-                        let target = stagedUserDataURL.appendingPathComponent(item.lastPathComponent)
-                        if !fm.fileExists(atPath: target.path) {
-                            try? fm.copyItem(at: item, to: target)
-                        }
-                    }
-                }
-            }
             _ = try fm.replaceItemAt(destinationURL, withItemAt: stagedBundleURL, backupItemName: nil, options: [.usingNewMetadataOnly])
         } else {
             if fm.fileExists(atPath: destinationURL.path) {
@@ -502,21 +526,37 @@ final class LCAppInstaller {
         finalNewApp.isShared = isSharedTarget
         finalNewApp.clearIconCache()
 
-        if !isReplace && !finalNewApp.is32bit,
+        if !finalNewApp.is32bit,
            let bundleId = finalNewApp.bundleIdentifier(), !bundleId.isEmpty {
-            let folderName = UUID().uuidString
-            let initialContainer = LCContainer.makeNewContainer(
-                folderName: folderName,
-                name: folderName,
-                isShared: isSharedTarget
-            )
-            initialContainer.makeLCContainerInfoPlist(
-                appIdentifier: bundleId,
-                keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
-            )
-            finalNewApp.containers = [initialContainer]
-            finalNewApp.dataUUID = folderName
-            finalNewApp.save()
+            if let importedDataURL {
+                if let importWarning = try await restoreImportedContainerData(
+                    from: importedDataURL,
+                    for: finalNewApp,
+                    bundleId: bundleId,
+                    isReplace: isReplace,
+                    isSharedTarget: isSharedTarget,
+                    sharedModel: sharedModel
+                ) {
+                    warningMessage = warningMessage.map { "\($0)\n\n\(importWarning)" } ?? importWarning
+                }
+            } else if !isReplace {
+                let folderName = UUID().uuidString
+                let initialContainer = LCContainer.makeNewContainer(
+                    folderName: folderName,
+                    name: folderName,
+                    isShared: isSharedTarget
+                )
+                initialContainer.makeLCContainerInfoPlist(
+                    appIdentifier: bundleId,
+                    keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+                )
+                finalNewApp.containers = [initialContainer]
+                finalNewApp.dataUUID = folderName
+                finalNewApp.save()
+                if !isSharedTarget && !sharedModel.appDataFolderNames.contains(folderName) {
+                    sharedModel.appDataFolderNames.append(folderName)
+                }
+            }
         }
 
         let delegateToAssign = appToReplace?.delegate ?? sharedModel.appModelDelegate
@@ -555,6 +595,77 @@ final class LCAppInstaller {
         progressHandler?(1.0, "Installed")
 
         return LCAppInstallOutcome(installedApp: newAppModel, warningMessage: warningMessage)
+    }
+
+    /// Restores bundled `LCContainerData` into a live container folder for `finalNewApp`.
+    /// When replacing an existing app, creates a separate container rather than overwriting existing data.
+    private static func restoreImportedContainerData(
+        from importedDataURL: URL,
+        for finalNewApp: LCAppInfo,
+        bundleId: String,
+        isReplace: Bool,
+        isSharedTarget: Bool,
+        sharedModel: SharedModel
+    ) async throws -> String? {
+        let existingContainers = finalNewApp.containers
+        if isReplace && existingContainers.count >= SharedModel.keychainAccessGroupCount {
+            return "App updated, but bundled container data was skipped because this app already uses the maximum number of containers."
+        }
+
+        let usedGroups = Set(existingContainers.map(\.keychainGroupId))
+        let availableGroups = (0..<SharedModel.keychainAccessGroupCount).filter { !usedGroups.contains($0) }
+        let chosenGroup = availableGroups.randomElement() ?? Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+
+        let dataBaseURL = isSharedTarget ? LCPath.lcGroupDataPath : LCPath.dataPath
+        let folderName = UUID().uuidString
+        let containerDestURL = dataBaseURL.appendingPathComponent(folderName, isDirectory: true)
+
+        try await lcRunOffMain {
+            let fm = FileManager.default
+            try fm.createDirectory(at: dataBaseURL, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: containerDestURL.path) {
+                try fm.removeItem(at: containerDestURL)
+            }
+            try fm.moveItem(at: importedDataURL, to: containerDestURL)
+            let tmpDir = containerDestURL.appendingPathComponent("tmp", isDirectory: true)
+            if !fm.fileExists(atPath: tmpDir.path) {
+                try? fm.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            }
+        }
+
+        let importedInfoPlistURL = containerDestURL.appendingPathComponent("LCContainerInfo.plist")
+        let restoredContainer: LCContainer
+        if FileManager.default.fileExists(atPath: importedInfoPlistURL.path) {
+            let container = LCContainer(infoDict: ["folderName": folderName, "name": "Imported Data"], isShared: isSharedTarget)
+            container.loadName()
+            if container.name == "ERROR" || container.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                container.name = "Imported Data"
+            }
+            restoredContainer = container
+        } else {
+            restoredContainer = LCContainer.makeNewContainer(
+                folderName: folderName,
+                name: isReplace ? "Imported Data" : folderName,
+                isShared: isSharedTarget
+            )
+        }
+
+        restoredContainer.makeLCContainerInfoPlist(appIdentifier: bundleId, keychainGroupId: chosenGroup)
+
+        if isReplace {
+            var updated = existingContainers
+            updated.append(restoredContainer)
+            finalNewApp.containers = updated
+        } else {
+            finalNewApp.containers = [restoredContainer]
+        }
+        finalNewApp.dataUUID = folderName
+        finalNewApp.save()
+
+        if !isSharedTarget && !sharedModel.appDataFolderNames.contains(folderName) {
+            sharedModel.appDataFolderNames.append(folderName)
+        }
+        return nil
     }
 }
 

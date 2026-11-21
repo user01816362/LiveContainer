@@ -314,23 +314,38 @@ extension LCAppBannerViewController {
             guard let container = configuration.model.uiSelectedContainer else {
                 throw "Select a container before exporting app data."
             }
+            if container.storageBookMark != nil && container.resolvedContainerURL == nil {
+                throw container.bookmarkResolved
+                    ? "lc.container.externalStorageUnavailable".loc
+                    : "lc.container.bookmarkResolveInProgress".loc
+            }
             containerDataURL = container.containerURL
             containerHasBookmark = (container.storageBookMark != nil)
         }
         let appName = Self.sanitizedFileStem(appInfo.displayName() ?? "App")
+        let fallbackExecStem = Self.sanitizedFileStem(appInfo.info()?["CFBundleExecutable"] as? String ?? appName)
 
         return try await Task.detached(priority: .userInitiated) {
             let fm = FileManager.default
             let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCAppExport-\(UUID().uuidString)", isDirectory: true)
             defer { try? fm.removeItem(at: stagingRoot) }
-
             try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-            let payloadDir = stagingRoot.appendingPathComponent("Payload", isDirectory: true)
-            try fm.createDirectory(at: payloadDir, withIntermediateDirectories: true)
 
             let sourceAppURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
-            let destinationAppURL = payloadDir.appendingPathComponent(sourceAppURL.lastPathComponent, isDirectory: true)
-            try fm.copyItem(at: sourceAppURL, to: destinationAppURL)
+            let rawExecName = Self.readExecutableName(at: sourceAppURL) ?? fallbackExecStem
+            let cleanBundleStem = Self.sanitizedFileStem(rawExecName)
+            let stagedAppURL = stagingRoot.appendingPathComponent("\(cleanBundleStem).app", isDirectory: true)
+            try fm.copyItem(at: sourceAppURL, to: stagedAppURL)
+
+            // Restore original bundle ID if spoofed, remove LC-internal metadata/user data,
+            // and unpatch Mach-O executables back to standard MH_EXECUTE for portability.
+            try lcSanitizeStagedAppBundle(at: stagedAppURL, unpatchExecutables: true, fileManager: fm)
+
+            var mappings: [[String: Any]] = [[
+                "sourcePath": stagedAppURL.path,
+                "archivePrefix": "Payload/\(cleanBundleStem).app",
+                "skipSymlinks": false
+            ]]
 
             if let dataURL = containerDataURL {
                 if containerHasBookmark && !dataURL.startAccessingSecurityScopedResource() {
@@ -341,19 +356,23 @@ extension LCAppBannerViewController {
                         dataURL.stopAccessingSecurityScopedResource()
                     }
                 }
-                guard fm.fileExists(atPath: dataURL.path) else {
+                var dataIsDir: ObjCBool = false
+                guard fm.fileExists(atPath: dataURL.path, isDirectory: &dataIsDir), dataIsDir.boolValue else {
                     throw "Selected container data does not exist."
                 }
-                try Self.copyContainerDataForExport(
-                    from: dataURL,
-                    to: destinationAppURL.appendingPathComponent("LCUserData", isDirectory: true)
-                )
+                mappings.append([
+                    "sourcePath": dataURL.path,
+                    "archivePrefix": "LCContainerData",
+                    "skipSymlinks": true,
+                    "excludedNames": [".lc_profile_telemetry.plist", "tmp"]
+                ])
             }
 
             let fileName = includeData ? "\(appName)-with-data.ipa" : "\(appName).ipa"
             let exportURL = try lcExportArtifactFileURL(fileName: fileName, fileManager: fm)
-            try? fm.removeItem(at: exportURL)
-            try Self.zipDirectorySync(sourceURL: stagingRoot, destinationURL: exportURL)
+            if let archiveError = LCCreateZipArchive(exportURL.path, mappings) {
+                throw archiveError
+            }
             return exportURL
         }.value
     }
@@ -361,6 +380,11 @@ extension LCAppBannerViewController {
     private func createDataArchive() async throws -> URL {
         guard let container = configuration.model.uiSelectedContainer else {
             throw "Select a container before exporting data."
+        }
+        if container.storageBookMark != nil && container.resolvedContainerURL == nil {
+            throw container.bookmarkResolved
+                ? "lc.container.externalStorageUnavailable".loc
+                : "lc.container.bookmarkResolveInProgress".loc
         }
 
         let containerURL = container.containerURL
@@ -384,16 +408,16 @@ extension LCAppBannerViewController {
                 throw "Selected container path is not a directory."
             }
 
-            let stagingRoot = fm.temporaryDirectory.appendingPathComponent("LCDataExport-\(UUID().uuidString)", isDirectory: true)
-            defer { try? fm.removeItem(at: stagingRoot) }
-            try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-
-            let stagedContainerURL = stagingRoot.appendingPathComponent("\(appName)-\(containerName)-data", isDirectory: true)
-            try Self.copyContainerDataForExport(from: containerURL, to: stagedContainerURL)
-
             let exportURL = try lcExportArtifactFileURL(fileName: "\(appName)-\(containerName)-data.zip", fileManager: fm)
-            try? fm.removeItem(at: exportURL)
-            try Self.zipDirectorySync(sourceURL: stagedContainerURL, destinationURL: exportURL)
+            let mappings: [[String: Any]] = [[
+                "sourcePath": containerURL.path,
+                "archivePrefix": "",
+                "skipSymlinks": true,
+                "excludedNames": [".lc_profile_telemetry.plist", "tmp"]
+            ]]
+            if let archiveError = LCCreateZipArchive(exportURL.path, mappings) {
+                throw archiveError
+            }
             return exportURL
         }.value
     }
@@ -421,34 +445,27 @@ extension LCAppBannerViewController {
             }
 
             let archiveURL = try lcExportArtifactFileURL(fileName: "\(appName)-dylibs-frameworks.zip", fileManager: fm)
-            try? fm.removeItem(at: archiveURL)
-            try Self.zipDirectorySync(sourceURL: contentRoot, destinationURL: archiveURL)
+            let mappings: [[String: Any]] = [[
+                "sourcePath": contentRoot.path,
+                "archivePrefix": "",
+                "skipSymlinks": false
+            ]]
+            if let archiveError = LCCreateZipArchive(archiveURL.path, mappings) {
+                throw archiveError
+            }
             return archiveURL
         }.value
     }
 
-    nonisolated private static func zipDirectorySync(sourceURL: URL, destinationURL: URL) throws {
-        let coordinator = NSFileCoordinator()
-        var coordinationError: NSError?
-        var copyError: Error?
-
-        coordinator.coordinate(readingItemAt: sourceURL, options: [.forUploading], error: &coordinationError) { zippedURL in
-            do {
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    try FileManager.default.removeItem(at: destinationURL)
-                }
-                try FileManager.default.copyItem(at: zippedURL, to: destinationURL)
-            } catch {
-                copyError = error
-            }
+    nonisolated private static func readExecutableName(at appBundleURL: URL) -> String? {
+        let infoURL = appBundleURL.appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: infoURL),
+              let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let name = dict["CFBundleExecutable"] as? String,
+              !name.isEmpty else {
+            return nil
         }
-
-        if let copyError {
-            throw copyError
-        }
-        if let coordinationError {
-            throw coordinationError
-        }
+        return name
     }
 
     @MainActor
@@ -460,13 +477,9 @@ extension LCAppBannerViewController {
             popover.permittedArrowDirections = []
         }
         activityController.completionWithItemsHandler = { _, _, _, _ in
-            Self.cleanupExportArtifacts()
+            try? FileManager.default.removeItem(at: fileURL)
         }
         present(activityController, animated: true)
-    }
-
-    nonisolated private static func cleanupExportArtifacts() {
-        try? FileManager.default.removeItem(at: lcExportArtifactDirectoryURL())
     }
 
     @MainActor
@@ -480,106 +493,14 @@ extension LCAppBannerViewController {
     }
 
     nonisolated private static func sanitizedFileStem(_ value: String) -> String {
-        let invalidCharacters = CharacterSet(charactersIn: "/\\:?%*|\"<>")
+        let invalidCharacters = CharacterSet(charactersIn: "/\\:?%*|\"<>").union(.controlCharacters)
         let cleaned = value
             .components(separatedBy: invalidCharacters)
             .joined(separator: "_")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? "Export" : cleaned
-    }
-
-    nonisolated private static func copyContainerDataForExport(from sourceContainerURL: URL, to destinationContainerURL: URL) throws {
-        let fm = FileManager.default
-        var sourceIsDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: sourceContainerURL.path, isDirectory: &sourceIsDirectory), sourceIsDirectory.boolValue else {
-            throw "Selected container path is not a directory."
+        if cleaned.isEmpty || cleaned == "." || cleaned == ".." {
+            return "Export"
         }
-        try copyDirectoryForExport(from: sourceContainerURL, to: destinationContainerURL)
-    }
-
-    nonisolated private static func copyDirectoryForExport(from sourceDirectoryURL: URL, to destinationDirectoryURL: URL) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: destinationDirectoryURL, withIntermediateDirectories: true)
-
-        let items = try fm.contentsOfDirectory(
-            at: sourceDirectoryURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileResourceTypeKey],
-            options: []
-        )
-
-        for itemURL in items {
-            let values = try itemURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileResourceTypeKey])
-            if shouldSkipDataExportItem(values: values) {
-                continue
-            }
-
-            let destinationItemURL = destinationDirectoryURL.appendingPathComponent(itemURL.lastPathComponent, isDirectory: values.isDirectory ?? false)
-            if values.isDirectory == true {
-                try copyDirectoryForExport(from: itemURL, to: destinationItemURL)
-                continue
-            }
-
-            do {
-                try fm.copyItem(at: itemURL, to: destinationItemURL)
-            } catch {
-                if shouldIgnoreDataExportCopyError(error, resourceValues: values) {
-                    continue
-                }
-                throw error
-            }
-        }
-    }
-
-    nonisolated private static func shouldSkipDataExportItem(values: URLResourceValues) -> Bool {
-        if values.isSymbolicLink == true {
-            return true
-        }
-        if let resourceType = values.fileResourceType {
-            switch resourceType {
-            case .socket, .characterSpecial, .blockSpecial, .namedPipe, .unknown:
-                return true
-            default:
-                break
-            }
-        }
-        return false
-    }
-
-    nonisolated private static func shouldIgnoreDataExportCopyError(_ error: Error, resourceValues: URLResourceValues) -> Bool {
-        if shouldSkipDataExportItem(values: resourceValues) {
-            return true
-        }
-        let nsError = error as NSError
-        if !isNoSuchFileError(nsError) {
-            if nsError.domain == NSPOSIXErrorDomain {
-                switch nsError.code {
-                case Int(POSIXErrorCode.EINVAL.rawValue),
-                     Int(POSIXErrorCode.EPERM.rawValue),
-                     Int(POSIXErrorCode.ENOTSUP.rawValue),
-                     Int(POSIXErrorCode.EOPNOTSUPP.rawValue):
-                    return true
-                default:
-                    break
-                }
-            }
-            return false
-        }
-        if resourceValues.isSymbolicLink == true {
-            return true
-        }
-        if let resourceType = resourceValues.fileResourceType {
-            return resourceType == .socket || resourceType == .namedPipe
-        }
-        return false
-    }
-
-    nonisolated private static func isNoSuchFileError(_ nsError: NSError) -> Bool {
-        if nsError.domain == NSCocoaErrorDomain {
-            return nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError
-        }
-        if nsError.domain == NSPOSIXErrorDomain {
-            return nsError.code == ENOENT
-        }
-        return false
+        return cleaned
     }
 }

@@ -3,8 +3,8 @@
 //  LiveContainerSwiftUI
 //
 //  Generates shareable Objective-C `.h` header files, full `Headers.zip`
-//  archives (via Foundation `NSFileCoordinator(.forUploading)`), Markdown
-//  analysis reports, and machine-readable JSON reports in `tmp/LCExports`.
+//  archives (via streaming libarchive), Markdown analysis reports, and
+//  machine-readable JSON reports in `tmp/LCExports`.
 //
 
 import Foundation
@@ -93,27 +93,18 @@ enum LCMachOExportService {
             try swiftText.write(to: packageDir.appendingPathComponent("SwiftTypes.swift"), atomically: true, encoding: .utf8)
         }
 
-        // Zip directory using Foundation NSFileCoordinator(.forUploading)
+        // Zip directory using streaming libarchive
         let destZipURL = try lcExportArtifactFileURL(fileName: "\(safeBinary)-Headers-\(UUID().uuidString.prefix(8)).zip")
-        if fm.fileExists(atPath: destZipURL.path) {
-            try fm.removeItem(at: destZipURL)
-        }
-
-        var coordinatorError: NSError?
-        var copyError: Error?
-        let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: packageDir, options: .forUploading, error: &coordinatorError) { zipTempURL in
-            do {
-                try fm.copyItem(at: zipTempURL, to: destZipURL)
-            } catch {
-                copyError = error
-            }
-        }
-        if let err = coordinatorError ?? copyError {
-            throw LCMachOInspectorError.exportFailed(err.localizedDescription)
+        let mappings: [[String: Any]] = [[
+            "sourcePath": packageDir.path,
+            "archivePrefix": "\(safeBinary)-Headers",
+            "skipSymlinks": true
+        ]]
+        if let archiveError = LCCreateZipArchive(destZipURL.path, mappings) {
+            throw LCMachOInspectorError.exportFailed(archiveError)
         }
         guard fm.fileExists(atPath: destZipURL.path) else {
-            throw LCMachOInspectorError.exportFailed("Archive coordinator did not produce a zip file.")
+            throw LCMachOInspectorError.exportFailed("ZIP archive was not created.")
         }
         return destZipURL
     }
