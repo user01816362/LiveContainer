@@ -57,7 +57,7 @@ struct LCDebugConsolePanel: View {
                     consoleStore.autoScroll.toggle()
                 } label: {
                     Image(systemName: "arrow.down.to.line")
-                        .foregroundStyle(consoleStore.autoScroll ? .cyan : .secondary)
+                        .foregroundStyle(consoleStore.autoScroll ? Color.cyan : Color.secondary)
                 }
                 .buttonStyle(.glass)
                 .controlSize(.mini)

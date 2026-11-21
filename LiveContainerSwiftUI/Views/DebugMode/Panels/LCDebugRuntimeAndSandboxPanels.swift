@@ -184,7 +184,7 @@ struct LCDebugRuntimePanel: View {
                             "FridaGadget: \(info.fridaGadgetLoaded ? "Loaded" : "Absent")",
                             systemImage: info.fridaGadgetLoaded ? "checkmark.circle.fill" : "circle.dashed"
                         )
-                        .foregroundStyle(info.fridaGadgetLoaded ? .green : .secondary)
+                        .foregroundStyle(info.fridaGadgetLoaded ? Color.green : Color.secondary)
                     }
                     .font(.caption.bold())
 
@@ -360,7 +360,7 @@ struct LCDebugSandboxPanel: View {
                             HStack {
                                 Image(systemName: file.type == "dir" ? "folder.fill" : "doc.text")
                                     .font(.caption2)
-                                    .foregroundStyle(file.type == "dir" ? .cyan : .secondary)
+                                    .foregroundStyle(file.type == "dir" ? Color.cyan : Color.secondary)
                                 Text(file.path)
                                     .font(.caption2.monospaced())
                                 Spacer()

@@ -235,7 +235,7 @@ private struct LCDebugHierarchyTreeRowView: View {
                 HStack(spacing: 5) {
                     Text(row.node.className)
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(row.node.isDimmed ? .secondary : .white)
+                        .foregroundStyle(row.node.isDimmed ? Color.secondary : Color.white)
                         .lineLimit(1)
                     if let vc = row.node.viewController, !vc.isEmpty {
                         Text(vc)

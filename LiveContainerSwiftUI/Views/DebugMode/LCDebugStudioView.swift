@@ -431,7 +431,7 @@ private struct LCDebugStudioHeaderBar: View {
                             .frame(width: 6, height: 6)
                         Text(connectionLabel)
                             .font(.caption2)
-                            .foregroundStyle(manager.connectionError != nil ? .orange : .secondary)
+                            .foregroundStyle(manager.connectionError != nil ? Color.orange : Color.secondary)
                             .lineLimit(1)
                     }
                 }
