@@ -104,12 +104,21 @@ struct LCMultitaskSettingView: View {
                     }
                 }
                 if autoHideDock {
-                    Picker("lc.settings.autoHideDockDelay".loc, selection: $autoHideDockDelay) {
-                        Text("2s").tag(2.0)
-                        Text("3s").tag(3.0)
-                        Text("5s").tag(5.0)
-                        Text("10s").tag(10.0)
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("lc.settings.autoHideDockDelay".loc)
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Text("\(Int(autoHideDockDelay))s")
+                                .foregroundColor(.secondary)
+                                .font(.caption)
+                        }
+                        Slider(value: $autoHideDockDelay, in: 1...10, step: 1) {
+                            Text("lc.settings.autoHideDockDelay".loc)
+                        }
+                        .tint(.accentColor)
                     }
+                    .padding(.vertical, 4)
                 }
             }
         }
