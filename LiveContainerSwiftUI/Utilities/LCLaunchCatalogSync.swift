@@ -14,13 +14,27 @@ enum LCLaunchCatalogSync {
     static let iconsFolderName = "LaunchCatalogIcons"
     private static let legacyPrivateDocBookmarkKey = "LCLaunchExtensionPrivateDocBookmark"
     private static let iconFilenames = ["LCAppIconLight.png", "LCAppIconDark.png"]
+    private static var pendingSyncTask: Task<Void, Never>?
+    private static var pendingIconTask: Task<Void, Never>?
+
+    private struct IconMirrorItem: Sendable {
+        let folderName: String
+        let sourceDir: URL
+    }
 
     static func syncFromSharedModel() {
-        let model = DataManager.shared.model
-        sync(apps: model.apps, hiddenApps: model.hiddenApps, multiLCStatus: model.multiLCStatus)
+        pendingSyncTask?.cancel()
+        pendingSyncTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            let model = DataManager.shared.model
+            sync(apps: model.apps, hiddenApps: model.hiddenApps, multiLCStatus: model.multiLCStatus)
+        }
     }
 
     static func sync(apps: [LCAppModel], hiddenApps: [LCAppModel], multiLCStatus: Int = DataManager.shared.model.multiLCStatus) {
+        pendingSyncTask?.cancel()
+        pendingSyncTask = nil
         guard multiLCStatus != 2 else {
             return
         }
@@ -34,10 +48,7 @@ enum LCLaunchCatalogSync {
         let visiblePool = strictHiding ? apps : (apps + hiddenApps)
 
         var catalog: [String: [String: Any]] = [:]
-        var activeIconFolders: Set<String> = []
-        let iconsRoot = LCSharedUtils.appGroupPath()?
-            .appendingPathComponent("LiveContainer", isDirectory: true)
-            .appendingPathComponent(iconsFolderName, isDirectory: true)
+        var iconItems: [IconMirrorItem] = []
 
         for app in visiblePool {
             let info = app.appInfo
@@ -85,44 +96,71 @@ enum LCLaunchCatalogSync {
             }
             catalog[relativePath] = entry
 
-            if let iconsRoot, !app.uiIsShared, let bundlePath = info.bundlePath(), !bundlePath.isEmpty {
-                activeIconFolders.insert(relativePath)
-                let srcDir = URL(fileURLWithPath: bundlePath, isDirectory: true)
-                let dstDir = iconsRoot.appendingPathComponent(relativePath, isDirectory: true)
-                mirrorIcons(from: srcDir, to: dstDir, info: info)
+            if !app.uiIsShared, let bundlePath = info.bundlePath(), !bundlePath.isEmpty {
+                iconItems.append(IconMirrorItem(
+                    folderName: relativePath,
+                    sourceDir: URL(fileURLWithPath: bundlePath, isDirectory: true)
+                ))
             }
-        }
-
-        if let iconsRoot {
-            let builtInSideStoreSrc = LCPath.docPath
-                .appendingPathComponent("SideStore/Library/Caches", isDirectory: true)
-                .appendingPathComponent("BuiltInSideStoreIconCache", isDirectory: true)
-            if FileManager.default.fileExists(atPath: builtInSideStoreSrc.path) {
-                activeIconFolders.insert("builtinSideStore")
-                let dstDir = iconsRoot.appendingPathComponent("builtinSideStore", isDirectory: true)
-                mirrorIcons(from: builtInSideStoreSrc, to: dstDir, info: nil)
-            }
-            pruneStaleIconFolders(in: iconsRoot, keeping: activeIconFolders)
         }
 
         sharedDefaults.set(catalog, forKey: catalogKey)
+
+        guard let iconsRoot = LCSharedUtils.appGroupPath()?
+            .appendingPathComponent("LiveContainer", isDirectory: true)
+            .appendingPathComponent(iconsFolderName, isDirectory: true) else {
+            return
+        }
+        let builtInSideStoreSrc = LCPath.docPath
+            .appendingPathComponent("SideStore/Library/Caches", isDirectory: true)
+            .appendingPathComponent("BuiltInSideStoreIconCache", isDirectory: true)
+
+        pendingIconTask?.cancel()
+        pendingIconTask = Task.detached(priority: .utility) {
+            Self.mirrorAllIcons(
+                items: iconItems,
+                builtInSideStoreSrc: builtInSideStoreSrc,
+                iconsRoot: iconsRoot
+            )
+        }
     }
 
     private static func isSafeSingleComponent(_ value: String) -> Bool {
         !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
     }
 
-    private static func mirrorIcons(from srcDir: URL, to dstDir: URL, info: LCAppInfo?) {
+    private nonisolated static func mirrorAllIcons(
+        items: [IconMirrorItem],
+        builtInSideStoreSrc: URL,
+        iconsRoot: URL
+    ) {
         let fm = FileManager.default
+        var activeIconFolders: Set<String> = []
+
+        for item in items {
+            guard !Task.isCancelled else { return }
+            activeIconFolders.insert(item.folderName)
+            let dstDir = iconsRoot.appendingPathComponent(item.folderName, isDirectory: true)
+            mirrorIcons(from: item.sourceDir, to: dstDir, fileManager: fm)
+        }
+
+        if fm.fileExists(atPath: builtInSideStoreSrc.path) {
+            activeIconFolders.insert("builtinSideStore")
+            let dstDir = iconsRoot.appendingPathComponent("builtinSideStore", isDirectory: true)
+            mirrorIcons(from: builtInSideStoreSrc, to: dstDir, fileManager: fm)
+        }
+
+        guard !Task.isCancelled else { return }
+        pruneStaleIconFolders(in: iconsRoot, keeping: activeIconFolders, fileManager: fm)
+    }
+
+    private nonisolated static func mirrorIcons(from srcDir: URL, to dstDir: URL, fileManager fm: FileManager) {
         if !fm.fileExists(atPath: dstDir.path) {
             try? fm.createDirectory(at: dstDir, withIntermediateDirectories: true)
         }
-        for (index, filename) in iconFilenames.enumerated() {
+        for filename in iconFilenames {
             let src = srcDir.appendingPathComponent(filename)
             let dst = dstDir.appendingPathComponent(filename)
-            if !fm.fileExists(atPath: src.path), !fm.fileExists(atPath: dst.path), let info {
-                _ = info.iconIsDarkIcon(index == 1)
-            }
             guard fm.fileExists(atPath: src.path) else {
                 continue
             }
@@ -136,8 +174,11 @@ enum LCLaunchCatalogSync {
         }
     }
 
-    private static func pruneStaleIconFolders(in iconsRoot: URL, keeping activeFolders: Set<String>) {
-        let fm = FileManager.default
+    private nonisolated static func pruneStaleIconFolders(
+        in iconsRoot: URL,
+        keeping activeFolders: Set<String>,
+        fileManager fm: FileManager
+    ) {
         guard let existing = try? fm.contentsOfDirectory(at: iconsRoot, includingPropertiesForKeys: nil) else {
             return
         }

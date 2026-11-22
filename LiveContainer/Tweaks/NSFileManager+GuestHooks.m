@@ -6,6 +6,7 @@
 #include "../LCMachOUtils.h"
 #import <dlfcn.h>
 #include <mach-o/getsect.h>
+#import <os/lock.h>
 #if __has_include(<ptrauth.h>)
 #include <ptrauth.h>
 #endif
@@ -16,6 +17,9 @@ BOOL isolateAppGroup = NO;
 BOOL strictTestMode = NO;
 static BOOL isolateWebViewData = NO;
 static NSString *extensionParentContainerPath;
+static NSString *sHostAppGroupID = nil;
+static os_unfair_lock sCreatedCachesLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableSet<NSString *> *sCreatedGroupCachePaths = nil;
 void* webKitHeader = 0;
 static uintptr_t webKitTextStart = 0;
 static uintptr_t webKitTextEnd = 0;
@@ -36,6 +40,7 @@ static void updateWebKitTextBounds(void) {
 }
 void NSFMGuestExtensionHooksInit(NSString *parentContainerPath) {
     LCStealthRegisterInternalRanges();
+    sHostAppGroupID = [NSClassFromString(@"LCSharedUtils") appGroupID];
     extensionParentContainerPath = parentContainerPath;
     NSDictionary *infoDict = [NSUserDefaults guestContainerInfo];
     strictTestMode = [infoDict[@"strictTestMode"] boolValue];
@@ -46,6 +51,7 @@ void NSFMGuestExtensionHooksInit(NSString *parentContainerPath) {
 
 void NSFMGuestHooksInit(void) {
     LCStealthRegisterInternalRanges();
+    sHostAppGroupID = [NSClassFromString(@"LCSharedUtils") appGroupID];
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
     strictTestMode = [infoDict[@"strictTestMode"] boolValue];
     isolateAppGroup = strictTestMode || [infoDict[@"isolateAppGroup"] boolValue];
@@ -82,7 +88,11 @@ void NSFMGuestHooksInit(void) {
 @implementation NSFileManager(LiveContainerHooks)
 
 - (nullable NSURL *)hook_containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-    if([groupIdentifier isEqualToString:[NSClassFromString(@"LCSharedUtils") appGroupID]]) {
+    if (groupIdentifier.length == 0) {
+        return nil;
+    }
+    NSString *hostAppGroupID = sHostAppGroupID ?: [NSClassFromString(@"LCSharedUtils") appGroupID];
+    if([groupIdentifier isEqualToString:hostAppGroupID]) {
         void *rawCaller = __builtin_return_address(0);
 #ifdef __PTRAUTH_INTRINSICS__
         void *strippedCaller = ptrauth_strip(rawCaller, ptrauth_key_return_address);
@@ -104,7 +114,22 @@ void NSFMGuestHooksInit(void) {
         NSString *lcHome = [NSClassFromString(@"LCSharedUtils") cachedLcHomePath] ?: NSHomeDirectory();
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/Documents/Data/AppGroup/%@", lcHome, groupIdentifier]];
     }
-    [NSFileManager.defaultManager createDirectoryAtURL:[result URLByAppendingPathComponent:@"Library/Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *groupPath = result.path;
+    if (groupPath.length > 0) {
+        BOOL shouldCreateCaches = NO;
+        os_unfair_lock_lock(&sCreatedCachesLock);
+        if (!sCreatedGroupCachePaths) {
+            sCreatedGroupCachePaths = [NSMutableSet set];
+        }
+        if (![sCreatedGroupCachePaths containsObject:groupPath]) {
+            [sCreatedGroupCachePaths addObject:groupPath];
+            shouldCreateCaches = YES;
+        }
+        os_unfair_lock_unlock(&sCreatedCachesLock);
+        if (shouldCreateCaches) {
+            [NSFileManager.defaultManager createDirectoryAtURL:[result URLByAppendingPathComponent:@"Library/Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+    }
     return result;
 }
 

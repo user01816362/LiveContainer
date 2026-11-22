@@ -305,7 +305,7 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
     isLiveProcess = true;
     lcAppUrlScheme = @"liveprocess";
     lcSharedDefaults = [[NSUserDefaults alloc] initWithSuiteName:LCSharedUtils.appGroupID];
-    [LCSharedUtils isJITLessConfigured];
+    BOOL jitLessConfigured = [LCSharedUtils isJITLessConfigured];
     lcAppGroupPath = [request[@"appGroupPath"] length] ? request[@"appGroupPath"] : nil;
     guestAppInfo = request[@"guestAppInfo"];
     guestContainerInfo = request[@"guestContainerInfo"];
@@ -324,13 +324,23 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
     NSString *bundlePath = request[@"bundlePath"];
     NSString *homePath = request[@"containerPath"];
     NSString *lcHomePath = request[@"lcHomePath"];
+    if (bundlePath.length == 0 || homePath.length == 0) {
+        return @"Missing guest extension bundle or container path.";
+    }
 
     NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+    if (!bundle || bundle.executablePath.length == 0) {
+        return @"Guest extension executable path not found.";
+    }
 
     lcGuestAppId = bundle.bundleIdentifier;
     NSString *originalHome = NSHomeDirectory();
-    setenv("LP_HOME_PATH", originalHome.fileSystemRepresentation, 1);
-    setenv("LC_HOME_PATH", lcHomePath.fileSystemRepresentation, 1);
+    if (originalHome.length > 0) {
+        setenv("LP_HOME_PATH", originalHome.fileSystemRepresentation, 1);
+    }
+    if (lcHomePath.length > 0) {
+        setenv("LC_HOME_PATH", lcHomePath.fileSystemRepresentation, 1);
+    }
     setenv("HOME", homePath.fileSystemRepresentation, 1);
     setenv("CFFIXED_USER_HOME", homePath.fileSystemRepresentation, 1);
     setenv("TMPDIR", [[homePath stringByAppendingPathComponent:@"tmp"] stringByAppendingString:@"/"].fileSystemRepresentation, 1);
@@ -349,14 +359,14 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
         initDead10ccFix();
     }
 
-    if (!LCSharedUtils.isJITLessConfigured && !isSideStore) {
+    if (!jitLessConfigured && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
 #else
         if (checkJITEnabled()) init_bypassDyldLibValidation();
 #endif
     }
-    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.isJITLessConfigured;
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && jitLessConfigured;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     appMainImageIndex = _dyld_image_count();
     __block void *handle = NULL;
@@ -559,6 +569,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         if(isLiveProcess) {
             newHomePath = [lcUserDefaults stringForKey:@"specifiedSideStoreContainerPath"];;
             [lcUserDefaults removeObjectForKey:@"specifiedSideStoreContainerPath"];
+            if (newHomePath.length == 0) {
+                return @"SideStore container path not available. Please relaunch SideStore.";
+            }
         } else {
             newHomePath = [docPath stringByAppendingPathComponent:@"SideStore"];
         }
@@ -588,7 +601,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
 
     NSString *newTmpPath = [newHomePath stringByAppendingPathComponent:@"tmp"];
-    remove(newTmpPath.UTF8String);
+    [fm removeItemAtPath:newTmpPath error:nil];
     symlink(effectiveTmpDir.UTF8String, newTmpPath.UTF8String);
 
     if ([guestAppInfo[@"doSymlinkInbox"] boolValue] && kernelTmpDir.length > 0) {
@@ -673,7 +686,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
-    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.isJITLessConfigured && isLiveProcess;
+    BOOL hookDlopen = isLiveProcess && !isSideStore && !isSharedBundle && LCSharedUtils.isJITLessConfigured;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     
     // IDFV spoofing is handled by UIKit+GuestHooks.m via UIDevice.identifierForVendor swizzle,

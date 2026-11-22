@@ -553,8 +553,11 @@ final class ShareExtensionViewModel: ObservableObject {
 
         sharedDefaults?.set("livecontainer", forKey: "LCLaunchExtensionScheme")
         sharedDefaults?.set("builtinSideStore", forKey: "LCLaunchExtensionBundleID")
+        sharedDefaults?.removeObject(forKey: "LCLaunchExtensionContainerName")
         if let launchURLString {
             sharedDefaults?.set(launchURLString, forKey: "LCLaunchExtensionLaunchURL")
+        } else {
+            sharedDefaults?.removeObject(forKey: "LCLaunchExtensionLaunchURL")
         }
         sharedDefaults?.set(Date(), forKey: "LCLaunchExtensionLaunchDate")
 
@@ -612,6 +615,8 @@ final class ShareExtensionViewModel: ObservableObject {
             sharedDefaults?.set(item.container.folderName, forKey: "LCLaunchExtensionContainerName")
             if let launchURLString {
                 sharedDefaults?.set(launchURLString, forKey: "LCLaunchExtensionLaunchURL")
+            } else {
+                sharedDefaults?.removeObject(forKey: "LCLaunchExtensionLaunchURL")
             }
             sharedDefaults?.set(Date(), forKey: "LCLaunchExtensionLaunchDate")
         }

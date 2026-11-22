@@ -109,6 +109,7 @@ struct LaunchAppExtension: AppIntent {
         
         guard
             let appGroupId = LCSharedUtils.appGroupID(),
+            appGroupId != "Unknown",
             let lcSharedDefaults = UserDefaults(suiteName: appGroupId)
         else {
             throw LaunchAppExtensionError("lcSharedDefaults failed to initialize, because no app group was found. Did you sign LiveContainer correctly?")
@@ -135,6 +136,9 @@ struct LaunchAppExtension: AppIntent {
         
         for queryItem in components.queryItems ?? [] {
             if queryItem.name == "bundle-name", let bundleId1 = queryItem.value {
+                guard Self.isSafeContainerFolderName(bundleId1) else {
+                    throw LaunchAppExtensionError("Invalid bundle-name parameter.")
+                }
                 bundleId = bundleId1
             } else if queryItem.name == "container-folder-name", let containerName1 = queryItem.value {
                 guard Self.isSafeContainerFolderName(containerName1) else {

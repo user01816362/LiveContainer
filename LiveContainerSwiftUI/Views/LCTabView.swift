@@ -114,7 +114,6 @@ struct LCTabView: View {
             checkTeamId()
             checkAndSaveBundleId()
             checkGetTaskAllow()
-            LCLaunchCatalogSync.syncFromSharedModel()
         }
         .onChange(of: sharedModel.apps) { _, _ in
             LCLaunchCatalogSync.syncFromSharedModel()

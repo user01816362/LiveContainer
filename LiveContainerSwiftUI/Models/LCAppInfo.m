@@ -8,7 +8,12 @@
 #import "../../LiveContainer/LCSharedUtils.h"
 
 
-@implementation LCAppInfo
+@implementation LCAppInfo {
+    UIColor *_memCachedColor;
+    BOOL _hasMemCachedColor;
+    UIColor *_memCachedColorDark;
+    BOOL _hasMemCachedColorDark;
+}
 
 - (instancetype)initWithBundlePath:(NSString*)bundlePath {
     self = [super init];
@@ -697,22 +702,28 @@
 }
 
 - (UIColor*)cachedColor {
+    if (_hasMemCachedColor) {
+        return _memCachedColor;
+    }
+    UIColor *resolved = nil;
     if(_info[@"cachedColor"] != nil) {
         NSData *colorData = _info[@"cachedColor"];
         NSError* error;
         UIColor *color = [NSKeyedUnarchiver unarchivedObjectOfClass:UIColor.class fromData:colorData error:&error];
         if (!error) {
-            return color;
+            resolved = color;
         } else {
             NSLog(@"[LC] failed to get color %@", error);
-            return nil;
         }
-    } else {
-        return nil;
     }
+    _memCachedColor = resolved;
+    _hasMemCachedColor = YES;
+    return resolved;
 }
 
 - (void)setCachedColor:(UIColor*) color {
+    _memCachedColor = color;
+    _hasMemCachedColor = YES;
     if(color == nil) {
         _info[@"cachedColor"] = nil;
     } else {
@@ -728,22 +739,28 @@
 }
 
 - (UIColor*)cachedColorDark {
+    if (_hasMemCachedColorDark) {
+        return _memCachedColorDark;
+    }
+    UIColor *resolved = nil;
     if(_info[@"cachedColorDark"] != nil) {
         NSData *colorData = _info[@"cachedColorDark"];
         NSError* error;
         UIColor *color = [NSKeyedUnarchiver unarchivedObjectOfClass:UIColor.class fromData:colorData error:&error];
         if (!error) {
-            return color;
+            resolved = color;
         } else {
             NSLog(@"[LC] failed to get color %@", error);
-            return nil;
         }
-    } else {
-        return nil;
     }
+    _memCachedColorDark = resolved;
+    _hasMemCachedColorDark = YES;
+    return resolved;
 }
 
 - (void)setCachedColorDark:(UIColor*)color {
+    _memCachedColorDark = color;
+    _hasMemCachedColorDark = YES;
     if(color == nil) {
         _info[@"cachedColorDark"] = nil;
     } else {

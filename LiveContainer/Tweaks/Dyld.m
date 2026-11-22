@@ -183,7 +183,7 @@ int hook_dladdr(const void *addr, Dl_info *info) {
 
 void* hook_dlsym(void * __handle, const char * __symbol) {
     if(__handle == (void*)RTLD_MAIN_ONLY) {
-        if(strcmp(__symbol, MH_EXECUTE_SYM) == 0) {
+        if(__symbol && strcmp(__symbol, MH_EXECUTE_SYM) == 0) {
             if(!appExecutableFileTypeOverwritten) {
                 overwriteAppExecutableFileType();
                 appExecutableFileTypeOverwritten = true;

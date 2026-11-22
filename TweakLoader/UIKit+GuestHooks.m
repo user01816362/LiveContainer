@@ -1006,6 +1006,9 @@ static BOOL LCInterceptSysctlByKey(const char *name, void *oldp, size_t *oldlenp
 }
 
 static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (!spoofProfileEnabled && !blockDeviceInfoReads) {
+        return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    }
     int handledReturn = 0;
     if (LCInterceptSysctlByKey(name, oldp, oldlenp, newp, &handledReturn)) {
         return handledReturn;
@@ -1091,6 +1094,9 @@ static const char *LCSysctlNameFromMIB(const int *name, u_int namelen) {
 }
 
 static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (!spoofProfileEnabled && !blockDeviceInfoReads) {
+        return sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    }
     const char *mappedName = LCSysctlNameFromMIB(name, namelen);
     int handledReturn = 0;
     if (mappedName && LCInterceptSysctlByKey(mappedName, oldp, oldlenp, newp, &handledReturn)) {
@@ -1704,24 +1710,6 @@ static void UIKitGuestHooksInit(void) {
         sRealHostMachine = @(rawUts.machine);
     }
 
-    const char *homeEnv = getenv("HOME");
-    NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
-    if (homePath.length > 0 && !NSUserDefaults.isSideStore) {
-        sTelemetryFilePath = [homePath stringByAppendingPathComponent:@".lc_profile_telemetry.plist"];
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                        object:nil
-                                                         queue:nil
-                                                    usingBlock:^(NSNotification * _Nonnull note) {
-            LCFlushProfileTelemetryToDisk(YES);
-        }];
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillTerminateNotification
-                                                        object:nil
-                                                         queue:nil
-                                                    usingBlock:^(NSNotification * _Nonnull note) {
-            LCFlushProfileTelemetryToDisk(YES);
-        }];
-    }
-
     swizzle(UIApplication.class, @selector(_applicationOpenURLAction:payload:origin:), @selector(hook__applicationOpenURLAction:payload:origin:));
     swizzle(UIApplication.class, @selector(_connectUISceneFromFBSScene:transitionContext:), @selector(hook__connectUISceneFromFBSScene:transitionContext:));
     swizzle(UIApplication.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
@@ -1775,6 +1763,28 @@ static void UIKitGuestHooksInit(void) {
     }
 
     BOOL shouldEnableSpoofProfile = [guestContainerInfo[@"spoofProfileEnabled"] boolValue];
+    if (shouldEnableSpoofProfile) {
+        spoofProfileEnabled = YES;
+    }
+    if ((spoofProfileEnabled || blockDeviceInfoReads) && !NSUserDefaults.isSideStore) {
+        const char *homeEnv = getenv("HOME");
+        NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
+        if (homePath.length > 0) {
+            sTelemetryFilePath = [homePath stringByAppendingPathComponent:@".lc_profile_telemetry.plist"];
+            [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                            object:nil
+                                                             queue:nil
+                                                        usingBlock:^(NSNotification * _Nonnull note) {
+                LCFlushProfileTelemetryToDisk(YES);
+            }];
+            [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillTerminateNotification
+                                                            object:nil
+                                                             queue:nil
+                                                        usingBlock:^(NSNotification * _Nonnull note) {
+                LCFlushProfileTelemetryToDisk(YES);
+            }];
+        }
+    }
     NSDictionary *featureOverrides = guestContainerInfo[@"spoofFeatureOverrides"];
     if([featureOverrides isKindOfClass:NSDictionary.class]) spoofFeatureOverrides = featureOverrides;
     spoofIdentityCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofIdentityCategoryEnabled", YES);
@@ -3034,8 +3044,16 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 static const char kLCWebUserContentConfiguredKey = 0;
 
 static WKWebsiteDataStore *LCIsolatedWebsiteDataStore(BOOL ephemeral) {
-    if (ephemeral || strictTestMode) {
+    if (ephemeral) {
         return [WKWebsiteDataStore nonPersistentDataStore];
+    }
+    if (strictTestMode) {
+        static WKWebsiteDataStore *sStrictEphemeralStore = nil;
+        static dispatch_once_t strictStoreOnce;
+        dispatch_once(&strictStoreOnce, ^{
+            sStrictEphemeralStore = [WKWebsiteDataStore nonPersistentDataStore];
+        });
+        return sStrictEphemeralStore;
     }
     const char *homeEnv = getenv("HOME");
     NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
@@ -3051,6 +3069,10 @@ static WKWebsiteDataStore *LCIsolatedWebsiteDataStore(BOOL ephemeral) {
     }
     return [WKWebsiteDataStore nonPersistentDataStore];
 }
+
+@interface WKWebViewConfiguration (LCRelatedWebViewPrivate)
+@property (nonatomic, readonly, nullable) WKWebView *_relatedWebView;
+@end
 
 @implementation WKWebsiteDataStore(LCContainerIsolation)
 
@@ -3083,10 +3105,15 @@ static WKWebsiteDataStore *LCIsolatedWebsiteDataStore(BOOL ephemeral) {
 
 - (instancetype)hook_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
     WKWebViewConfiguration *effectiveConfig = configuration ?: [[WKWebViewConfiguration alloc] init];
-    if (isolateWebViewData && strictTestMode) {
-        effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(YES);
-    } else if (isolateWebViewData && !configuration) {
-        effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(NO);
+    BOOL isRelatedWebViewConfig = (configuration &&
+        [configuration respondsToSelector:@selector(_relatedWebView)] &&
+        configuration._relatedWebView != nil);
+    if (!isRelatedWebViewConfig) {
+        if (isolateWebViewData && strictTestMode) {
+            effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(NO);
+        } else if (isolateWebViewData && !configuration) {
+            effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(NO);
+        }
     }
     NSString *profileScript = nil;
     if(spoofProfileEnabled && spoofWebViewCategoryEnabled) {
@@ -3707,14 +3734,18 @@ static BOOL LCShouldInterceptAuthSession(NSURL *authURL, NSString *callbackSchem
     }
     if (callbackObj && [callbackObj respondsToSelector:@selector(matchesURL:)]) {
         NSArray *guestURLTypes = NSBundle.mainBundle.infoDictionary[@"CFBundleURLTypes"];
-        for (NSDictionary *entry in guestURLTypes) {
-            if (![entry isKindOfClass:NSDictionary.class]) continue;
-            for (id item in entry[@"CFBundleURLSchemes"]) {
-                if (![item isKindOfClass:NSString.class]) continue;
-                NSString *s = (NSString *)item;
-                NSURL *probe = [NSURL URLWithString:[NSString stringWithFormat:@"%@://oauth-callback", s]];
-                if (probe && [callbackObj matchesURL:probe] && !LCIsSchemeRegisteredInHostBundle(s)) {
-                    return YES;
+        if ([guestURLTypes isKindOfClass:NSArray.class]) {
+            for (NSDictionary *entry in guestURLTypes) {
+                if (![entry isKindOfClass:NSDictionary.class]) continue;
+                NSArray *schemes = entry[@"CFBundleURLSchemes"];
+                if (![schemes isKindOfClass:NSArray.class]) continue;
+                for (id item in schemes) {
+                    if (![item isKindOfClass:NSString.class]) continue;
+                    NSString *s = (NSString *)item;
+                    NSURL *probe = [NSURL URLWithString:[NSString stringWithFormat:@"%@://oauth-callback", s]];
+                    if (probe && [callbackObj matchesURL:probe] && !LCIsSchemeRegisteredInHostBundle(s)) {
+                        return YES;
+                    }
                 }
             }
         }
@@ -3894,13 +3925,16 @@ static BOOL LCShouldInterceptAuthSession(NSURL *authURL, NSString *callbackSchem
         }
         BOOL ephemeral = [self respondsToSelector:@selector(prefersEphemeralWebBrowserSession)] ? self.prefersEphemeralWebBrowserSession : NO;
         NSDictionary<NSString *, NSString *> *extraHeaders = [self respondsToSelector:@selector(additionalHeaderFields)] ? self.additionalHeaderFields : nil;
-        UIWindow *anchor = nil;
         id<ASWebAuthenticationPresentationContextProviding> provider = [self respondsToSelector:@selector(presentationContextProvider)] ? self.presentationContextProvider : nil;
-        if (provider && [provider respondsToSelector:@selector(presentationAnchorForWebAuthenticationSession:)]) {
-            anchor = [provider presentationAnchorForWebAuthenticationSession:self];
-        }
 
         void (^presentBlock)(void) = ^{
+            if ([objc_getAssociatedObject(self, &kLCAuthInProcessCancelledKey) boolValue]) {
+                return;
+            }
+            UIWindow *anchor = nil;
+            if (provider && [provider respondsToSelector:@selector(presentationAnchorForWebAuthenticationSession:)]) {
+                anchor = [provider presentationAnchorForWebAuthenticationSession:self];
+            }
             UIWindow *targetWindow = anchor ?: LCKeyWindowForScene(LCForegroundWindowScene());
             UIViewController *presenter = targetWindow.rootViewController;
             while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed) {

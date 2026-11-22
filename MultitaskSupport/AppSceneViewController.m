@@ -57,6 +57,14 @@ static UIScreen *LCFallbackActiveScreen(void) {
 
 - (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID debugMode:(BOOL)debugMode delegate:(id<AppSceneViewControllerDelegate>)delegate {
     self = [super initWithNibName:nil bundle:nil];
+    if (!self) {
+        return nil;
+    }
+    if (bundleId.length == 0 || dataUUID.length == 0) {
+        NSError *error = [NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Missing bundle identifier or container identifier."}];
+        [delegate appSceneVC:self didInitializeWithError:error];
+        return nil;
+    }
     self.delegate = delegate;
     self.dataUUID = dataUUID;
     self.bundleId = bundleId;
@@ -72,8 +80,8 @@ static UIScreen *LCFallbackActiveScreen(void) {
     // init extension
     NSError* error = nil;
     _extension = [NSExtension extensionWithIdentifier:LCUtils.liveProcessBundleIdentifier error:&error];
-    if(error) {
-        [delegate appSceneVC:self didInitializeWithError:error];
+    if(!_extension || error) {
+        [delegate appSceneVC:self didInitializeWithError:error ?: [NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Failed to initialize LiveProcess extension."}]];
         return nil;
     }
     _extension.preferredLanguages = @[];
@@ -81,7 +89,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
     NSExtensionItem *item = [NSExtensionItem new];
     NSMutableArray* bookmarks = [NSMutableArray array];
     NSMutableDictionary *userInfo = @{
-        @"hostUrlScheme": NSUserDefaults.lcAppUrlScheme,
+        @"hostUrlScheme": NSUserDefaults.lcAppUrlScheme ?: @"livecontainer",
         @"selected": _bundleId,
         @"selectedContainer": _dataUUID,
         @"bookmarks": bookmarks,
@@ -183,13 +191,17 @@ static UIScreen *LCFallbackActiveScreen(void) {
 }
 
 - (void)setUpAppPresenter {
-    if (self.isTerminating || self.isAppTerminationCleanUpCalled) {
+    if (self.isTerminating || self.isAppTerminationCleanUpCalled || self.pid <= 0) {
         return;
     }
     RBSProcessPredicate* predicate = [PrivClass(RBSProcessPredicate) predicateMatchingIdentifier:@(self.pid)];
     FBProcessManager *manager = [PrivClass(FBProcessManager) sharedInstance];
     // At this point, the process is spawned and we're ready to create a scene to render in our app
     RBSProcessHandle* processHandle = [PrivClass(RBSProcessHandle) handleForPredicate:predicate error:nil];
+    if (!processHandle || !processHandle.identity) {
+        [self appTerminationCleanUp];
+        return;
+    }
     [manager registerProcessForAuditToken:processHandle.auditToken];
     UIApplicationSceneSpecification *specification = [UIApplicationSceneSpecification specification];
     
@@ -217,8 +229,13 @@ static UIScreen *LCFallbackActiveScreen(void) {
     _UISceneHostingControllerAdvancedConfiguration *config = [[_UISceneHostingControllerAdvancedConfiguration alloc] initWithProcessIdentity:processHandle.identity];
     config.sceneSpecification = specification;
     self.hostingController = [[_UISceneHostingController alloc] initWithAdvancedConfiguration:config];
+    UIViewController *sceneVC = self.hostingController.sceneViewController;
+    if (!sceneVC) {
+        [self appTerminationCleanUp];
+        return;
+    }
     // Use sceneViewController.view rather than sceneView so the child VC owns its responder chain cleanly
-    self.contentView = self.hostingController.sceneViewController.view;
+    self.contentView = sceneVC.view;
     self.contentView.clipsToBounds = NO;
     @try {
         self.presenter = [self.contentView valueForKey:@"_scenePresenter"];
@@ -247,7 +264,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
     
     // Now it's time to get the initial settings from decorated VC
     [self.delegate appSceneVCWillActivateScene:self];
-    [self addChildViewController:self.hostingController.sceneViewController];
+    [self addChildViewController:sceneVC];
     
     // For new API, let FBSSceneObserver send host scene events instead of NSExtensionContext
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
@@ -266,7 +283,9 @@ static UIScreen *LCFallbackActiveScreen(void) {
     
     __weak typeof(self) weakSelf = self;
     [self.extension setRequestInterruptionBlock:^(NSUUID *uuid) {
-        [weakSelf appTerminationCleanUp];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf appTerminationCleanUp];
+        });
     }];
     self.contentView.layer.anchorPoint = CGPointMake(0, 0);
     self.contentView.layer.position = CGPointMake(0, 0);
@@ -425,7 +444,9 @@ static UIScreen *LCFallbackActiveScreen(void) {
     [super viewDidMoveToWindow:newWindow shouldAppearOrDisappear:appear];
     if(!newWindow) {
         [self unregisterHostSceneDiffAction];
-        self.delegate = nil;
+        if (!self.isAppRunning || self.isTerminating || self.isAppTerminationCleanUpCalled) {
+            self.delegate = nil;
+        }
     } else if (!self.isTerminating && !self.isAppTerminationCleanUpCalled) {
         self.hostScene = newWindow.windowScene;
         if (self.sceneID && self.hostScene && !self.isRegisteredForSceneDiff) {
@@ -435,11 +456,21 @@ static UIScreen *LCFallbackActiveScreen(void) {
     }
 }
 
+- (void)dealloc {
+    [self unregisterHostSceneDiffAction];
+}
+
 - (void)openURLScheme:(NSString *)urlString {
+    if (urlString.length == 0) {
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) {
+        return;
+    }
     [self.presenter.scene updateSettingsWithTransitionBlock:^(id settings) {
         // pull from UserDefaults.standard.setValue(launchURLStr, forKey: "launchAppUrlScheme")
         UIApplicationSceneTransitionContext *context = [UIApplicationSceneTransitionContext new];
-        NSURL *url = [NSURL URLWithString:urlString];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         context.payload = @{UIApplicationLaunchOptionsURLKey: urlString};

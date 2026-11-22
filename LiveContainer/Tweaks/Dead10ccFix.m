@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include "./libproc.h"
 #include <sys/stat.h>
-#include <sys/xattr.h>
 #include "./proc_info.h"
 #include <fcntl.h>
 #include <spawn.h>
@@ -18,10 +17,15 @@
 
 //extern int _sqlite3_lockstate(const char *path, int pid);
 
+static const NSInteger kDead10ccMaxBackgroundRescans = 2;
+
 @interface Dead10ccFix : NSObject
 @property(nonatomic) BOOL methodInited;
 @property(nonatomic) int deboundeToken;
+@property(nonatomic) NSInteger backgroundRescanCount;
+@property(nonatomic, strong) dispatch_queue_t lockScanQueue;
 - (void)handleAppDidEnterBackground:(NSNotification *)notification;
+- (void)handleAppDidBecomeActive:(NSNotification *)notification;
 @end
 
 @interface Dead10ccFix (RuntimeStolen)
@@ -50,21 +54,31 @@ void initDead10ccFix(void) {
         // Note on LiveProcess: depending on Scene API, it could invoke either of these, so register both.
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:NSExtensionHostDidEnterBackgroundNotification object:nil];
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:@"UIApplicationDidEnterBackgroundNotification" object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidBecomeActive:) name:NSExtensionHostDidBecomeActiveNotification object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidBecomeActive:) name:@"UIApplicationDidBecomeActiveNotification" object:nil];
     });
 }
 
-
-
-
 @implementation Dead10ccFix
 
-- (void)handleAppDidEnterBackgroundReal {
-    NSSet* locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
-    for(NSString* path in locks) {
-        unsigned char value = 0x01;
-
-        setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value),0,0);
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _lockScanQueue = dispatch_queue_create("com.kdt.livecontainer.dead10cc", DISPATCH_QUEUE_SERIAL);
     }
+    return self;
+}
+
+- (void)handleAppDidEnterBackgroundReal {
+    dispatch_async(self.lockScanQueue, ^{
+        @autoreleasepool {
+            NSSet *locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
+            for (NSString *path in locks) {
+                unsigned char value = 0x01;
+                setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value), 0, 0);
+            }
+        }
+    });
 }
 
 // https://gist.github.com/JJTech0130/07e2458df592faad1d2ba72283a0ca50
@@ -72,7 +86,6 @@ void initDead10ccFix(void) {
     int pid = getpid();
     int pidinfo_size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
     if (pidinfo_size <= 0) {
-        // _rbs_process_log with strerr
         return nil;
     }
 
@@ -129,7 +142,6 @@ void initDead10ccFix(void) {
         char *path_c = (char *)[path UTF8String];
         struct stat statbuf;
         if (stat(path_c, &statbuf) != 0) {
-            NSLog(@"Could not stat %@: %s", path, strerror(errno));
             continue;
         }
 
@@ -191,8 +203,21 @@ void initDead10ccFix(void) {
     return lockedFilePaths;
 }
 
+- (void)handleAppDidBecomeActive:(NSNotification *)notification {
+    dispatch_block_t activeBlock = ^{
+        self.deboundeToken += 1;
+        self.backgroundRescanCount = 0;
+    };
+    if ([NSThread isMainThread]) {
+        activeBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), activeBlock);
+    }
+}
+
 - (void)handleAppDidEnterBackground:(NSNotification *)notification {
     dispatch_block_t handleBlock = ^{
+        self.backgroundRescanCount = 0;
         if(!self->_methodInited) {
             self->_methodInited = YES;
             // hack: steal -[UIApplication _handleTaskCompletionAndTerminate:]
@@ -218,15 +243,18 @@ void initDead10ccFix(void) {
 }
 
 - (void)_terminateWithStatus:(int)status {
-    // Fake implementation from UIApplication
-//    NSLog(@"[LC] _handleTaskCompletionAndTerminate");
     [self handleAppDidEnterBackgroundReal];
-    //    NSLog(@"Backtrace: %@", [NSThread performSelector:@selector(ams_symbolicatedCallStackSymbols)]);
-    if([[NSClassFromString(@"UIApplication") sharedApplication] applicationState] != 0) {
+    int appState = [[NSClassFromString(@"UIApplication") sharedApplication] applicationState];
+    if (appState != 0 && self.backgroundRescanCount < kDead10ccMaxBackgroundRescans) {
+        self.backgroundRescanCount += 1;
+        int64_t delaySeconds = 2 * self.backgroundRescanCount;
         self.deboundeToken += 1;
         int curToken = self.deboundeToken;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if(self.deboundeToken != curToken) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delaySeconds * (int64_t)NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (self.deboundeToken != curToken) {
+                return;
+            }
+            if ([[NSClassFromString(@"UIApplication") sharedApplication] applicationState] == 0) {
                 return;
             }
             if ([self respondsToSelector:@selector(_handleTaskCompletionAndTerminate:)]) {

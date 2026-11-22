@@ -6,6 +6,22 @@
 @import Security;
 @import CommonCrypto;
 #import <objc/message.h>
+#import <os/lock.h>
+
+static os_unfair_lock sSigningCacheLock = OS_UNFAIR_LOCK_INIT;
+static BOOL sCertDataLoaded = NO;
+static NSData *sCachedCertData = nil;
+static BOOL sCertPwdLoaded = NO;
+static NSString *sCachedCertPassword = nil;
+
+static void LCInvalidateHostSigningSecretCache(void) {
+    os_unfair_lock_lock(&sSigningCacheLock);
+    sCertDataLoaded = NO;
+    sCachedCertData = nil;
+    sCertPwdLoaded = NO;
+    sCachedCertPassword = nil;
+    os_unfair_lock_unlock(&sSigningCacheLock);
+}
 
 extern NSUserDefaults *lcUserDefaults;
 extern NSString *lcAppUrlScheme;
@@ -266,39 +282,79 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 }
 
 + (nullable NSData *)certificateData {
-    NSData *keychainData = [self readHostSigningSecretForAccount:@"certificateData"];
-    if (keychainData.length > 0) {
-        return keychainData;
+    BOOL canUseHostCache = (!NSUserDefaults.isLiveProcess && NSUserDefaults.guestAppInfo == nil);
+    if (canUseHostCache) {
+        os_unfair_lock_lock(&sSigningCacheLock);
+        BOOL loaded = sCertDataLoaded;
+        NSData *cached = sCachedCertData;
+        os_unfair_lock_unlock(&sSigningCacheLock);
+        if (loaded) {
+            return cached;
+        }
     }
-    NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
-    NSData *legacy = [sharedDefaults objectForKey:@"LCCertificateData"];
-    if ([legacy isKindOfClass:NSData.class] && legacy.length > 0) {
-        return legacy;
+
+    NSData *resolved = [self readHostSigningSecretForAccount:@"certificateData"];
+    if (resolved.length == 0) {
+        NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
+        NSData *legacy = [sharedDefaults objectForKey:@"LCCertificateData"];
+        if ([legacy isKindOfClass:NSData.class] && legacy.length > 0) {
+            resolved = legacy;
+        } else {
+            NSData *stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificateData"];
+            resolved = [stdLegacy isKindOfClass:NSData.class] ? stdLegacy : nil;
+        }
     }
-    NSData *stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificateData"];
-    return [stdLegacy isKindOfClass:NSData.class] ? stdLegacy : nil;
+
+    if (canUseHostCache) {
+        os_unfair_lock_lock(&sSigningCacheLock);
+        sCachedCertData = resolved;
+        sCertDataLoaded = YES;
+        os_unfair_lock_unlock(&sSigningCacheLock);
+    }
+    return resolved;
 }
 
 + (nullable NSString *)certificatePassword {
-    NSData *pwdData = [self readHostSigningSecretForAccount:@"certificatePassword"];
-    if (pwdData != nil) {
-        NSString *decoded = [[NSString alloc] initWithData:pwdData encoding:NSUTF8StringEncoding];
-        if (decoded != nil) {
-            return decoded;
+    BOOL canUseHostCache = (!NSUserDefaults.isLiveProcess && NSUserDefaults.guestAppInfo == nil);
+    if (canUseHostCache) {
+        os_unfair_lock_lock(&sSigningCacheLock);
+        BOOL loaded = sCertPwdLoaded;
+        NSString *cached = sCachedCertPassword;
+        os_unfair_lock_unlock(&sSigningCacheLock);
+        if (loaded) {
+            return cached;
         }
     }
-    NSUserDefaults *nud = [self sharedSigningDefaults];
-    id legacy = [nud objectForKey:@"LCCertificatePassword"];
-    if ([legacy isKindOfClass:NSString.class]) {
-        return legacy;
+
+    NSString *resolved = nil;
+    NSData *pwdData = [self readHostSigningSecretForAccount:@"certificatePassword"];
+    if (pwdData != nil) {
+        resolved = [[NSString alloc] initWithData:pwdData encoding:NSUTF8StringEncoding];
     }
-    id stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificatePassword"];
-    return [stdLegacy isKindOfClass:NSString.class] ? stdLegacy : nil;
+    if (resolved == nil) {
+        NSUserDefaults *nud = [self sharedSigningDefaults];
+        id legacy = [nud objectForKey:@"LCCertificatePassword"];
+        if ([legacy isKindOfClass:NSString.class]) {
+            resolved = legacy;
+        } else {
+            id stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificatePassword"];
+            resolved = [stdLegacy isKindOfClass:NSString.class] ? stdLegacy : nil;
+        }
+    }
+
+    if (canUseHostCache) {
+        os_unfair_lock_lock(&sSigningCacheLock);
+        sCachedCertPassword = resolved;
+        sCertPwdLoaded = YES;
+        os_unfair_lock_unlock(&sSigningCacheLock);
+    }
+    return resolved;
 }
 
 + (BOOL)isJITLessConfigured {
     NSUserDefaults *nud = [self sharedSigningDefaults];
-    if (NSUserDefaults.isLiveProcess) {
+    // Never probe host Keychain once running a guest process or inside normal-mode bootstrap where SecItem is hooked.
+    if (NSUserDefaults.isLiveProcess || NSUserDefaults.guestAppInfo != nil) {
         return [nud boolForKey:@"LCJITLessConfigured"] || ([nud objectForKey:@"LCCertificatePassword"] != nil);
     }
     // Always verify actual backing secret in host process so stale defaults never mask missing Keychain items.
@@ -327,6 +383,7 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     }
     [sharedDefaults setBool:YES forKey:@"LCJITLessConfigured"];
     [sharedDefaults setObject:NSDate.date forKey:@"LCCertificateUpdateDate"];
+    LCInvalidateHostSigningSecretCache();
 }
 
 + (void)clearCertificateData {
@@ -345,6 +402,7 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     [sharedDefaults setBool:NO forKey:@"LCJITLessConfigured"];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificateData"];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificatePassword"];
+    LCInvalidateHostSigningSecretCache();
 }
 
 + (void)migrateCertificateToHostKeychainIfNeeded {
@@ -370,6 +428,7 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
             [sharedDefaults removeObjectForKey:@"LCCertificatePassword"];
             [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificateData"];
             [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificatePassword"];
+            LCInvalidateHostSigningSecretCache();
         }
     }
     [self isJITLessConfigured];
@@ -622,14 +681,17 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 }
 
 + (NSString*)getContainerUsingLCSchemeWithFolderName:(NSString*)folderName {
+    if (folderName.length == 0) {
+        return nil;
+    }
     NSURL* infoPath = [self containerLockPath];
     NSMutableDictionary *info = [NSMutableDictionary dictionaryWithContentsOfFile:infoPath.path];
-    if (!info) {
+    if (![info isKindOfClass:NSDictionary.class]) {
         return nil;
     }
     
     NSDictionary* appUsageInfo = info[folderName];
-    if (!appUsageInfo) {
+    if (![appUsageInfo isKindOfClass:NSDictionary.class]) {
         return nil;
     }
     uint64_t val57 = [appUsageInfo[@"auditToken57"] longLongValue];
@@ -915,12 +977,26 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
     [self removeKeychainItemsForContainerUUID:containerDataUUID
                               keychainGroupId:keychainGroupId
                               wipeEntireGroup:wipeEntireGroup];
-    [self removeWebKitDataStoreForContainerUUID:containerDataUUID];
+    // Avoid bootstrapping WebKit2 inside guest constructors / atexit teardown; guest container Library was already wiped above.
+    if (NSUserDefaults.guestAppInfo == nil) {
+        [self removeWebKitDataStoreForContainerUUID:containerDataUUID];
+    }
     if (containerDataUUID.length > 0) {
-        NSString *containerTmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:containerDataUUID];
-        BOOL tmpIsDir = NO;
-        if ([fm fileExistsAtPath:containerTmpPath isDirectory:&tmpIsDir] && tmpIsDir) {
-            [fm removeItemAtPath:containerTmpPath error:nil];
+        NSString *tmpRoot = NSTemporaryDirectory();
+        if (tmpRoot.length > 1 && [tmpRoot hasSuffix:@"/"]) {
+            tmpRoot = [tmpRoot substringToIndex:tmpRoot.length - 1];
+        }
+        if ([tmpRoot.lastPathComponent isEqualToString:containerDataUUID]) {
+            NSArray<NSString *> *tmpEntries = [fm contentsOfDirectoryAtPath:tmpRoot error:nil];
+            for (NSString *tmpEntry in tmpEntries) {
+                [fm removeItemAtPath:[tmpRoot stringByAppendingPathComponent:tmpEntry] error:nil];
+            }
+        } else {
+            NSString *containerTmpPath = [tmpRoot stringByAppendingPathComponent:containerDataUUID];
+            BOOL tmpIsDir = NO;
+            if ([fm fileExistsAtPath:containerTmpPath isDirectory:&tmpIsDir] && tmpIsDir) {
+                [fm removeItemAtPath:containerTmpPath error:nil];
+            }
         }
     }
 
@@ -928,7 +1004,10 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
 }
 
 + (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID {
-    if (dataUUID.length == 0) {
+    if (dataUUID.length == 0 ||
+        [dataUUID rangeOfString:@"/"].location != NSNotFound ||
+        [dataUUID isEqualToString:@"."] ||
+        [dataUUID isEqualToString:@".."]) {
         return;
     }
     NSFileManager *fm = NSFileManager.defaultManager;

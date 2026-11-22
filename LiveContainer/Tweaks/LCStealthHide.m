@@ -23,6 +23,11 @@
 #import "../utils.h"
 #import "Tweaks.h"
 #include "./libproc.h"
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
+
+extern int (*orig_dladdr)(const void *addr, Dl_info *info);
 
 #ifndef PROC_PIDREGIONPATHINFO
 #define PROC_PIDREGIONPATHINFO 8
@@ -175,7 +180,16 @@ static const char *lcFindImageNameForHeader(const struct mach_header *header) {
 }
 
 static void lcStealthImageAdded(const struct mach_header *header, intptr_t slide) {
-    const char *path = lcFindImageNameForHeader(header);
+    if (!header) {
+        return;
+    }
+    Dl_info dlInfo;
+    const char *path = NULL;
+    if ((orig_dladdr ? orig_dladdr(header, &dlInfo) : dladdr(header, &dlInfo)) && dlInfo.dli_fname) {
+        path = dlInfo.dli_fname;
+    } else {
+        path = lcFindImageNameForHeader(header);
+    }
     if (LCStealthIsHiddenPath(path)) {
         lcRegisterSegmentsForHeader(header, slide);
     }
@@ -183,8 +197,11 @@ static void lcStealthImageAdded(const struct mach_header *header, intptr_t slide
 
 bool LCStealthIsInternalAddress(const void *addr) {
     if (!addr) return false;
+#ifdef __PTRAUTH_INTRINSICS__
+    uintptr_t p = (uintptr_t)ptrauth_strip((void *)addr, ptrauth_key_return_address);
+#else
     uintptr_t p = (uintptr_t)addr;
-    // Strip PAC bits if authenticated/raw arm64e pointer checks are involved.
+#endif
     p &= 0x0000FFFFFFFFFFFFULL;
     os_unfair_lock_lock(&sRangeLock);
     bool found = false;
@@ -404,13 +421,6 @@ void LCStealthRegisterInternalRanges(void) {
         lcCapturePathCString([LCSharedUtils cachedGlobalTweaksFolderPath], sGlobalTweaksPath, sizeof(sGlobalTweaksPath));
         lcCapturePathCString(NSBundle.mainBundle.bundlePath, sGuestAppBundlePath, sizeof(sGuestAppBundlePath));
 
-        uint32_t count = orig_dyld_image_count();
-        for (uint32_t i = 0; i < count; ++i) {
-            const char *name = orig_dyld_get_image_name(i);
-            if (LCStealthIsHiddenPath(name)) {
-                lcRegisterSegmentsForHeader(orig_dyld_get_image_header(i), orig_dyld_get_image_vmaddr_slide(i));
-            }
-        }
         _dyld_register_func_for_add_image(lcStealthImageAdded);
     });
 }

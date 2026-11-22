@@ -1329,6 +1329,7 @@ static NSString *LCDebugWebConsoleHTML(void) {
 @property (nonatomic, strong) NSDate *lastOSLogDate;
 @property (nonatomic, strong) NSMutableSet<NSString *> *seenAtLastOSLogDate;
 @property (atomic, assign) BOOL osLogPaused;
+@property (atomic, assign) BOOL telemetryPaused;
 
 @property (nonatomic, strong) dispatch_source_t telemetryTimer;
 @property (nonatomic, strong) CADisplayLink *displayLink;
@@ -1622,10 +1623,20 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
 
 - (void)handleAppDidEnterBackground:(NSNotification *)note {
     self.osLogPaused = YES;
+    self.telemetryPaused = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.displayLink.paused = YES;
+    });
 }
 
 - (void)handleAppWillEnterForeground:(NSNotification *)note {
     self.osLogPaused = NO;
+    self.telemetryPaused = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.lastFPSTimestamp = 0;
+        self.frameCounter = 0;
+        self.displayLink.paused = NO;
+    });
 }
 
 - (void)pollOSLogStore {
@@ -1903,6 +1914,9 @@ static void LCSendAllBlocking(int fd, const uint8_t *bytes, size_t length) {
 }
 
 - (void)sampleProcessMetrics {
+    if (self.telemetryPaused) {
+        return;
+    }
     task_vm_info_data_t vmInfo;
     mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
     double memMB = 0.0;

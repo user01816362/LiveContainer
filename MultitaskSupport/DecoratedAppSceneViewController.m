@@ -55,24 +55,28 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     
     [MultitaskDockManager.shared addRunningApp:windowName appUUID:dataUUID view:self.view];
     
+    __weak typeof(self) weakSelf = self;
     NSArray *menuItems = @[
         [UIAction actionWithTitle:@"lc.multitask.copyPid".loc image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            UIPasteboard.generalPasteboard.string = @(self.appSceneVC.pid).stringValue;
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            UIPasteboard.generalPasteboard.string = @(strongSelf.appSceneVC.pid).stringValue;
         }],
         [UIAction actionWithTitle:@"lc.multitask.enablePip".loc image:[UIImage systemImageNamed:@"pip.enter"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            if ([PiPManager.shared isPiPWithVC:self.appSceneVC]) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if ([PiPManager.shared isPiPWithVC:strongSelf.appSceneVC]) {
                 [PiPManager.shared stopPiP];
             } else {
-                [PiPManager.shared startPiPWithVC:self.appSceneVC];
+                [PiPManager.shared startPiPWithVC:strongSelf.appSceneVC];
             }
         }],
         [UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
-            return [self scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:self.scaleRatio stepInterval:0.01];
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            return [strongSelf scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:strongSelf.scaleRatio stepInterval:0.01];
         }]
     ];
-    
 
-    __weak typeof(self) weakSelf = self;
     [self.navigationItem setTitleMenuProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions){
         if(!weakSelf.appSceneVC.isAppRunning) {
             return [UIMenu menuWithTitle:NSLocalizedString(@"lc.multitaskAppWindow.appTerminated", nil) children:@[]];

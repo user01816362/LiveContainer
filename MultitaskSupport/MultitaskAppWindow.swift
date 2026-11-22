@@ -104,13 +104,25 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
     }
     
     func makeUIViewController(context: Context) -> UIViewController {
-        return AppSceneViewController(bundleId: bundleId, dataUUID: dataUUID, delegate: context.coordinator)
+        guard let vc = AppSceneViewController(bundleId: bundleId, dataUUID: dataUUID, delegate: context.coordinator) else {
+            return UIViewController()
+        }
+        return vc
     }
     
     func updateUIViewController(_ vc: UIViewController, context _: Context) {
         if let vc = vc as? AppSceneViewController {
             if !show {
                 vc.terminate()
+            }
+        }
+    }
+
+    static func dismantleUIViewController(_ vc: UIViewController, coordinator _: Coordinator) {
+        if let vc = vc as? AppSceneViewController {
+            vc.terminate()
+            if let uuid = vc.dataUUID {
+                MultitaskWindowManager.appDict.removeValue(forKey: uuid)
             }
         }
     }

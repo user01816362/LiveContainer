@@ -12,7 +12,6 @@
 #import "../../litehook/src/litehook.h"
 #import "LCSharedUtils.h"
 
-extern void* (*msHookFunction)(void *symbol, void *hook, void **old);
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = NULL;
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
 static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = NULL;
@@ -28,10 +27,9 @@ static NSString* containerId = nil;
 
 static NSMutableDictionary *LCCopyMutableSecDict(CFDictionaryRef dict) {
     if (!dict) {
-        return [NSMutableDictionary dictionary];
+        return nil;
     }
-    NSMutableDictionary *copy = [(__bridge NSDictionary *)dict mutableCopy];
-    return copy ?: [NSMutableDictionary dictionary];
+    return [(__bridge NSDictionary *)dict mutableCopy];
 }
 
 static BOOL LCQueryRequiresOmittedAccessGroup(CFDictionaryRef query) {
@@ -42,6 +40,10 @@ static BOOL LCQueryRequiresOmittedAccessGroup(CFDictionaryRef query) {
     return CFDictionaryContainsKey(query, kSecValuePersistentRef) ||
            CFDictionaryContainsKey(query, kSecMatchItemList) ||
            CFDictionaryContainsKey(query, kSecUseItemList);
+}
+
+static BOOL LCKeyDictHasExplicitAccessGroup(NSDictionary *dict) {
+    return [dict isKindOfClass:NSDictionary.class] && dict[(__bridge id)kSecAttrAccessGroup] != nil;
 }
 
 static void LCApplyIsolatedAccessGroupToNestedKeyAttrs(NSMutableDictionary *paramsCopy, id keyAttrKey) {
@@ -80,15 +82,33 @@ static BOOL LCKeyParametersAreExplicitlyEphemeral(NSDictionary *params, BOOL def
     return defaultEphemeral;
 }
 
+static BOOL LCShouldRewriteKeyParameters(NSDictionary *params, BOOL defaultEphemeral) {
+    if (accessGroup.length == 0 || ![params isKindOfClass:NSDictionary.class]) {
+        return NO;
+    }
+    if (!LCKeyParametersAreExplicitlyEphemeral(params, defaultEphemeral)) {
+        return YES;
+    }
+    return LCKeyDictHasExplicitAccessGroup(params) ||
+           LCKeyDictHasExplicitAccessGroup(params[(__bridge id)kSecPrivateKeyAttrs]) ||
+           LCKeyDictHasExplicitAccessGroup(params[(__bridge id)kSecPublicKeyAttrs]);
+}
+
 static OSStatus new_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     if (!orig_SecItemAdd) {
         return errSecUnimplemented;
     }
+    if (!attributes) {
+        return orig_SecItemAdd(NULL, result);
+    }
     NSMutableDictionary *attributesCopy = LCCopyMutableSecDict(attributes);
+    if (!attributesCopy) {
+        return orig_SecItemAdd(attributes, result);
+    }
     if (accessGroup.length > 0) {
         attributesCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
     }
-    CFTypeRef secClass = attributes ? CFDictionaryGetValue(attributes, kSecClass) : NULL;
+    CFTypeRef secClass = CFDictionaryGetValue(attributes, kSecClass);
     BOOL canAttachAlias = (secClass == NULL || CFEqual(secClass, kSecClassGenericPassword));
     BOOL injectedAlias = NO;
     if (canAttachAlias && containerId.length > 0 && attributesCopy[@"alis"] == nil) {
@@ -109,13 +129,14 @@ static OSStatus new_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result
     if (!orig_SecItemCopyMatching) {
         return errSecUnimplemented;
     }
-    if (LCQueryRequiresOmittedAccessGroup(query)) {
+    if (!query || accessGroup.length == 0 || LCQueryRequiresOmittedAccessGroup(query)) {
         return orig_SecItemCopyMatching(query, result);
     }
     NSMutableDictionary *queryCopy = LCCopyMutableSecDict(query);
-    if (accessGroup.length > 0) {
-        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    if (!queryCopy) {
+        return orig_SecItemCopyMatching(query, result);
     }
+    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
     return orig_SecItemCopyMatching((__bridge CFDictionaryRef)queryCopy, result);
 }
 
@@ -123,32 +144,43 @@ static OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attribu
     if (!orig_SecItemUpdate) {
         return errSecUnimplemented;
     }
+    if (!query || !attributesToUpdate) {
+        return orig_SecItemUpdate(query, attributesToUpdate);
+    }
     CFDictionaryRef effectiveQuery = query;
     NSMutableDictionary *queryCopy = nil;
-    if (!LCQueryRequiresOmittedAccessGroup(query)) {
+    if (accessGroup.length > 0 && !LCQueryRequiresOmittedAccessGroup(query)) {
         queryCopy = LCCopyMutableSecDict(query);
-        if (accessGroup.length > 0) {
+        if (queryCopy) {
             queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+            effectiveQuery = (__bridge CFDictionaryRef)queryCopy;
         }
-        effectiveQuery = (__bridge CFDictionaryRef)queryCopy;
     }
 
-    NSMutableDictionary *updateCopy = LCCopyMutableSecDict(attributesToUpdate);
-    [updateCopy removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
-    return orig_SecItemUpdate(effectiveQuery, (__bridge CFDictionaryRef)updateCopy);
+    CFDictionaryRef effectiveUpdate = attributesToUpdate;
+    NSMutableDictionary *updateCopy = nil;
+    if (CFDictionaryContainsKey(attributesToUpdate, kSecAttrAccessGroup)) {
+        updateCopy = LCCopyMutableSecDict(attributesToUpdate);
+        if (updateCopy) {
+            [updateCopy removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
+            effectiveUpdate = (__bridge CFDictionaryRef)updateCopy;
+        }
+    }
+    return orig_SecItemUpdate(effectiveQuery, effectiveUpdate);
 }
 
 static OSStatus new_SecItemDelete(CFDictionaryRef query) {
     if (!orig_SecItemDelete) {
         return errSecUnimplemented;
     }
-    if (LCQueryRequiresOmittedAccessGroup(query)) {
+    if (!query || accessGroup.length == 0 || LCQueryRequiresOmittedAccessGroup(query)) {
         return orig_SecItemDelete(query);
     }
     NSMutableDictionary *queryCopy = LCCopyMutableSecDict(query);
-    if (accessGroup.length > 0) {
-        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    if (!queryCopy) {
+        return orig_SecItemDelete(query);
     }
+    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
     return orig_SecItemDelete((__bridge CFDictionaryRef)queryCopy);
 }
 
@@ -156,12 +188,14 @@ static SecKeyRef new_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRe
     if (!orig_SecKeyCreateRandomKey) {
         return NULL;
     }
-    NSMutableDictionary *paramsCopy = LCCopyMutableSecDict(parameters);
-    if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(paramsCopy, YES)) {
-        paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
-        LCApplyIsolatedAccessGroupToNestedKeyAttrs(paramsCopy, (__bridge id)kSecPrivateKeyAttrs);
-        LCApplyIsolatedAccessGroupToNestedKeyAttrs(paramsCopy, (__bridge id)kSecPublicKeyAttrs);
+    NSDictionary *paramsDict = (__bridge NSDictionary *)parameters;
+    if (!parameters || !LCShouldRewriteKeyParameters(paramsDict, YES)) {
+        return orig_SecKeyCreateRandomKey(parameters, error);
     }
+    NSMutableDictionary *paramsCopy = [paramsDict mutableCopy];
+    paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    LCApplyIsolatedAccessGroupToNestedKeyAttrs(paramsCopy, (__bridge id)kSecPrivateKeyAttrs);
+    LCApplyIsolatedAccessGroupToNestedKeyAttrs(paramsCopy, (__bridge id)kSecPublicKeyAttrs);
     return orig_SecKeyCreateRandomKey((__bridge CFDictionaryRef)paramsCopy, error);
 }
 
@@ -169,11 +203,12 @@ static SecKeyRef new_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef par
     if (!orig_SecKeyCreateWithData) {
         return NULL;
     }
-    NSMutableDictionary *paramsCopy = LCCopyMutableSecDict(parameters);
-    // SecKeyCreateWithData creates in-memory keys by default; only scope if permanent attributes are passed.
-    if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(paramsCopy, YES)) {
-        paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    NSDictionary *paramsDict = (__bridge NSDictionary *)parameters;
+    if (!parameters || !LCShouldRewriteKeyParameters(paramsDict, YES)) {
+        return orig_SecKeyCreateWithData(keyData, parameters, error);
     }
+    NSMutableDictionary *paramsCopy = [paramsDict mutableCopy];
+    paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
     return orig_SecKeyCreateWithData(keyData, (__bridge CFDictionaryRef)paramsCopy, error);
 }
 
@@ -181,12 +216,14 @@ static OSStatus new_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *pu
     if (!orig_SecKeyGeneratePair) {
         return errSecUnimplemented;
     }
-    NSMutableDictionary *queryCopy = LCCopyMutableSecDict(parameters);
-    if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(queryCopy, YES)) {
-        queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
-        LCApplyIsolatedAccessGroupToNestedKeyAttrs(queryCopy, (__bridge id)kSecPrivateKeyAttrs);
-        LCApplyIsolatedAccessGroupToNestedKeyAttrs(queryCopy, (__bridge id)kSecPublicKeyAttrs);
+    NSDictionary *paramsDict = (__bridge NSDictionary *)parameters;
+    if (!parameters || !LCShouldRewriteKeyParameters(paramsDict, YES)) {
+        return orig_SecKeyGeneratePair(parameters, publicKey, privateKey);
     }
+    NSMutableDictionary *queryCopy = [paramsDict mutableCopy];
+    queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    LCApplyIsolatedAccessGroupToNestedKeyAttrs(queryCopy, (__bridge id)kSecPrivateKeyAttrs);
+    LCApplyIsolatedAccessGroupToNestedKeyAttrs(queryCopy, (__bridge id)kSecPublicKeyAttrs);
     return orig_SecKeyGeneratePair((__bridge CFDictionaryRef)queryCopy, publicKey, privateKey);
 }
 
