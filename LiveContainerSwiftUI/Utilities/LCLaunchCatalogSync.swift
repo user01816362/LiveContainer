@@ -13,7 +13,7 @@ enum LCLaunchCatalogSync {
     static let catalogKey = "LCLaunchAppCatalog"
     static let iconsFolderName = "LaunchCatalogIcons"
     private static let legacyPrivateDocBookmarkKey = "LCLaunchExtensionPrivateDocBookmark"
-    private static let iconFilenames = ["LCAppIconLight.png", "LCAppIconDark.png"]
+    private nonisolated static let iconFilenames = ["LCAppIconLight.png", "LCAppIconDark.png"]
     private static var pendingSyncTask: Task<Void, Never>?
     private static var pendingIconTask: Task<Void, Never>?
 
