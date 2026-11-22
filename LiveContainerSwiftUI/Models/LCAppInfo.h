@@ -91,11 +91,14 @@ typedef NS_ENUM(NSInteger, MultitaskSpecified){
                           minimumOSVersion:(nullable NSString *)minimumOSVersion
                   updateExtensionBundleIds:(BOOL)updateExtensions
                       updateLocalizedNames:(BOOL)updateLocalized
-                                     error:(NSError * _Nullable * _Nullable)error;
+                                     error:(NSError * _Nullable * _Nullable)error
+    NS_SWIFT_NAME(applyCustomMetadata(withDisplayName:bundleName:bundleIdentifier:shortVersion:buildVersion:minimumOSVersion:updateExtensionBundleIds:updateLocalizedNames:));
 - (BOOL)replaceInfoPlistWithDictionary:(nonnull NSDictionary<NSString *, id> *)newInfoPlist
-                                 error:(NSError * _Nullable * _Nullable)error;
-- (BOOL)resetInfoPlistToOriginalWithError:(NSError * _Nullable * _Nullable)error;
-- (void)reloadInfoPlistFromDisk;
+                                 error:(NSError * _Nullable * _Nullable)error
+    NS_SWIFT_NAME(replaceInfoPlist(with:));
+- (BOOL)resetInfoPlistToOriginalWithError:(NSError * _Nullable * _Nullable)error
+    NS_SWIFT_NAME(resetInfoPlistToOriginal());
+- (void)reloadInfoPlistFromDisk NS_SWIFT_NAME(reloadInfoPlistFromDisk());
 - (NSMutableArray<NSString *> * _Null_unspecified)urlSchemes;
 - (instancetype _Null_unspecified)initWithBundlePath:(NSString * _Null_unspecified)bundlePath;
 - (UIImage * _Null_unspecified)generateLiveContainerWrappedIconWithStyle:(GeneratedIconStyle)style;

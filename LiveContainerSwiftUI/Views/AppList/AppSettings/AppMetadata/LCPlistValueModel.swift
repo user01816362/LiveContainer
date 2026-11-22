@@ -86,7 +86,7 @@ enum LCPlistValueType: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum LCPlistValue: Equatable, Sendable {
+enum LCPlistValue: Hashable, Sendable {
     case string(String)
     case integer(Int64)
     case real(Double)

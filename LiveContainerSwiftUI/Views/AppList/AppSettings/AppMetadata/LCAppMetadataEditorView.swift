@@ -86,7 +86,7 @@ struct LCAppMetadataEditorView: View {
         if trimmedBundleId.isEmpty {
             return "Bundle Identifier cannot be empty."
         }
-        if trimmedBundleId.rangeOfCharacterFromSet(.whitespacesAndNewlines) != nil || trimmedBundleId.contains("/") {
+        if trimmedBundleId.rangeOfCharacter(from: .whitespacesAndNewlines) != nil || trimmedBundleId.contains("/") {
             return "Bundle Identifier cannot contain spaces, newlines, or '/'."
         }
         return nil
