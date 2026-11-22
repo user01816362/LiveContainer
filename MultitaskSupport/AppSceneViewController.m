@@ -11,6 +11,7 @@
 #import "PiPManager.h"
 #import "Localization.h"
 #import "LCSharedUtils.h"
+#import "../LiveContainer/LCDeviceProfileCatalog.h"
 #import "utils.h"
 #import "UIKitPrivate+MultitaskSupport.h"
 
@@ -29,6 +30,9 @@
 @property(nonatomic) bool isAppTerminationCleanUpCalled;
 @property(nonatomic) BOOL isTerminating;
 @property(nonatomic) BOOL isRegisteredForSceneDiff;
+@property(nonatomic, readwrite) BOOL hasSpoofedViewport;
+@property(nonatomic, readwrite) CGSize emulatedViewportSize;
+@property(nonatomic, readwrite, nullable) NSString *emulatedViewportLabel;
 @end
 
 static UIScreen *LCFallbackActiveScreen(void) {
@@ -68,6 +72,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
     self.delegate = delegate;
     self.dataUUID = dataUUID;
     self.bundleId = bundleId;
+    [self reloadSpoofedViewportSpecFromContainer];
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
     self.isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
@@ -190,6 +195,100 @@ static UIScreen *LCFallbackActiveScreen(void) {
     self.isRegisteredForSceneDiff = NO;
 }
 
+- (void)reloadSpoofedViewportSpecFromContainer {
+    self.hasSpoofedViewport = NO;
+    self.emulatedViewportSize = CGSizeZero;
+    self.emulatedViewportLabel = nil;
+    self.emulatedViewportEnabled = NO;
+
+    NSDictionary *info = [LCSharedUtils containerInfoForDataUUID:self.dataUUID];
+    if (![info isKindOfClass:NSDictionary.class]) {
+        return;
+    }
+
+    BOOL blockReads = [info[@"blockDeviceInfoReads"] boolValue];
+    if (blockReads) {
+        self.hasSpoofedViewport = YES;
+        self.emulatedViewportSize = CGSizeMake(390.0, 844.0);
+        self.emulatedViewportLabel = @"iPhone 16";
+    } else {
+        BOOL spoofEnabled = [info[@"spoofProfileEnabled"] boolValue];
+        id displayFlag = info[@"spoofDisplayCategoryEnabled"];
+        BOOL displayEnabled = (displayFlag == nil) || [displayFlag boolValue];
+        if (!spoofEnabled || !displayEnabled) {
+            return;
+        }
+
+        NSString *variantId = [info[@"spoofDeviceVariantId"] isKindOfClass:NSString.class] ? info[@"spoofDeviceVariantId"] : nil;
+        NSString *hwModel = [info[@"spoofHardwareModel"] isKindOfClass:NSString.class] ? info[@"spoofHardwareModel"] : nil;
+        double pixelW = [info[@"spoofScreenWidth"] respondsToSelector:@selector(doubleValue)] ? [info[@"spoofScreenWidth"] doubleValue] : 0.0;
+        double pixelH = [info[@"spoofScreenHeight"] respondsToSelector:@selector(doubleValue)] ? [info[@"spoofScreenHeight"] doubleValue] : 0.0;
+        double scale = [info[@"spoofScreenScale"] respondsToSelector:@selector(doubleValue)] ? [info[@"spoofScreenScale"] doubleValue] : 0.0;
+
+        const LCDeviceHardwareSpec *spec = (variantId.length > 0)
+            ? LCDeviceHardwareSpecFindByVariant(variantId.UTF8String)
+            : LCDeviceHardwareSpecFindByMachine(hwModel.UTF8String);
+
+        BOOL pixelsMatchCatalog = (spec != NULL) &&
+            (pixelW <= 0.0 || pixelH <= 0.0 ||
+             (fabs(pixelW - spec->pixelWidth) < 1.0 && fabs(pixelH - spec->pixelHeight) < 1.0));
+
+        double ptW = 0.0;
+        double ptH = 0.0;
+        if (pixelsMatchCatalog) {
+            ptW = spec->pointWidth;
+            ptH = spec->pointHeight;
+        } else if (pixelW > 0.0 && pixelH > 0.0) {
+            double divisor = scale > 0.0 ? scale : 3.0;
+            ptW = round(pixelW / divisor);
+            ptH = round(pixelH / divisor);
+        }
+
+        if (ptW >= 200.0 && ptH >= 200.0 && ptW <= 2500.0 && ptH <= 2500.0) {
+            self.hasSpoofedViewport = YES;
+            self.emulatedViewportSize = CGSizeMake(ptW, ptH);
+            self.emulatedViewportLabel = spec
+                ? @(spec->marketingName)
+                : [NSString stringWithFormat:@"%ld×%ld", (long)llround(ptW), (long)llround(ptH)];
+        }
+    }
+
+    if (self.hasSpoofedViewport) {
+        self.emulatedViewportEnabled = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskEmulateSpoofViewport"];
+    }
+}
+
+- (void)applyViewportLayoutForAvailableSize:(CGSize)availableSize interfaceOrientation:(UIInterfaceOrientation)orientation {
+    if (!self.contentView || !self.hasSpoofedViewport || !self.emulatedViewportEnabled) {
+        return;
+    }
+    CGFloat availW = availableSize.width >= 1.0 ? availableSize.width : self.view.bounds.size.width;
+    CGFloat availH = availableSize.height >= 1.0 ? availableSize.height : self.view.bounds.size.height;
+    BOOL isLandscape = UIInterfaceOrientationIsLandscape(orientation);
+    CGFloat rawW = self.emulatedViewportSize.width;
+    CGFloat rawH = self.emulatedViewportSize.height;
+    CGFloat targetW = isLandscape ? MAX(rawW, rawH) : MIN(rawW, rawH);
+    CGFloat targetH = isLandscape ? MIN(rawW, rawH) : MAX(rawW, rawH);
+    if (availW < 1.0 || availH < 1.0 || targetW < 1.0 || targetH < 1.0) {
+        return;
+    }
+    CGFloat fitScale = MIN(availW / targetW, availH / targetH);
+    if (!isfinite(fitScale) || fitScale <= 0.0) {
+        return;
+    }
+    fitScale = MAX(0.1, MIN(fitScale, 4.0));
+    CGFloat offsetX = floor(MAX(0.0, (availW - targetW * fitScale) * 0.5));
+    CGFloat offsetY = floor(MAX(0.0, (availH - targetH * fitScale) * 0.5));
+
+    self.view.backgroundColor = UIColor.blackColor;
+    self.view.clipsToBounds = YES;
+    self.contentView.transform = CGAffineTransformIdentity;
+    self.contentView.bounds = CGRectMake(0.0, 0.0, targetW, targetH);
+    self.contentView.layer.anchorPoint = CGPointMake(0.0, 0.0);
+    self.contentView.layer.position = CGPointMake(offsetX, offsetY);
+    self.contentView.transform = CGAffineTransformMakeScale(fitScale, fitScale);
+}
+
 - (void)setUpAppPresenter {
     if (self.isTerminating || self.isAppTerminationCleanUpCalled || self.pid <= 0) {
         return;
@@ -237,6 +336,8 @@ static UIScreen *LCFallbackActiveScreen(void) {
     // Use sceneViewController.view rather than sceneView so the child VC owns its responder chain cleanly
     self.contentView = sceneVC.view;
     self.contentView.clipsToBounds = NO;
+    self.contentView.layer.anchorPoint = CGPointMake(0, 0);
+    self.contentView.layer.position = CGPointMake(0, 0);
     @try {
         self.presenter = [self.contentView valueForKey:@"_scenePresenter"];
     } @catch (NSException *exception) {
@@ -287,8 +388,10 @@ static UIScreen *LCFallbackActiveScreen(void) {
             [weakSelf appTerminationCleanUp];
         });
     }];
-    self.contentView.layer.anchorPoint = CGPointMake(0, 0);
-    self.contentView.layer.position = CGPointMake(0, 0);
+    if (!(self.emulatedViewportEnabled && self.hasSpoofedViewport)) {
+        self.contentView.layer.anchorPoint = CGPointMake(0, 0);
+        self.contentView.layer.position = CGPointMake(0, 0);
+    }
     
     self.hostScene = self.view.window.windowScene;
     if (self.hostScene && self.sceneID && !self.isTerminating && !self.isAppTerminationCleanUpCalled) {
@@ -335,6 +438,11 @@ static UIScreen *LCFallbackActiveScreen(void) {
 }
 
 - (void)viewWillLayoutSubviews {
+    if (self.emulatedViewportEnabled && self.hasSpoofedViewport) {
+        UIInterfaceOrientation orientation = self.view.window.windowScene.effectiveGeometry.interfaceOrientation;
+        [self applyViewportLayoutForAvailableSize:self.view.bounds.size interfaceOrientation:orientation];
+        return;
+    }
     /// For native window we let iPadOS handle it however it wants, which is usually live resize (autoresizingMask set in appSceneVCWillActivateScene)
     if(_contentView.autoresizingMask != (UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight)) {
         [self updateFrameWithSettingsBlock:nil];
@@ -387,9 +495,17 @@ static UIScreen *LCFallbackActiveScreen(void) {
     }
     
     if (self.contentView) {
-        // Discard position
-        frame.origin = CGPointZero;
-        self.contentView.frame = frame;
+        if (self.emulatedViewportEnabled && self.hasSpoofedViewport) {
+            [self applyViewportLayoutForAvailableSize:frame.size interfaceOrientation:tempSettings.interfaceOrientation];
+        } else {
+            self.view.backgroundColor = UIColor.clearColor;
+            self.contentView.transform = CGAffineTransformMakeScale(self.scaleRatio, self.scaleRatio);
+            self.contentView.layer.anchorPoint = CGPointMake(0, 0);
+            self.contentView.layer.position = CGPointZero;
+            // Discard position
+            frame.origin = CGPointZero;
+            self.contentView.frame = frame;
+        }
     } else {
         // This method can be called while contentView is nil to set up initial frame
         self.view.frame = frame;

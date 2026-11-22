@@ -19,6 +19,7 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCDockWidth", store: LCUtils.appGroupUserDefault) var dockWidth: Double = 80
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
     @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
+    @AppStorage("LCMultitaskEmulateSpoofViewport", store: LCUtils.appGroupUserDefault) var emulateSpoofViewport = false
     
     var body: some View {
         List {
@@ -62,6 +63,14 @@ struct LCMultitaskSettingView: View {
                         Text("lc.settings.redirectURLToHost".loc)
                     }
 
+                }
+                Toggle(isOn: $emulateSpoofViewport) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("lc.settings.emulateSpoofViewport".loc)
+                        Text("lc.settings.emulateSpoofViewportDesc".loc)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             

@@ -29,6 +29,11 @@ NS_SWIFT_UI_ACTOR
 @property(nonatomic) BOOL isAppRunning;
 @property(nonatomic) BOOL shouldIgnoreSceneUpdates, shouldSkipDebounceOnce;
 @property(nonatomic) CGFloat scaleRatio;
+@property(nonatomic, readonly) BOOL hasSpoofedViewport;
+@property(nonatomic, readonly) CGSize emulatedViewportSize;
+@property(nonatomic, readonly, nullable) NSString *emulatedViewportLabel;
+@property(nonatomic) BOOL emulatedViewportEnabled;
+- (void)applyViewportLayoutForAvailableSize:(CGSize)availableSize interfaceOrientation:(UIInterfaceOrientation)orientation;
 @property(nonatomic, nullable) UIView* contentView;
 @property(nonatomic, nullable) _UIScenePresenter *presenter;
 @property(nonatomic, nullable) _UISceneHostingController *hostingController;

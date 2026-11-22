@@ -81,12 +81,21 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
                 }
             }
             // fix live resize
-            vc.contentView?.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            if !vc.emulatedViewportEnabled {
+                vc.contentView?.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            }
         }
         
         func appSceneVC(_ vc: AppSceneViewController, didUpdateFrom settings: UIMutableApplicationSceneSettings, transitionContext context: Any?, lifecycleActionType actionType: UInt32) {
             guard let scene = vc.presenter?.scene else { return }
             settings.interruptionPolicy = 0
+            if vc.emulatedViewportEnabled && vc.hasSpoofedViewport {
+                let vp = vc.emulatedViewportSize
+                let portraitW = min(vp.width, vp.height)
+                let portraitH = max(vp.width, vp.height)
+                settings.setFrame(CGRect(x: 0, y: 0, width: portraitW, height: portraitH))
+                vc.applyViewportLayout(forAvailableSize: vc.view.bounds.size, interfaceOrientation: settings.interfaceOrientation())
+            }
             //settings.peripheryInsets = vc.view.window?.safeAreaInsets ?? .zero
             scene.updateSettings(settings, withTransitionContext: context, completion: nil)
             // Not sure what actionType 2 is, but it's only set when this scene enters foreground, so we can pass URL scheme here

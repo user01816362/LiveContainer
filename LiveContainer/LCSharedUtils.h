@@ -35,4 +35,5 @@
 + (void)ensureContainerDirectoriesAtPath:(NSString *)containerPath;
 + (void)wipeStrictContainerIfNeededAtPath:(NSString *)containerPath force:(BOOL)force;
 + (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID;
++ (nullable NSDictionary *)containerInfoForDataUUID:(nonnull NSString *)dataUUID;
 @end

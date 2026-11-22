@@ -1033,12 +1033,12 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
     [self ensureContainerDirectoriesAtPath:containerPath];
 }
 
-+ (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID {
+static nullable NSString *LCContainerInfoPathForDataUUID(NSString *dataUUID) {
     if (dataUUID.length == 0 ||
         [dataUUID rangeOfString:@"/"].location != NSNotFound ||
         [dataUUID isEqualToString:@"."] ||
         [dataUUID isEqualToString:@".."]) {
-        return;
+        return nil;
     }
     NSFileManager *fm = NSFileManager.defaultManager;
     NSURL *docURL = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
@@ -1046,7 +1046,7 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
     if (docURL) {
         [candidateURLs addObject:[docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]]];
     }
-    NSURL *appGroupPath = [self appGroupPath];
+    NSURL *appGroupPath = [LCSharedUtils appGroupPath];
     if (appGroupPath) {
         [candidateURLs addObject:[appGroupPath URLByAppendingPathComponent:[NSString stringWithFormat:@"LiveContainer/Data/Application/%@", dataUUID]]];
     }
@@ -1054,9 +1054,25 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
     for (NSURL *candidateURL in candidateURLs) {
         NSString *containerInfoPath = [candidateURL.path stringByAppendingPathComponent:@"LCContainerInfo.plist"];
         if ([fm fileExistsAtPath:containerInfoPath]) {
-            [self wipeStrictContainerIfNeededAtPath:candidateURL.path force:NO];
-            return;
+            return containerInfoPath;
         }
+    }
+    return nil;
+}
+
++ (nullable NSDictionary *)containerInfoForDataUUID:(NSString *)dataUUID {
+    NSString *containerInfoPath = LCContainerInfoPathForDataUUID(dataUUID);
+    if (containerInfoPath.length == 0) {
+        return nil;
+    }
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
+    return [info isKindOfClass:NSDictionary.class] ? info : nil;
+}
+
++ (void)wipeStrictContainerForDataUUIDIfNeeded:(NSString *)dataUUID {
+    NSString *containerInfoPath = LCContainerInfoPathForDataUUID(dataUUID);
+    if (containerInfoPath.length > 0) {
+        [self wipeStrictContainerIfNeededAtPath:containerInfoPath.stringByDeletingLastPathComponent force:NO];
     }
 }
 @end

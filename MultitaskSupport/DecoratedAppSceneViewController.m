@@ -56,38 +56,53 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     [MultitaskDockManager.shared addRunningApp:windowName appUUID:dataUUID view:self.view];
     
     __weak typeof(self) weakSelf = self;
-    NSArray *menuItems = @[
-        [UIAction actionWithTitle:@"lc.multitask.copyPid".loc image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            UIPasteboard.generalPasteboard.string = @(strongSelf.appSceneVC.pid).stringValue;
-        }],
-        [UIAction actionWithTitle:@"lc.multitask.enablePip".loc image:[UIImage systemImageNamed:@"pip.enter"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            if ([PiPManager.shared isPiPWithVC:strongSelf.appSceneVC]) {
-                [PiPManager.shared stopPiP];
-            } else {
-                [PiPManager.shared startPiPWithVC:strongSelf.appSceneVC];
-            }
-        }],
-        [UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) {
-                return [[UIView alloc] initWithFrame:CGRectZero];
-            }
-            return [strongSelf scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:strongSelf.scaleRatio stepInterval:0.01];
-        }]
-    ];
-
     [self.navigationItem setTitleMenuProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions){
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf || !strongSelf.appSceneVC.isAppRunning) {
             return [UIMenu menuWithTitle:NSLocalizedString(@"lc.multitaskAppWindow.appTerminated", nil) children:@[]];
-        } else {
-            NSString *pidText = [NSString stringWithFormat:@"PID: %d", strongSelf.pid];
-            return [UIMenu menuWithTitle:pidText children:menuItems];
         }
+        NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithArray:@[
+            [UIAction actionWithTitle:@"lc.multitask.copyPid".loc image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction * _Nonnull action) {
+                __strong typeof(weakSelf) innerSelf = weakSelf;
+                if (!innerSelf) return;
+                UIPasteboard.generalPasteboard.string = @(innerSelf.appSceneVC.pid).stringValue;
+            }],
+            [UIAction actionWithTitle:@"lc.multitask.enablePip".loc image:[UIImage systemImageNamed:@"pip.enter"] identifier:nil handler:^(UIAction * _Nonnull action) {
+                __strong typeof(weakSelf) innerSelf = weakSelf;
+                if (!innerSelf) return;
+                if ([PiPManager.shared isPiPWithVC:innerSelf.appSceneVC]) {
+                    [PiPManager.shared stopPiP];
+                } else {
+                    [PiPManager.shared startPiPWithVC:innerSelf.appSceneVC];
+                }
+            }]
+        ]];
+        if (strongSelf.appSceneVC.hasSpoofedViewport) {
+            CGSize vp = strongSelf.appSceneVC.emulatedViewportSize;
+            NSString *label = strongSelf.appSceneVC.emulatedViewportLabel;
+            NSString *vpTitle = label.length > 0
+                ? [NSString stringWithFormat:@"%@: %@ (%ld×%ld)", @"lc.multitask.emulateViewport".loc, label, (long)llround(vp.width), (long)llround(vp.height)]
+                : [NSString stringWithFormat:@"%@ (%ld×%ld)", @"lc.multitask.emulateViewport".loc, (long)llround(vp.width), (long)llround(vp.height)];
+            UIAction *viewportAction = [UIAction actionWithTitle:vpTitle
+                                                           image:[UIImage systemImageNamed:@"aspectratio"]
+                                                      identifier:nil
+                                                         handler:^(UIAction * _Nonnull action) {
+                __strong typeof(weakSelf) innerSelf = weakSelf;
+                if (!innerSelf) return;
+                [innerSelf setSpoofViewportEmulationEnabled:!innerSelf.appSceneVC.emulatedViewportEnabled];
+            }];
+            viewportAction.state = strongSelf.appSceneVC.emulatedViewportEnabled ? UIMenuElementStateOn : UIMenuElementStateOff;
+            [items addObject:viewportAction];
+        }
+        [items addObject:[UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
+            __strong typeof(weakSelf) innerSelf = weakSelf;
+            if (!innerSelf) {
+                return [[UIView alloc] initWithFrame:CGRectZero];
+            }
+            return [innerSelf scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:innerSelf.scaleRatio stepInterval:0.01];
+        }]];
+        NSString *pidText = [NSString stringWithFormat:@"PID: %d", strongSelf.pid];
+        return [UIMenu menuWithTitle:pidText children:items];
     }];
     
     UIImage *minimizeImage = [UIImage systemImageNamed:@"minus.circle"];
@@ -127,7 +142,21 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 - (void)setupDecoratedView {
     CGFloat navBarHeight = 44;
     BOOL isLandscape = UIInterfaceOrientationIsLandscape(LCCurrentInterfaceOrientation());
-    CGRect frame = CGRectMake(0, 0, isLandscape ? 480 : 320, (isLandscape ? 320 : 480) + navBarHeight);
+    CGFloat contentW = isLandscape ? 480.0 : 320.0;
+    CGFloat contentH = isLandscape ? 320.0 : 480.0;
+    if (_appSceneVC.emulatedViewportEnabled && _appSceneVC.hasSpoofedViewport) {
+        CGSize vp = _appSceneVC.emulatedViewportSize;
+        CGFloat vpW = isLandscape ? MAX(vp.width, vp.height) : MIN(vp.width, vp.height);
+        CGFloat vpH = isLandscape ? MIN(vp.width, vp.height) : MAX(vp.width, vp.height);
+        CGFloat boxW = isLandscape ? 500.0 : 340.0;
+        CGFloat boxH = isLandscape ? 320.0 : 500.0;
+        if (vpW > 0.0 && vpH > 0.0) {
+            CGFloat s = MIN(boxW / vpW, boxH / vpH);
+            contentW = MAX(220.0, round(vpW * s));
+            contentH = MAX(220.0, round(vpH * s));
+        }
+    }
+    CGRect frame = CGRectMake(0, 0, contentW, contentH + navBarHeight);
     CGPoint rootViewCenter = self.view.superview.center;
     frame.origin = CGPointMake(rootViewCenter.x - frame.size.width / 2, rootViewCenter.y - frame.size.height / 2);
     
@@ -210,6 +239,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     if (!self.isObservingDefaults) {
         self.isObservingDefaults = YES;
         [defaults addObserver:self forKeyPath:@"LCMultitaskBottomWindowBar" options:NSKeyValueObservingOptionNew context:NULL];
+        [defaults addObserver:self forKeyPath:@"LCMultitaskEmulateSpoofViewport" options:NSKeyValueObservingOptionNew context:NULL];
     }
     if (!self.isObservingKeyboard) {
         self.isObservingKeyboard = YES;
@@ -283,6 +313,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     if (_isObservingDefaults) {
         _isObservingDefaults = NO;
         [NSUserDefaults.lcSharedDefaults removeObserver:self forKeyPath:@"LCMultitaskBottomWindowBar"];
+        [NSUserDefaults.lcSharedDefaults removeObserver:self forKeyPath:@"LCMultitaskEmulateSpoofViewport"];
     }
     if (_isObservingKeyboard) {
         _isObservingKeyboard = NO;
@@ -332,7 +363,34 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     return containerView;
 }
 
+- (void)setSpoofViewportEmulationEnabled:(BOOL)enabled {
+    BOOL shouldEnable = enabled && self.appSceneVC.hasSpoofedViewport;
+    if (self.appSceneVC.emulatedViewportEnabled == shouldEnable) {
+        return;
+    }
+    self.appSceneVC.emulatedViewportEnabled = shouldEnable;
+    self.appSceneVC.shouldSkipDebounceOnce = YES;
+    if (!shouldEnable) {
+        self.appSceneVC.view.backgroundColor = UIColor.clearColor;
+        self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(self.scaleRatio, self.scaleRatio);
+    }
+    __weak typeof(self) weakSelf = self;
+    [self.appSceneVC updateFrameWithSettingsBlock:^(UIMutableApplicationSceneSettings *settings) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf.isMaximized) {
+            [strongSelf updateMaximizedSafeAreaWithSettings:settings];
+        } else {
+            settings.peripheryInsets = UIEdgeInsetsZero;
+            settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
+        }
+    }];
+}
+
 - (void)scaleSliderChanged:(_UIPrototypingMenuSlider *)slider {
+    if (self.appSceneVC.emulatedViewportEnabled) {
+        self.appSceneVC.emulatedViewportEnabled = NO;
+    }
     self.scaleRatio = slider.value;
     self.appSceneVC.scaleRatio = _scaleRatio;
     self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(_scaleRatio, _scaleRatio);
@@ -500,7 +558,8 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         } else {
             [self updateWindowedFrameWithSettings:settings];
         }
-        CGRect newFrame = CGRectMake(0, 0, self.view.bounds.size.width, self.view.bounds.size.height - self.navigationBar.frame.size.height/self.scaleRatio);
+        CGFloat navHeight = self.navigationBar.hidden ? 0.0 : (self.appSceneVC.emulatedViewportEnabled ? self.navigationBar.frame.size.height : (self.navigationBar.frame.size.height / self.scaleRatio));
+        CGRect newFrame = CGRectMake(0, 0, self.view.bounds.size.width, self.view.bounds.size.height - navHeight);
         
         if(UIInterfaceOrientationIsLandscape(baseSettings.interfaceOrientation)) {
             settings.frame = CGRectMake(0, 0, newFrame.size.height, newFrame.size.width);
@@ -544,6 +603,18 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqualToString:@"LCMultitaskEmulateSpoofViewport"]) {
+        BOOL enabled = [change[NSKeyValueChangeNewKey] boolValue];
+        dispatch_block_t applyBlock = ^{
+            [self setSpoofViewportEmulationEnabled:enabled];
+        };
+        if (NSThread.isMainThread) {
+            applyBlock();
+        } else {
+            dispatch_async(dispatch_get_main_queue(), applyBlock);
+        }
+        return;
+    }
     [self.view layoutIfNeeded];
     [UIView animateWithDuration:0.3 animations:^{
         BOOL bottomWindowBar = [change[NSKeyValueChangeNewKey] boolValue];

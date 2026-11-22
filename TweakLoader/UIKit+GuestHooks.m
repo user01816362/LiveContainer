@@ -118,6 +118,7 @@ NSDictionary<NSString *, NSNumber *> *spoofFeatureOverrides = nil;
 NSString *spoofDeviceVariantId = nil;
 CGFloat spoofScreenPointWidth = 0;
 CGFloat spoofScreenPointHeight = 0;
+static BOOL sUIScreenBoundsSwizzled = NO;
 
 static uint32_t LCFNV1a32(const char *str, uint32_t seed) {
     uint32_t hash = seed ? seed : 2166136261u;
@@ -812,20 +813,49 @@ static NSInteger LCEffectiveOSMajorVersion(void) {
     return 27;
 }
 
+static NSInteger LCEffectiveOSMinorVersion(void) {
+    if (spoofOperatingSystemVersionValid && spoofOperatingSystemVersion.majorVersion > 0) {
+        return MAX(0, spoofOperatingSystemVersion.minorVersion);
+    }
+    return (LCEffectiveOSMajorVersion() >= 27) ? 2 : 0;
+}
+
 static NSString *LCDerivedDarwinRelease(void) {
     NSInteger osMajor = LCEffectiveOSMajorVersion();
     int32_t darwinMajor = LCExpectedDarwinMajorForOSMajor((int32_t)osMajor);
-    NSInteger darwinMinor = (osMajor >= 27) ? 2 : 0;
+    NSInteger darwinMinor = LCEffectiveOSMinorVersion();
     return [NSString stringWithFormat:@"%d.%ld.0", darwinMajor, (long)darwinMinor];
 }
 
 static NSString *LCDerivedOSBuildVersion(void) {
     NSInteger osMajor = LCEffectiveOSMajorVersion();
-    if (osMajor >= 27) return @"24C101";
-    if (osMajor == 26) return @"23A340";
-    if (osMajor == 18) return @"22B83";
-    if (osMajor == 17) return @"21A329";
+    NSInteger osMinor = LCEffectiveOSMinorVersion();
+    char minorLetter = (char)('A' + MIN(MAX(osMinor, 0), 10));
+    if (osMajor >= 27) {
+        if (osMinor == 0) return @"24A340";
+        if (osMinor == 1) return @"24B83";
+        if (osMinor == 2) return @"24C101";
+        return [NSString stringWithFormat:@"24%c85", minorLetter];
+    }
+    if (osMajor == 26) {
+        return (osMinor == 0) ? @"23A340" : [NSString stringWithFormat:@"23%c85", minorLetter];
+    }
+    if (osMajor == 18) {
+        return [NSString stringWithFormat:@"22%c83", minorLetter];
+    }
+    if (osMajor == 17) {
+        return [NSString stringWithFormat:@"21%c329", minorLetter];
+    }
     return @"20A362";
+}
+
+static NSString *LCDerivedCFNetworkVersion(void) {
+    NSInteger osMajor = LCEffectiveOSMajorVersion();
+    if (osMajor >= 27) return @"3826.500.131";
+    if (osMajor == 26) return @"3826.400.100";
+    if (osMajor == 18) return @"1568.300.101";
+    if (osMajor == 17) return @"1498.700.2";
+    return @"1410.0.3";
 }
 
 static NSUUID *LCBlockedZeroUUID(void) {
@@ -1275,6 +1305,7 @@ static NSRegularExpression *_uaIOSVersionSlashRegex = nil;
 static NSRegularExpression *_uaIOSVersionCPURegex = nil;
 static NSRegularExpression *_uaIOSVersionParenRegex = nil;
 static NSRegularExpression *_uaDarwinVersionRegex = nil;
+static NSRegularExpression *_uaCFNetworkVersionRegex = nil;
 
 static void LCInitUserAgentRegexes(void) {
     static dispatch_once_t onceToken;
@@ -1302,6 +1333,11 @@ static void LCInitUserAgentRegexes(void) {
         // Match CFNetwork's "Darwin/25.0.0" token
         _uaDarwinVersionRegex = [NSRegularExpression
             regularExpressionWithPattern:@"Darwin/[\\d.]+"
+            options:0 error:nil];
+
+        // Match CFNetwork's "CFNetwork/3826.500.131" token
+        _uaCFNetworkVersionRegex = [NSRegularExpression
+            regularExpressionWithPattern:@"CFNetwork/[\\d.]+"
             options:0 error:nil];
     });
 }
@@ -1348,6 +1384,11 @@ static NSString* LCRewriteUserAgent(NSString *ua) {
         [_uaDarwinVersionRegex replaceMatchesInString:result
             options:0 range:fullRange
             withTemplate:[NSString stringWithFormat:@"Darwin/%@", LCDerivedDarwinRelease()]];
+        fullRange = NSMakeRange(0, result.length);
+
+        [_uaCFNetworkVersionRegex replaceMatchesInString:result
+            options:0 range:fullRange
+            withTemplate:[NSString stringWithFormat:@"CFNetwork/%@", LCDerivedCFNetworkVersion()]];
     }
 
     if (![result isEqualToString:ua]) {
@@ -1367,8 +1408,8 @@ static NSString *LCDefaultSynthesizedCFNetworkUserAgent(void) {
     NSDictionary *info = NSBundle.mainBundle.infoDictionary;
     NSString *execName = info[@"CFBundleName"] ?: NSProcessInfo.processInfo.processName ?: @"App";
     NSString *buildVer = info[@"CFBundleVersion"] ?: @"1";
-    return [NSString stringWithFormat:@"%@/%@ CFNetwork/3826.500.131 Darwin/%@",
-            execName, buildVer, LCDerivedDarwinRelease()];
+    return [NSString stringWithFormat:@"%@/%@ CFNetwork/%@ Darwin/%@",
+            execName, buildVer, LCDerivedCFNetworkVersion(), LCDerivedDarwinRelease()];
 }
 
 static NSDictionary* LCRewriteHeaderDict(NSDictionary *headers, BOOL injectMissingDefaults) {
@@ -1633,7 +1674,7 @@ static void LCRotateSpoofProfile(void) {
             spoofAudioInputChannels = arc4random_uniform(3);
         }
     }
-    if(spoofGraphicsCategoryEnabled) {
+    if(spoofGraphicsCategoryEnabled && !selectedSpec) {
         if(LCFeatureEnabled(@"graphics.workingSet")) spoofGPUWorkingSetSize = (2 + arc4random_uniform(7)) * 1024ULL * 1024ULL * 1024ULL;
         if(LCFeatureEnabled(@"graphics.rayTracing")) spoofGraphicsSupportsRayTracing = arc4random_uniform(2) == 1;
         if(LCFeatureEnabled(@"graphics.allFamilies")) spoofGraphicsSupportsAllFamilies = arc4random_uniform(2) == 1;
@@ -2039,7 +2080,11 @@ static void UIKitGuestHooksInit(void) {
         const LCDeviceHardwareSpec *matchedSpec = spoofDeviceVariantId.length > 0
             ? LCDeviceHardwareSpecFindByVariant(spoofDeviceVariantId.UTF8String)
             : LCDeviceHardwareSpecFindByMachine(spoofHardwareModel.UTF8String);
-        if(matchedSpec) {
+        BOOL pixelsMatchCatalog = (matchedSpec != NULL) &&
+            (spoofScreenWidth <= 0 || spoofScreenHeight <= 0 ||
+             (fabs(spoofScreenWidth - matchedSpec->pixelWidth) < 1.0 &&
+              fabs(spoofScreenHeight - matchedSpec->pixelHeight) < 1.0));
+        if(pixelsMatchCatalog) {
             spoofScreenPointWidth = matchedSpec->pointWidth;
             spoofScreenPointHeight = matchedSpec->pointHeight;
         } else if(spoofScreenWidth > 0 && spoofScreenHeight > 0) {
@@ -2160,6 +2205,7 @@ static void UIKitGuestHooksInit(void) {
         spoofScreenNativeScale > 0 || spoofMaximumFramesPerSecond > 0 || spoofScreenBrightness >= 0))) {
         swizzle(UIScreen.class, @selector(nativeBounds), @selector(hook_nativeBounds));
         swizzle(UIScreen.class, @selector(bounds), @selector(hook_bounds));
+        sUIScreenBoundsSwizzled = YES;
         swizzle(UIScreen.class, @selector(scale), @selector(hook_scale));
         swizzle(UIScreen.class, @selector(nativeScale), @selector(hook_nativeScale));
         swizzle(UIScreen.class, @selector(maximumFramesPerSecond), @selector(hook_maximumFramesPerSecond));
@@ -3479,9 +3525,14 @@ static WKWebsiteDataStore *LCIsolatedWebsiteDataStore(BOOL ephemeral) {
 - (UIEdgeInsets)hook_safeAreaInsets {
     UIEdgeInsets original = [self hook_safeAreaInsets];
     if(spoofProfileEnabled && spoofDisplayCategoryEnabled && self.windowScene) {
-        CGRect screenBounds = self.windowScene.screen ? self.windowScene.screen.bounds : self.bounds;
-        if(fabs(CGRectGetWidth(self.bounds) - CGRectGetWidth(screenBounds)) < 2.0 &&
-           fabs(CGRectGetHeight(self.bounds) - CGRectGetHeight(screenBounds)) < 2.0) {
+        UIScreen *screen = self.windowScene.screen;
+        CGRect realScreenBounds = (screen && sUIScreenBoundsSwizzled) ? [screen hook_bounds] : (screen ? screen.bounds : self.bounds);
+        CGRect spoofedScreenBounds = screen ? screen.bounds : self.bounds;
+        BOOL matchesRealScreen = fabs(CGRectGetWidth(self.bounds) - CGRectGetWidth(realScreenBounds)) < 2.0 &&
+                                 fabs(CGRectGetHeight(self.bounds) - CGRectGetHeight(realScreenBounds)) < 2.0;
+        BOOL matchesSpoofedScreen = fabs(CGRectGetWidth(self.bounds) - CGRectGetWidth(spoofedScreenBounds)) < 2.0 &&
+                                    fabs(CGRectGetHeight(self.bounds) - CGRectGetHeight(spoofedScreenBounds)) < 2.0;
+        if(matchesRealScreen || matchesSpoofedScreen) {
             if(self.bounds.size.width > self.bounds.size.height) {
                 return UIEdgeInsetsMake(0, MAX(spoofSafeAreaInsets.top, spoofSafeAreaInsets.left),
                                         MIN(21.0, spoofSafeAreaInsets.bottom), MAX(spoofSafeAreaInsets.top, spoofSafeAreaInsets.right));

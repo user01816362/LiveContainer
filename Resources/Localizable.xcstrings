@@ -34982,6 +34982,54 @@
           }
         }
       }
+    },
+    "lc.multitask.emulateViewport" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "أبعاد شاشة الجهاز"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Device Viewport"
+          }
+        }
+      }
+    },
+    "lc.settings.emulateSpoofViewport" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "محاكاة شاشة الجهاز المُموَّه"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Emulate Spoofed Device Screen"
+          }
+        }
+      }
+    },
+    "lc.settings.emulateSpoofViewportDesc" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "عرض نوافذ تعدد المهام بأبعاد شاشة الجهاز المُموَّه للحاوية (مثل iPhone Duo أو iPhone 18 أو iPad) مع تحجيم تلقائي مناسب. أوقفه للعودة إلى الحجم العادي."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Render Multitask windows at the container's spoofed device viewport (e.g., iPhone Duo, iPhone 18, iPad) scaled to fit. Turn off to return to normal resizing."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
