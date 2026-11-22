@@ -341,7 +341,7 @@ final class AppInfoProvider {
                     self.isAutoHidden = false
                     self.setupEdgeGestureRecognizers()
                 }
-            } else if self.isVisible && !self.isAutoHidden && !self.isDockHidden {
+            } else if self.isVisible && self.isCollapsed && !self.isAutoHidden && !self.isDockHidden {
                 self.scheduleAutoHideIfNeeded()
             }
             if self.isVisible {
@@ -547,7 +547,7 @@ final class AppInfoProvider {
 
     func scheduleAutoHideIfNeeded() {
         cancelAutoHideTimer()
-        guard isVisible, isAutoHideEnabled, !isUserInteracting, !isAutoHidden, !isDockHidden else {
+        guard isVisible, isCollapsed, isAutoHideEnabled, !isUserInteracting, !isAutoHidden, !isDockHidden else {
             return
         }
         let delay = autoHideDelaySeconds
@@ -558,7 +558,7 @@ final class AppInfoProvider {
                 return
             }
             guard let self, !Task.isCancelled else { return }
-            guard self.isVisible, self.isAutoHideEnabled, !self.isUserInteracting, !self.isDockHidden else {
+            guard self.isVisible, self.isCollapsed, self.isAutoHideEnabled, !self.isUserInteracting, !self.isDockHidden else {
                 return
             }
             self.isAutoHidden = true
@@ -812,10 +812,19 @@ final class AppInfoProvider {
     }
     
     @objc public func toggleDockCollapse() {
-        self.noteUserActivity(wakeDock: true)
         self.isCollapsed.toggle()
+        if !self.isCollapsed {
+            self.cancelAutoHideTimer()
+            if self.isAutoHidden {
+                self.isAutoHidden = false
+                self.setupEdgeGestureRecognizers()
+            }
+        }
         self.updateDockFrame()
         self.notifyDockCollapseChanged()
+        if self.isCollapsed {
+            self.scheduleAutoHideIfNeeded()
+        }
     }
     
     @objc public func notifyDockCollapseChanged() {
