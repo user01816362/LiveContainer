@@ -1033,7 +1033,7 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
     [self ensureContainerDirectoriesAtPath:containerPath];
 }
 
-static nullable NSString *LCContainerInfoPathForDataUUID(NSString *dataUUID) {
+static NSString * _Nullable LCContainerInfoPathForDataUUID(NSString *dataUUID) {
     if (dataUUID.length == 0 ||
         [dataUUID rangeOfString:@"/"].location != NSNotFound ||
         [dataUUID isEqualToString:@"."] ||
