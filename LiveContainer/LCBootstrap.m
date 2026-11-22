@@ -518,6 +518,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     const char *oldPath = *path;
     
     // Overwrite @executable_path
+    if (!appBundle.executablePath) {
+        return @"App's executable path not found. Please try force re-signing or reinstalling this app.";
+    }
     const char *appExecPath = appBundle.executablePath.fileSystemRepresentation;
     *path = appExecPath;
     overwriteExecPath(appExecPath);

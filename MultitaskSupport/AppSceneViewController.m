@@ -182,7 +182,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
         self.isRegisteredForSceneDiff = NO;
         return;
     }
-    UIWindowScene *sceneToUnregister = self.hostScene ?: self.view.window.windowScene;
+    UIWindowScene *sceneToUnregister = self.hostScene ?: (self.isViewLoaded ? self.view.window.windowScene : nil);
     if (sceneToUnregister) {
         [sceneToUnregister _unregisterSettingsDiffActionArrayForKey:self.sceneID];
     }
@@ -457,7 +457,19 @@ static UIScreen *LCFallbackActiveScreen(void) {
 }
 
 - (void)dealloc {
-    [self unregisterHostSceneDiffAction];
+    UIWindowScene *hostScene = _hostScene;
+    NSString *sceneID = _sceneID;
+    _hostScene = nil;
+    _isRegisteredForSceneDiff = NO;
+    if (hostScene && sceneID) {
+        if ([NSThread isMainThread]) {
+            [hostScene _unregisterSettingsDiffActionArrayForKey:sceneID];
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [hostScene _unregisterSettingsDiffActionArrayForKey:sceneID];
+            });
+        }
+    }
 }
 
 - (void)openURLScheme:(NSString *)urlString {

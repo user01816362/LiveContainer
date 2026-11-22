@@ -35,6 +35,8 @@ static const NSInteger kDead10ccMaxBackgroundRescans = 2;
 @property (nonatomic, readonly) NSTimeInterval backgroundTimeRemaining;
 + (instancetype)sharedApplication;
 - (int)applicationState;
+- (NSUInteger)beginBackgroundTaskWithName:(NSString *)taskName expirationHandler:(void (^)(void))handler;
+- (void)endBackgroundTask:(NSUInteger)identifier;
 @end
 
 Dead10ccFix* fix = nil;
@@ -69,15 +71,49 @@ void initDead10ccFix(void) {
     return self;
 }
 
-- (void)handleAppDidEnterBackgroundReal {
-    dispatch_async(self.lockScanQueue, ^{
-        @autoreleasepool {
-            NSSet *locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
-            for (NSString *path in locks) {
-                unsigned char value = 0x01;
-                setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value), 0, 0);
-            }
+- (void)performLockScan {
+    @autoreleasepool {
+        NSSet *locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
+        for (NSString *path in locks) {
+            unsigned char value = 0x01;
+            setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value), 0, 0);
         }
+    }
+}
+
+- (void)handleAppDidEnterBackgroundReal {
+    UIApplication *app = [NSClassFromString(@"UIApplication") sharedApplication];
+    if (app &&
+        [app respondsToSelector:@selector(beginBackgroundTaskWithName:expirationHandler:)] &&
+        [app respondsToSelector:@selector(endBackgroundTask:)]) {
+        __block NSUInteger bgTaskID = 0; // UIBackgroundTaskInvalid
+        void (^endTaskOnMain)(void) = ^{
+            dispatch_block_t finish = ^{
+                NSUInteger taskToEnd = bgTaskID;
+                bgTaskID = 0;
+                if (taskToEnd != 0) {
+                    [app endBackgroundTask:taskToEnd];
+                }
+            };
+            if ([NSThread isMainThread]) {
+                finish();
+            } else {
+                dispatch_async(dispatch_get_main_queue(), finish);
+            }
+        };
+        bgTaskID = [app beginBackgroundTaskWithName:@"com.kdt.livecontainer.dead10cc" expirationHandler:^{
+            endTaskOnMain();
+        }];
+        if (bgTaskID != 0) {
+            dispatch_async(self.lockScanQueue, ^{
+                [self performLockScan];
+                endTaskOnMain();
+            });
+            return;
+        }
+    }
+    dispatch_sync(self.lockScanQueue, ^{
+        [self performLockScan];
     });
 }
 

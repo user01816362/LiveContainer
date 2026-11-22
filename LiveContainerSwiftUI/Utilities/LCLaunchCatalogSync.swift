@@ -115,8 +115,11 @@ enum LCLaunchCatalogSync {
             .appendingPathComponent("SideStore/Library/Caches", isDirectory: true)
             .appendingPathComponent("BuiltInSideStoreIconCache", isDirectory: true)
 
-        pendingIconTask?.cancel()
+        let previousTask = pendingIconTask
+        previousTask?.cancel()
         pendingIconTask = Task.detached(priority: .utility) {
+            await previousTask?.value
+            guard !Task.isCancelled else { return }
             Self.mirrorAllIcons(
                 items: iconItems,
                 builtInSideStoreSrc: builtInSideStoreSrc,

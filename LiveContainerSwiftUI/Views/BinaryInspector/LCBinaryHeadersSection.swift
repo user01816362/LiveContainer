@@ -471,6 +471,7 @@ private struct LCObjCHeaderDetailView: View {
     let onShareHeaderFile: (URL) -> Void
 
     @State private var headerCode = ""
+    @State private var isRendering = true
     @State private var copied = false
     @State private var exportError: String?
 
@@ -539,12 +540,22 @@ private struct LCObjCHeaderDetailView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 4)
 
-            ScrollView([.vertical, .horizontal]) {
-                Text(headerCode)
-                    .font(.system(size: 12, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding()
+            if isRendering && headerCode.isEmpty {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if headerCode.isEmpty {
+                ContentUnavailableView("Unable to render header", systemImage: "doc.text")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(headerCode)
+                        .font(.system(size: 12, design: .monospaced))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .textSelection(.enabled)
+                        .padding()
+                }
+                .environment(\.layoutDirection, .leftToRight)
             }
         }
         .navigationTitle(title)
@@ -585,10 +596,14 @@ private struct LCObjCHeaderDetailView: View {
             Text(exportError ?? "")
         }
         .task(id: title) {
-            if headerCode.isEmpty {
-                let renderTarget = target
-                headerCode = (try? await lcRunOffMain { renderTarget.render() }) ?? ""
+            guard headerCode.isEmpty else {
+                isRendering = false
+                return
             }
+            isRendering = true
+            defer { isRendering = false }
+            let renderTarget = target
+            headerCode = (try? await lcRunOffMain { renderTarget.render() }) ?? ""
         }
         .task(id: copied) {
             guard copied else { return }
@@ -620,10 +635,12 @@ private struct LCSwiftTypeDetailView: View {
         ScrollView([.vertical, .horizontal]) {
             Text(declarationText)
                 .font(.system(size: 12, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: true, vertical: false)
                 .textSelection(.enabled)
                 .padding()
         }
+        .environment(\.layoutDirection, .leftToRight)
         .navigationTitle(type.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

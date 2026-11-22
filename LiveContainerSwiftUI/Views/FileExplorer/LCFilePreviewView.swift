@@ -371,9 +371,12 @@ struct LCHexPageViewer: View {
                 ScrollView([.vertical, .horizontal]) {
                     Text(formattedHexText)
                         .font(.system(size: 11, design: .monospaced))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
                         .textSelection(.enabled)
                         .padding(12)
                 }
+                .environment(\.layoutDirection, .leftToRight)
 
                 Divider()
 

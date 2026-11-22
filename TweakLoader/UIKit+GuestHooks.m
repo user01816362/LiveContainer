@@ -1763,10 +1763,7 @@ static void UIKitGuestHooksInit(void) {
     }
 
     BOOL shouldEnableSpoofProfile = [guestContainerInfo[@"spoofProfileEnabled"] boolValue];
-    if (shouldEnableSpoofProfile) {
-        spoofProfileEnabled = YES;
-    }
-    if ((spoofProfileEnabled || blockDeviceInfoReads) && !NSUserDefaults.isSideStore) {
+    if ((shouldEnableSpoofProfile || blockDeviceInfoReads) && !NSUserDefaults.isSideStore) {
         const char *homeEnv = getenv("HOME");
         NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
         if (homePath.length > 0) {
@@ -1802,6 +1799,9 @@ static void UIKitGuestHooksInit(void) {
     spoofWebViewCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofWebViewCategoryEnabled", YES);
     spoofAppPrivacyCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofAppPrivacyCategoryEnabled", YES);
     spoofSensorsAndUserDataCategoryEnabled = LCBoolWithDefault(guestContainerInfo, @"spoofSensorsAndUserDataCategoryEnabled", NO);
+    if(shouldEnableSpoofProfile) {
+        spoofProfileEnabled = YES;
+    }
     if(shouldEnableSpoofProfile && spoofAppPrivacyCategoryEnabled && LCFeatureEnabled(@"app.pasteboard") && !strictTestMode) {
         strictPrivatePasteboard = [UIPasteboard pasteboardWithUniqueName];
         LCSwizzleClassIfPresent(UIPasteboard.class, @selector(generalPasteboard), @selector(hook_generalPasteboard));
@@ -1826,7 +1826,6 @@ static void UIKitGuestHooksInit(void) {
     }
 
     if(shouldEnableSpoofProfile) {
-        spoofProfileEnabled = YES;
         NSString *deviceVariantId = guestContainerInfo[@"spoofDeviceVariantId"];
         if([deviceVariantId isKindOfClass:NSString.class] && deviceVariantId.length > 0) {
             spoofDeviceVariantId = deviceVariantId;

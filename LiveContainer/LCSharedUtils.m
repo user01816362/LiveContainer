@@ -9,6 +9,8 @@
 #import <os/lock.h>
 
 static os_unfair_lock sSigningCacheLock = OS_UNFAIR_LOCK_INIT;
+static uint64_t sSigningCacheGeneration = 0;
+static NSDate *sCachedCertUpdateDate = nil;
 static BOOL sCertDataLoaded = NO;
 static NSData *sCachedCertData = nil;
 static BOOL sCertPwdLoaded = NO;
@@ -16,11 +18,27 @@ static NSString *sCachedCertPassword = nil;
 
 static void LCInvalidateHostSigningSecretCache(void) {
     os_unfair_lock_lock(&sSigningCacheLock);
+    sSigningCacheGeneration++;
+    sCachedCertUpdateDate = nil;
     sCertDataLoaded = NO;
     sCachedCertData = nil;
     sCertPwdLoaded = NO;
     sCachedCertPassword = nil;
     os_unfair_lock_unlock(&sSigningCacheLock);
+}
+
+static uint64_t LCSyncHostSigningCacheLocked(NSDate *currentUpdateDate) {
+    BOOL dateChanged = (sCachedCertUpdateDate != currentUpdateDate &&
+                        ![sCachedCertUpdateDate isEqual:currentUpdateDate]);
+    if (dateChanged) {
+        sSigningCacheGeneration++;
+        sCachedCertUpdateDate = currentUpdateDate;
+        sCertDataLoaded = NO;
+        sCachedCertData = nil;
+        sCertPwdLoaded = NO;
+        sCachedCertPassword = nil;
+    }
+    return sSigningCacheGeneration;
 }
 
 extern NSUserDefaults *lcUserDefaults;
@@ -283,8 +301,12 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 
 + (nullable NSData *)certificateData {
     BOOL canUseHostCache = (!NSUserDefaults.isLiveProcess && NSUserDefaults.guestAppInfo == nil);
+    uint64_t readGeneration = 0;
     if (canUseHostCache) {
+        id rawDate = [[self sharedSigningDefaults] objectForKey:@"LCCertificateUpdateDate"];
+        NSDate *currentUpdateDate = [rawDate isKindOfClass:NSDate.class] ? rawDate : nil;
         os_unfair_lock_lock(&sSigningCacheLock);
+        readGeneration = LCSyncHostSigningCacheLocked(currentUpdateDate);
         BOOL loaded = sCertDataLoaded;
         NSData *cached = sCachedCertData;
         os_unfair_lock_unlock(&sSigningCacheLock);
@@ -307,8 +329,10 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 
     if (canUseHostCache) {
         os_unfair_lock_lock(&sSigningCacheLock);
-        sCachedCertData = resolved;
-        sCertDataLoaded = YES;
+        if (sSigningCacheGeneration == readGeneration) {
+            sCachedCertData = resolved;
+            sCertDataLoaded = YES;
+        }
         os_unfair_lock_unlock(&sSigningCacheLock);
     }
     return resolved;
@@ -316,8 +340,12 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 
 + (nullable NSString *)certificatePassword {
     BOOL canUseHostCache = (!NSUserDefaults.isLiveProcess && NSUserDefaults.guestAppInfo == nil);
+    uint64_t readGeneration = 0;
     if (canUseHostCache) {
+        id rawDate = [[self sharedSigningDefaults] objectForKey:@"LCCertificateUpdateDate"];
+        NSDate *currentUpdateDate = [rawDate isKindOfClass:NSDate.class] ? rawDate : nil;
         os_unfair_lock_lock(&sSigningCacheLock);
+        readGeneration = LCSyncHostSigningCacheLocked(currentUpdateDate);
         BOOL loaded = sCertPwdLoaded;
         NSString *cached = sCachedCertPassword;
         os_unfair_lock_unlock(&sSigningCacheLock);
@@ -344,8 +372,10 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 
     if (canUseHostCache) {
         os_unfair_lock_lock(&sSigningCacheLock);
-        sCachedCertPassword = resolved;
-        sCertPwdLoaded = YES;
+        if (sSigningCacheGeneration == readGeneration) {
+            sCachedCertPassword = resolved;
+            sCertPwdLoaded = YES;
+        }
         os_unfair_lock_unlock(&sSigningCacheLock);
     }
     return resolved;

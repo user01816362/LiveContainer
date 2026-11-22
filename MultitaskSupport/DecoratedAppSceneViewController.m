@@ -73,15 +73,19 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         }],
         [UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return [[UIView alloc] initWithFrame:CGRectZero];
+            }
             return [strongSelf scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:strongSelf.scaleRatio stepInterval:0.01];
         }]
     ];
 
     [self.navigationItem setTitleMenuProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions){
-        if(!weakSelf.appSceneVC.isAppRunning) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.appSceneVC.isAppRunning) {
             return [UIMenu menuWithTitle:NSLocalizedString(@"lc.multitaskAppWindow.appTerminated", nil) children:@[]];
         } else {
-            NSString *pidText = [NSString stringWithFormat:@"PID: %d", weakSelf.pid];
+            NSString *pidText = [NSString stringWithFormat:@"PID: %d", strongSelf.pid];
             return [UIMenu menuWithTitle:pidText children:menuItems];
         }
     }];
