@@ -19,6 +19,9 @@ def fetch_latest_release(repo_url, is_nightly: bool):
     headers = {
         "Accept": "application/vnd.github+json",
     }
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
     try:
         response = requests.get(api_url, headers=headers)
         response.raise_for_status()
