@@ -18,6 +18,8 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCMaxOneAppOnStage", store: LCUtils.appGroupUserDefault) var onlyOneAppOnStage = false
     @AppStorage("LCDockWidth", store: LCUtils.appGroupUserDefault) var dockWidth: Double = 80
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
+    @AppStorage("LCAutoHideMultitaskDock", store: LCUtils.appGroupUserDefault) var autoHideDock: Bool = false
+    @AppStorage("LCAutoHideMultitaskDockDelay", store: LCUtils.appGroupUserDefault) var autoHideDockDelay: Double = 3.0
     @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
     @AppStorage("LCMultitaskEmulateSpoofViewport", store: LCUtils.appGroupUserDefault) var emulateSpoofViewport = false
     
@@ -92,6 +94,22 @@ struct LCMultitaskSettingView: View {
                 .padding(.vertical, 4)
                 Toggle(isOn: $hideCollapsedDock) {
                     Text("lc.settings.hideCollapsedDock".loc)
+                }
+                Toggle(isOn: $autoHideDock) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("lc.settings.autoHideDock".loc)
+                        Text("lc.settings.autoHideDockDesc".loc)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if autoHideDock {
+                    Picker("lc.settings.autoHideDockDelay".loc, selection: $autoHideDockDelay) {
+                        Text("2s").tag(2.0)
+                        Text("3s").tag(3.0)
+                        Text("5s").tag(5.0)
+                        Text("10s").tag(10.0)
+                    }
                 }
             }
         }

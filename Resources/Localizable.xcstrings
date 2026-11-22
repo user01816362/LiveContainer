@@ -35030,6 +35030,54 @@
           }
         }
       }
+    },
+    "lc.settings.autoHideDock" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "إخفاء زر تعدد المهام تلقائياً"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto-Hide Floating Dock"
+          }
+        }
+      }
+    },
+    "lc.settings.autoHideDockDelay" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "مدة الانتظار قبل الإخفاء"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide After Inactivity"
+          }
+        }
+      }
+    },
+    "lc.settings.autoHideDockDesc" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "إخفاء الزر العائم بالكامل بعد عدم التفاعل (مفيد لالتقاط الشاشة). اسحب من حافة الشاشة أو المس الحافة أو شريط النافذة لإظهاره."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Completely hides the floating dock after inactivity for clean screenshots. Swipe from the screen edge, tap the edge sliver, or touch a window bar to show it again."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

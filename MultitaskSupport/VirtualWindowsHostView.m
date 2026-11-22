@@ -6,6 +6,7 @@
 //
 #import "DecoratedAppSceneViewController.h"
 #import "VirtualWindowsHostView.h"
+#import "LiveContainerSwiftUI-Swift.h"
 
 @implementation VirtualWindowsHostView
 - (instancetype)init {
@@ -35,6 +36,9 @@
         return nil;
     } else {
         self.shouldForwardTapAction = YES;
+        if (event != nil && event.type == UIEventTypeTouches && hitView != nil) {
+            [[MultitaskDockManager shared] noteHostTouchActivity];
+        }
         return hitView;
     }
 }
