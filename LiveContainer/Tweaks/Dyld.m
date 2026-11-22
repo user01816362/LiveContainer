@@ -181,25 +181,6 @@ int hook_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
-static bool LCIsProtectedSecuritySymbol(const char *symbol) {
-    if (!symbol) return false;
-    static const char *const kProtected[] = {
-        "SecItemAdd",
-        "SecItemCopyMatching",
-        "SecItemUpdate",
-        "SecItemDelete",
-        "SecKeyCreateRandomKey",
-        "SecKeyCreateWithData",
-        "SecKeyGeneratePair"
-    };
-    for (size_t i = 0; i < sizeof(kProtected) / sizeof(kProtected[0]); ++i) {
-        if (strcmp(symbol, kProtected[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void* hook_dlsym(void * __handle, const char * __symbol) {
     if(__handle == (void*)RTLD_MAIN_ONLY) {
         if(strcmp(__symbol, MH_EXECUTE_SYM) == 0) {
@@ -220,20 +201,6 @@ void* hook_dlsym(void * __handle, const char * __symbol) {
         for(int i = 0; i < gRebindCount; i++) {
             global_rebind rebind = gRebinds[i];
             if(ans == rebind.replacee) {
-                return rebind.replacement;
-            }
-        }
-        return ans;
-    }
-
-    if (LCIsProtectedSecuritySymbol(__symbol) && !LCStealthIsInternalAddress(__builtin_return_address(0))) {
-        void *ans = orig_dlsym(RTLD_DEFAULT, __symbol);
-        if (!ans) {
-            return 0;
-        }
-        for (int i = 0; i < gRebindCount; i++) {
-            global_rebind rebind = gRebinds[i];
-            if (ans == rebind.replacee) {
                 return rebind.replacement;
             }
         }

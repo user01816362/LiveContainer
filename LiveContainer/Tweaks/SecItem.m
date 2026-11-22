@@ -6,21 +6,22 @@
 //
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <dlfcn.h>
 #import "utils.h"
 #import <CommonCrypto/CommonDigest.h>
 #import "../../litehook/src/litehook.h"
 #import "LCSharedUtils.h"
 
 extern void* (*msHookFunction)(void *symbol, void *hook, void **old);
-static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = SecItemAdd;
-static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = SecItemCopyMatching;
-static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = SecItemUpdate;
-static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query) = SecItemDelete;
-static SecKeyRef (*orig_SecKeyCreateRandomKey)(CFDictionaryRef parameters, CFErrorRef *error) = SecKeyCreateRandomKey;
-static SecKeyRef (*orig_SecKeyCreateWithData)(CFDataRef keyData, CFDictionaryRef parameters, CFErrorRef *error) = SecKeyCreateWithData;
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) = NULL;
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query) = NULL;
+static SecKeyRef (*orig_SecKeyCreateRandomKey)(CFDictionaryRef parameters, CFErrorRef *error) = NULL;
+static SecKeyRef (*orig_SecKeyCreateWithData)(CFDataRef keyData, CFDictionaryRef parameters, CFErrorRef *error) = NULL;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-static OSStatus (*orig_SecKeyGeneratePair)(CFDictionaryRef query, SecKeyRef *publicKey, SecKeyRef *privateKey) = SecKeyGeneratePair;
+static OSStatus (*orig_SecKeyGeneratePair)(CFDictionaryRef query, SecKeyRef *publicKey, SecKeyRef *privateKey) = NULL;
 #pragma clang diagnostic pop
 static NSString* accessGroup = nil;
 static NSString* containerId = nil;
@@ -80,6 +81,9 @@ static BOOL LCKeyParametersAreExplicitlyEphemeral(NSDictionary *params, BOOL def
 }
 
 static OSStatus new_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    if (!orig_SecItemAdd) {
+        return errSecUnimplemented;
+    }
     NSMutableDictionary *attributesCopy = LCCopyMutableSecDict(attributes);
     if (accessGroup.length > 0) {
         attributesCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
@@ -102,6 +106,9 @@ static OSStatus new_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
 }
 
 static OSStatus new_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    if (!orig_SecItemCopyMatching) {
+        return errSecUnimplemented;
+    }
     if (LCQueryRequiresOmittedAccessGroup(query)) {
         return orig_SecItemCopyMatching(query, result);
     }
@@ -113,6 +120,9 @@ static OSStatus new_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result
 }
 
 static OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    if (!orig_SecItemUpdate) {
+        return errSecUnimplemented;
+    }
     CFDictionaryRef effectiveQuery = query;
     NSMutableDictionary *queryCopy = nil;
     if (!LCQueryRequiresOmittedAccessGroup(query)) {
@@ -129,6 +139,9 @@ static OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attribu
 }
 
 static OSStatus new_SecItemDelete(CFDictionaryRef query) {
+    if (!orig_SecItemDelete) {
+        return errSecUnimplemented;
+    }
     if (LCQueryRequiresOmittedAccessGroup(query)) {
         return orig_SecItemDelete(query);
     }
@@ -140,6 +153,9 @@ static OSStatus new_SecItemDelete(CFDictionaryRef query) {
 }
 
 static SecKeyRef new_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error) {
+    if (!orig_SecKeyCreateRandomKey) {
+        return NULL;
+    }
     NSMutableDictionary *paramsCopy = LCCopyMutableSecDict(parameters);
     if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(paramsCopy, YES)) {
         paramsCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
@@ -150,6 +166,9 @@ static SecKeyRef new_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRe
 }
 
 static SecKeyRef new_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef parameters, CFErrorRef *error) {
+    if (!orig_SecKeyCreateWithData) {
+        return NULL;
+    }
     NSMutableDictionary *paramsCopy = LCCopyMutableSecDict(parameters);
     // SecKeyCreateWithData creates in-memory keys by default; only scope if permanent attributes are passed.
     if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(paramsCopy, YES)) {
@@ -159,6 +178,9 @@ static SecKeyRef new_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef par
 }
 
 static OSStatus new_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey) {
+    if (!orig_SecKeyGeneratePair) {
+        return errSecUnimplemented;
+    }
     NSMutableDictionary *queryCopy = LCCopyMutableSecDict(parameters);
     if (accessGroup.length > 0 && !LCKeyParametersAreExplicitlyEphemeral(queryCopy, YES)) {
         queryCopy[(__bridge id)kSecAttrAccessGroup] = accessGroup;
@@ -169,6 +191,36 @@ static OSStatus new_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *pu
 }
 
 void SecItemGuestHooksInit(void)  {
+    void *securityHandle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_NOLOAD);
+    if (!securityHandle) {
+        securityHandle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+    }
+
+    if (!orig_SecItemAdd) {
+        orig_SecItemAdd = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))(securityHandle ? dlsym(securityHandle, "SecItemAdd") : NULL) ?: SecItemAdd;
+    }
+    if (!orig_SecItemCopyMatching) {
+        orig_SecItemCopyMatching = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))(securityHandle ? dlsym(securityHandle, "SecItemCopyMatching") : NULL) ?: SecItemCopyMatching;
+    }
+    if (!orig_SecItemUpdate) {
+        orig_SecItemUpdate = (OSStatus (*)(CFDictionaryRef, CFDictionaryRef))(securityHandle ? dlsym(securityHandle, "SecItemUpdate") : NULL) ?: SecItemUpdate;
+    }
+    if (!orig_SecItemDelete) {
+        orig_SecItemDelete = (OSStatus (*)(CFDictionaryRef))(securityHandle ? dlsym(securityHandle, "SecItemDelete") : NULL) ?: SecItemDelete;
+    }
+    if (!orig_SecKeyCreateRandomKey) {
+        orig_SecKeyCreateRandomKey = (SecKeyRef (*)(CFDictionaryRef, CFErrorRef *))(securityHandle ? dlsym(securityHandle, "SecKeyCreateRandomKey") : NULL) ?: SecKeyCreateRandomKey;
+    }
+    if (!orig_SecKeyCreateWithData) {
+        orig_SecKeyCreateWithData = (SecKeyRef (*)(CFDataRef, CFDictionaryRef, CFErrorRef *))(securityHandle ? dlsym(securityHandle, "SecKeyCreateWithData") : NULL) ?: SecKeyCreateWithData;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (!orig_SecKeyGeneratePair) {
+        orig_SecKeyGeneratePair = (OSStatus (*)(CFDictionaryRef, SecKeyRef *, SecKeyRef *))(securityHandle ? dlsym(securityHandle, "SecKeyGeneratePair") : NULL) ?: SecKeyGeneratePair;
+    }
+#pragma clang diagnostic pop
+
     const char *homeEnv = getenv("HOME");
     containerId = (homeEnv ? [NSString stringWithUTF8String:homeEnv] : NSHomeDirectory()).lastPathComponent;
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
@@ -179,8 +231,9 @@ void SecItemGuestHooksInit(void)  {
         keychainGroupId = 0;
     }
 
+    accessGroup = nil;
     NSString* teamId = [LCSharedUtils teamIdentifier];
-    if (teamId.length > 0) {
+    if (teamId.length > 0 && orig_SecItemCopyMatching) {
         NSString *candidateGroup = (keychainGroupId == 0)
             ? [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared", teamId]
             : [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared.%ld", teamId, (long)keychainGroupId];
@@ -193,7 +246,7 @@ void SecItemGuestHooksInit(void)  {
             (__bridge id)kSecAttrAccessGroup: candidateGroup,
             (__bridge id)kSecReturnData: @NO
         };
-        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, NULL);
+        OSStatus status = orig_SecItemCopyMatching((__bridge CFDictionaryRef)query, NULL);
         if (status != errSecMissingEntitlement) {
             accessGroup = candidateGroup;
         } else {
@@ -201,26 +254,36 @@ void SecItemGuestHooksInit(void)  {
             NSString *fallbackShared = [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared", teamId];
             NSMutableDictionary *sharedProbe = [query mutableCopy];
             sharedProbe[(__bridge id)kSecAttrAccessGroup] = fallbackShared;
-            if (SecItemCopyMatching((__bridge CFDictionaryRef)sharedProbe, NULL) != errSecMissingEntitlement) {
+            if (orig_SecItemCopyMatching((__bridge CFDictionaryRef)sharedProbe, NULL) != errSecMissingEntitlement) {
                 accessGroup = fallbackShared;
             } else {
-                // Keep hooks active using app-id group when keychain-access-groups were stripped by a signer.
-                NSString *bundleId = NSUserDefaults.lcMainBundle.bundleIdentifier ?: NSBundle.mainBundle.bundleIdentifier;
-                if (bundleId.length > 0) {
-                    accessGroup = [NSString stringWithFormat:@"%@.%@", teamId, bundleId];
+                // Probe app-identifier group(s) when keychain-access-groups were stripped by a signer.
+                NSString *lcBundleId = NSUserDefaults.lcMainBundle.bundleIdentifier;
+                NSString *mainBundleId = NSBundle.mainBundle.bundleIdentifier;
+                NSMutableArray<NSString *> *bundleCandidates = [NSMutableArray array];
+                if (lcBundleId.length > 0) {
+                    [bundleCandidates addObject:lcBundleId];
+                }
+                if (mainBundleId.length > 0 && ![bundleCandidates containsObject:mainBundleId]) {
+                    [bundleCandidates addObject:mainBundleId];
+                }
+                for (NSString *bundleId in bundleCandidates) {
+                    NSString *appIdGroup = [NSString stringWithFormat:@"%@.%@", teamId, bundleId];
+                    sharedProbe[(__bridge id)kSecAttrAccessGroup] = appIdGroup;
+                    if (orig_SecItemCopyMatching((__bridge CFDictionaryRef)sharedProbe, NULL) != errSecMissingEntitlement) {
+                        accessGroup = appIdGroup;
+                        break;
+                    }
                 }
             }
         }
     }
 
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecItemAdd, new_SecItemAdd, nil);
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecItemCopyMatching, new_SecItemCopyMatching, nil);
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecItemUpdate, new_SecItemUpdate, nil);
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecItemDelete, new_SecItemDelete, nil);
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyCreateRandomKey, new_SecKeyCreateRandomKey, nil);
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyCreateWithData, new_SecKeyCreateWithData, nil);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, SecKeyGeneratePair, new_SecKeyGeneratePair, nil);
-#pragma clang diagnostic pop
+    if (orig_SecItemAdd) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecItemAdd, new_SecItemAdd, nil);
+    if (orig_SecItemCopyMatching) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecItemCopyMatching, new_SecItemCopyMatching, nil);
+    if (orig_SecItemUpdate) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecItemUpdate, new_SecItemUpdate, nil);
+    if (orig_SecItemDelete) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecItemDelete, new_SecItemDelete, nil);
+    if (orig_SecKeyCreateRandomKey) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecKeyCreateRandomKey, new_SecKeyCreateRandomKey, nil);
+    if (orig_SecKeyCreateWithData) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecKeyCreateWithData, new_SecKeyCreateWithData, nil);
+    if (orig_SecKeyGeneratePair) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)orig_SecKeyGeneratePair, new_SecKeyGeneratePair, nil);
 }

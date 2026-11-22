@@ -398,14 +398,52 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     }
     dispatch_block_t removeBlock = ^{
         Class storeClass = NSClassFromString(@"WKWebsiteDataStore");
+        if (!storeClass) {
+            return;
+        }
+        // Fast-path exit when WebKit has never stored any data in this container.
+        NSString *webKitDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/WebKit"];
+        if (![NSFileManager.defaultManager fileExistsAtPath:webKitDir]) {
+            return;
+        }
+
+        // Ensure WebKit2 and WTF::RunLoop::main() are initialized before WebsiteDataStoreIO runs.
+        static dispatch_once_t wkInitOnce;
+        dispatch_once(&wkInitOnce, ^{
+            SEL defaultSel = NSSelectorFromString(@"defaultDataStore");
+            if ([storeClass respondsToSelector:defaultSel]) {
+                id (*getDefault)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                (void)getDefault(storeClass, defaultSel);
+            }
+            Class configClass = NSClassFromString(@"WKWebViewConfiguration");
+            if (configClass) {
+                (void)[[configClass alloc] init];
+            }
+        });
+
         SEL removeSel = NSSelectorFromString(@"removeDataStoreForIdentifier:completionHandler:");
-        if (storeClass && [storeClass respondsToSelector:removeSel]) {
+        if (![storeClass respondsToSelector:removeSel]) {
+            return;
+        }
+        void (^performRemove)(void) = ^{
             void (*fn)(id, SEL, NSUUID *, void (^)(NSError *)) = (void (*)(id, SEL, NSUUID *, void (^)(NSError *)))objc_msgSend;
             fn(storeClass, removeSel, storeUUID, ^(NSError *error) {
                 if (error) {
                     NSLog(@"[LC] Failed to remove WebKit data store %@: %@", storeUUID.UUIDString, error.localizedDescription);
                 }
             });
+        };
+
+        SEL fetchSel = NSSelectorFromString(@"fetchAllDataStoreIdentifiers:");
+        if ([storeClass respondsToSelector:fetchSel]) {
+            void (*fetchFn)(id, SEL, void (^)(NSArray<NSUUID *> *)) = (void (*)(id, SEL, void (^)(NSArray<NSUUID *> *)))objc_msgSend;
+            fetchFn(storeClass, fetchSel, ^(NSArray<NSUUID *> *identifiers) {
+                if ([identifiers containsObject:storeUUID]) {
+                    performRemove();
+                }
+            });
+        } else {
+            performRemove();
         }
     };
     if (NSThread.isMainThread) {
