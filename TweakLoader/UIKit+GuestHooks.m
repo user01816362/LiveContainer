@@ -50,6 +50,7 @@ NSArray<NSNumber *> *rotateOSMajorVersions = nil;
 BOOL rotateUsesRealDeviceTemplates = YES;
 BOOL blockDeviceInfoReads = NO;
 BOOL strictTestMode = NO;
+BOOL isolateWebViewData = NO;
 UIPasteboard *strictPrivatePasteboard = nil;
 NSString *spoofDeviceName = nil;
 NSString *spoofDeviceModel = nil;
@@ -1750,11 +1751,17 @@ static void UIKitGuestHooksInit(void) {
     }
     NSDictionary* guestContainerInfo = [NSUserDefaults guestContainerInfo];
     strictTestMode = [guestContainerInfo[@"strictTestMode"] boolValue];
+    isolateWebViewData = strictTestMode || [guestContainerInfo[@"isolateWebViewData"] boolValue];
     blockDeviceInfoReads = strictTestMode || [guestContainerInfo[@"blockDeviceInfoReads"] boolValue];
+
+    if (isolateWebViewData) {
+        LCSwizzleClassIfPresent(WKWebsiteDataStore.class, @selector(defaultDataStore), @selector(hook_defaultDataStore));
+    }
 
     if(strictTestMode) {
         strictPrivatePasteboard = [UIPasteboard pasteboardWithUniqueName];
         LCSwizzleClassIfPresent(UIPasteboard.class, @selector(generalPasteboard), @selector(hook_generalPasteboard));
+        LCSwizzleClassIfPresent(UIPasteboard.class, @selector(pasteboardWithName:create:), @selector(hook_pasteboardWithName:create:));
     }
     if(strictTestMode) {
         LCSwizzleIfPresent(NSURLSessionTask.class, @selector(resume), @selector(hook_resume));
@@ -1788,6 +1795,7 @@ static void UIKitGuestHooksInit(void) {
     if(shouldEnableSpoofProfile && spoofAppPrivacyCategoryEnabled && LCFeatureEnabled(@"app.pasteboard") && !strictTestMode) {
         strictPrivatePasteboard = [UIPasteboard pasteboardWithUniqueName];
         LCSwizzleClassIfPresent(UIPasteboard.class, @selector(generalPasteboard), @selector(hook_generalPasteboard));
+        LCSwizzleClassIfPresent(UIPasteboard.class, @selector(pasteboardWithName:create:), @selector(hook_pasteboardWithName:create:));
     }
     rotateOSMajorVersions = LCParseRotationOSMajorVersions(guestContainerInfo[@"rotateOSMajorVersions"]);
     rotateUsesRealDeviceTemplates = LCBoolWithDefault(guestContainerInfo, @"rotateUsesRealDeviceTemplates", YES);
@@ -2080,8 +2088,10 @@ static void UIKitGuestHooksInit(void) {
     if(shouldEnableSpoofProfile && spoofAppPrivacyCategoryEnabled && LCFeatureEnabled(@"app.iCloud")) {
         LCSwizzleIfPresent(NSFileManager.class, @selector(ubiquityIdentityToken), @selector(hook_ubiquityIdentityToken));
     }
-    if(shouldEnableSpoofProfile && spoofWebViewCategoryEnabled) {
+    if(isolateWebViewData || (shouldEnableSpoofProfile && spoofWebViewCategoryEnabled)) {
         LCSwizzleIfPresent(WKWebView.class, @selector(initWithFrame:configuration:), @selector(hook_initWithFrame:configuration:));
+    }
+    if(shouldEnableSpoofProfile && spoofWebViewCategoryEnabled) {
         LCSwizzleIfPresent(WKWebView.class, @selector(setCustomUserAgent:), @selector(hook_setCustomUserAgent:));
     }
 
@@ -2943,6 +2953,14 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
     return [self hook_generalPasteboard];
 }
 
++ (UIPasteboard *)hook_pasteboardWithName:(UIPasteboardName)pasteboardName create:(BOOL)create {
+    if ((strictTestMode || (spoofProfileEnabled && spoofAppPrivacyCategoryEnabled && LCFeatureEnabled(@"app.pasteboard"))) &&
+        (pasteboardName == nil || pasteboardName.length == 0 || [pasteboardName isEqualToString:UIPasteboardNameGeneral])) {
+        return strictPrivatePasteboard ?: [self hook_pasteboardWithName:pasteboardName create:create];
+    }
+    return [self hook_pasteboardWithName:pasteboardName create:create];
+}
+
 @end
 
 @implementation NSURLSessionTask(hook)
@@ -3015,6 +3033,36 @@ static id LCStorageProfileValue(NSURLResourceKey key) {
 
 static const char kLCWebUserContentConfiguredKey = 0;
 
+static WKWebsiteDataStore *LCIsolatedWebsiteDataStore(BOOL ephemeral) {
+    if (ephemeral || strictTestMode) {
+        return [WKWebsiteDataStore nonPersistentDataStore];
+    }
+    const char *homeEnv = getenv("HOME");
+    NSString *homePath = homeEnv ? @(homeEnv) : NSHomeDirectory();
+    NSString *containerFolder = homePath.lastPathComponent;
+    NSString *storeKey = containerFolder;
+    if ([homePath containsString:@"/Extensions/"] && containerFolder.length > 0) {
+        NSString *parentContainer = homePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.lastPathComponent;
+        storeKey = [NSString stringWithFormat:@"ext:%@:%@", parentContainer ?: @"", containerFolder];
+    }
+    NSUUID *storeUUID = [NSClassFromString(@"LCSharedUtils") webKitStoreIdentifierForContainerUUID:storeKey];
+    if (storeUUID) {
+        return [WKWebsiteDataStore dataStoreForIdentifier:storeUUID];
+    }
+    return [WKWebsiteDataStore nonPersistentDataStore];
+}
+
+@implementation WKWebsiteDataStore(LCContainerIsolation)
+
++ (WKWebsiteDataStore *)hook_defaultDataStore {
+    if (isolateWebViewData) {
+        return LCIsolatedWebsiteDataStore(NO);
+    }
+    return [self hook_defaultDataStore];
+}
+
+@end
+
 @implementation WKWebView(LCFingerprintProfile)
 
 - (void)hook_setCustomUserAgent:(NSString *)customUserAgent {
@@ -3035,6 +3083,11 @@ static const char kLCWebUserContentConfiguredKey = 0;
 
 - (instancetype)hook_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
     WKWebViewConfiguration *effectiveConfig = configuration ?: [[WKWebViewConfiguration alloc] init];
+    if (isolateWebViewData && strictTestMode) {
+        effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(YES);
+    } else if (isolateWebViewData && !configuration) {
+        effectiveConfig.websiteDataStore = LCIsolatedWebsiteDataStore(NO);
+    }
     NSString *profileScript = nil;
     if(spoofProfileEnabled && spoofWebViewCategoryEnabled) {
         LCRecordProfileInterception(LCProfileTelemetryVectorWebKit);
@@ -3707,7 +3760,13 @@ static BOOL LCShouldInterceptAuthSession(NSURL *authURL, NSString *callbackSchem
     self.navigationItem.title = self.initialURL.host ?: @"Sign In";
 
     WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
-    cfg.websiteDataStore = self.prefersEphemeral ? [WKWebsiteDataStore nonPersistentDataStore] : [WKWebsiteDataStore defaultDataStore];
+    if (self.prefersEphemeral || strictTestMode) {
+        cfg.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    } else if (isolateWebViewData) {
+        cfg.websiteDataStore = LCIsolatedWebsiteDataStore(NO);
+    } else {
+        cfg.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+    }
     self.webView = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:cfg];
     self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.webView.navigationDelegate = self;

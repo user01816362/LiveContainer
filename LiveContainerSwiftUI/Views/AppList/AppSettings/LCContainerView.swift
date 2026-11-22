@@ -200,6 +200,12 @@ struct LCContainerView: View {
                 saveContainer()
             }
 
+            Toggle("Isolate WebView Data", isOn: $container.isolateWebViewData)
+                .disabled(container.strictTestMode)
+                .onChange(of: container.isolateWebViewData) { _, _ in
+                    saveContainer()
+                }
+
             if let settingsBundle {
                 NavigationLink {
                     AppPreferenceView(
@@ -459,6 +465,7 @@ struct LCContainerView: View {
         container.loadName()
         if container.strictTestMode {
             container.isolateAppGroup = true
+            container.isolateWebViewData = true
             container.blockDeviceInfoReads = true
         }
         syncDraftStateFromContainer()
@@ -885,6 +892,7 @@ struct LCContainerView: View {
     func saveStrictModeSettings() {
         if container.strictTestMode {
             container.isolateAppGroup = true
+            container.isolateWebViewData = true
             container.blockDeviceInfoReads = true
         }
         saveContainer()
@@ -914,6 +922,16 @@ struct LCContainerView: View {
             errorShow = true
             return
         }
+        let isUniqueGroup = LCContainer.isKeychainGroupIdUnique(container.keychainGroupId, forFolderName: container.folderName)
+        LCUtils.removeAppKeychain(
+            dataUUID: container.folderName,
+            keychainGroupId: container.keychainGroupId,
+            wipeEntireGroup: isUniqueGroup
+        )
+        LCSharedUtils.removeWebKitDataStore(forContainerUUID: container.folderName)
+        let tmpSubdir = FileManager.default.temporaryDirectory.appendingPathComponent(container.folderName, isDirectory: true)
+        try? FileManager.default.removeItem(at: tmpSubdir)
+
         dismiss()
         delegate.unbindContainer(container: container)
     }
@@ -935,7 +953,12 @@ struct LCContainerView: View {
             return
         }
         guard let ans = await removeKeychainAlert.open(), ans else { return }
-        LCUtils.removeAppKeychain(dataUUID: container.folderName)
+        let isUniqueGroup = LCContainer.isKeychainGroupIdUnique(container.keychainGroupId, forFolderName: container.folderName)
+        LCUtils.removeAppKeychain(
+            dataUUID: container.folderName,
+            keychainGroupId: container.keychainGroupId,
+            wipeEntireGroup: isUniqueGroup
+        )
     }
 
     func deleteData() async {
@@ -953,6 +976,9 @@ struct LCContainerView: View {
                 }
                 try fm.removeItem(at: file)
             }
+            LCSharedUtils.removeWebKitDataStore(forContainerUUID: container.folderName)
+            let tmpSubdir = fm.temporaryDirectory.appendingPathComponent(container.folderName, isDirectory: true)
+            try? fm.removeItem(at: tmpSubdir)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true

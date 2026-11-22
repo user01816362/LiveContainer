@@ -3,6 +3,9 @@
 #import "UIKitPrivate.h"
 #import "utils.h"
 @import MachO;
+@import Security;
+@import CommonCrypto;
+#import <objc/message.h>
 
 extern NSUserDefaults *lcUserDefaults;
 extern NSString *lcAppUrlScheme;
@@ -137,9 +140,328 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     return appGroupPath;
 }
 
-+ (NSString *)certificatePassword {
-    NSUserDefaults* nud = NSUserDefaults.lcSharedDefaults ?: NSUserDefaults.standardUserDefaults;
-    return [nud objectForKey:@"LCCertificatePassword"];
++ (NSUserDefaults *)sharedSigningDefaults {
+    if (NSUserDefaults.lcSharedDefaults) {
+        return NSUserDefaults.lcSharedDefaults;
+    }
+    NSString *groupID = [self appGroupID];
+    if (groupID.length > 0 && ![groupID isEqualToString:@"Unknown"]) {
+        NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:groupID];
+        if (suite) {
+            return suite;
+        }
+    }
+    return NSUserDefaults.standardUserDefaults;
+}
+
++ (nullable NSString *)hostKeychainAccessGroup {
+    NSString *teamId = [self teamIdentifier];
+    if (teamId.length == 0) {
+        return nil;
+    }
+    return [NSString stringWithFormat:@"%@.com.kdt.livecontainer.host", teamId];
+}
+
++ (nullable NSString *)appIdentifierKeychainAccessGroup {
+    NSString *teamId = [self teamIdentifier];
+    NSString *bundleId = (NSUserDefaults.lcMainBundle ?: NSBundle.mainBundle).bundleIdentifier;
+    if (teamId.length == 0 || bundleId.length == 0) {
+        return nil;
+    }
+    return [NSString stringWithFormat:@"%@.%@", teamId, bundleId];
+}
+
++ (NSMutableDictionary *)baseHostCertQueryForAccount:(NSString *)account accessGroup:(nullable NSString *)accessGroup {
+    NSMutableDictionary *query = [@{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"com.kdt.livecontainer.host.signing",
+        (__bridge id)kSecAttrAccount: account
+    } mutableCopy];
+    if (accessGroup.length > 0) {
+        query[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+    }
+    return query;
+}
+
++ (nullable NSData *)readHostSigningSecretForAccount:(NSString *)account {
+    if (NSUserDefaults.isLiveProcess) {
+        return nil;
+    }
+    NSString *hostGroup = [self hostKeychainAccessGroup];
+    if (hostGroup.length > 0) {
+        NSMutableDictionary *query = [self baseHostCertQueryForAccount:account accessGroup:hostGroup];
+        query[(__bridge id)kSecReturnData] = @YES;
+        query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+        query[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+        if (status == errSecSuccess && result && CFGetTypeID(result) == CFDataGetTypeID()) {
+            return CFBridgingRelease(result);
+        }
+        if (result) {
+            CFRelease(result);
+        }
+        // Only fall back when the .host entitlement itself was stripped; never search .shared* on errSecItemNotFound.
+        if (status != errSecMissingEntitlement) {
+            return nil;
+        }
+    }
+
+    NSString *appIdGroup = [self appIdentifierKeychainAccessGroup];
+    if (appIdGroup.length > 0) {
+        NSMutableDictionary *fallbackQuery = [self baseHostCertQueryForAccount:account accessGroup:appIdGroup];
+        fallbackQuery[(__bridge id)kSecReturnData] = @YES;
+        fallbackQuery[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+        fallbackQuery[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+        CFTypeRef fallbackResult = NULL;
+        OSStatus fallbackStatus = SecItemCopyMatching((__bridge CFDictionaryRef)fallbackQuery, &fallbackResult);
+        if (fallbackStatus == errSecSuccess && fallbackResult && CFGetTypeID(fallbackResult) == CFDataGetTypeID()) {
+            return CFBridgingRelease(fallbackResult);
+        }
+        if (fallbackResult) {
+            CFRelease(fallbackResult);
+        }
+    }
+    return nil;
+}
+
++ (BOOL)writeHostSigningSecret:(NSData *)data forAccount:(NSString *)account {
+    if (!data || NSUserDefaults.isLiveProcess) {
+        return NO;
+    }
+    NSMutableArray<NSString *> *candidateGroups = [NSMutableArray array];
+    NSString *hostGroup = [self hostKeychainAccessGroup];
+    NSString *appIdGroup = [self appIdentifierKeychainAccessGroup];
+    if (hostGroup.length > 0) {
+        [candidateGroups addObject:hostGroup];
+    }
+    // Use application-identifier (never default group 0) if a signer stripped .host.
+    if (appIdGroup.length > 0) {
+        [candidateGroups addObject:appIdGroup];
+    } else if (candidateGroups.count == 0) {
+        [candidateGroups addObject:@""];
+    }
+
+    for (NSString *group in candidateGroups) {
+        NSString *effectiveGroup = group.length > 0 ? group : nil;
+        NSMutableDictionary *deleteQuery = [self baseHostCertQueryForAccount:account accessGroup:effectiveGroup];
+        deleteQuery[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+        SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+
+        NSMutableDictionary *addAttrs = [self baseHostCertQueryForAccount:account accessGroup:effectiveGroup];
+        addAttrs[(__bridge id)kSecValueData] = data;
+        addAttrs[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+        addAttrs[(__bridge id)kSecAttrSynchronizable] = @NO;
+
+        OSStatus status = SecItemAdd((__bridge CFDictionaryRef)addAttrs, NULL);
+        if (status == errSecSuccess) {
+            return YES;
+        }
+        if (status != errSecMissingEntitlement) {
+            NSLog(@"[LC] Failed to store signing secret %@ in keychain: %d", account, (int)status);
+            break;
+        }
+    }
+    return NO;
+}
+
++ (nullable NSData *)certificateData {
+    NSData *keychainData = [self readHostSigningSecretForAccount:@"certificateData"];
+    if (keychainData.length > 0) {
+        return keychainData;
+    }
+    NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
+    NSData *legacy = [sharedDefaults objectForKey:@"LCCertificateData"];
+    if ([legacy isKindOfClass:NSData.class] && legacy.length > 0) {
+        return legacy;
+    }
+    NSData *stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificateData"];
+    return [stdLegacy isKindOfClass:NSData.class] ? stdLegacy : nil;
+}
+
++ (nullable NSString *)certificatePassword {
+    NSData *pwdData = [self readHostSigningSecretForAccount:@"certificatePassword"];
+    if (pwdData != nil) {
+        NSString *decoded = [[NSString alloc] initWithData:pwdData encoding:NSUTF8StringEncoding];
+        if (decoded != nil) {
+            return decoded;
+        }
+    }
+    NSUserDefaults *nud = [self sharedSigningDefaults];
+    id legacy = [nud objectForKey:@"LCCertificatePassword"];
+    if ([legacy isKindOfClass:NSString.class]) {
+        return legacy;
+    }
+    id stdLegacy = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificatePassword"];
+    return [stdLegacy isKindOfClass:NSString.class] ? stdLegacy : nil;
+}
+
++ (BOOL)isJITLessConfigured {
+    NSUserDefaults *nud = [self sharedSigningDefaults];
+    if (NSUserDefaults.isLiveProcess) {
+        return [nud boolForKey:@"LCJITLessConfigured"] || ([nud objectForKey:@"LCCertificatePassword"] != nil);
+    }
+    // Always verify actual backing secret in host process so stale defaults never mask missing Keychain items.
+    BOOL configured = ([self certificateData].length > 0 && [self certificatePassword] != nil);
+    if ([nud boolForKey:@"LCJITLessConfigured"] != configured) {
+        [nud setBool:configured forKey:@"LCJITLessConfigured"];
+    }
+    return configured;
+}
+
++ (void)saveCertificateData:(NSData *)certData password:(NSString *)password {
+    NSData *pwdData = [(password ?: @"") dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    BOOL savedCert = [self writeHostSigningSecret:certData forAccount:@"certificateData"];
+    BOOL savedPwd = [self writeHostSigningSecret:pwdData forAccount:@"certificatePassword"];
+
+    NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
+    if (savedCert && savedPwd) {
+        [sharedDefaults removeObjectForKey:@"LCCertificateData"];
+        [sharedDefaults removeObjectForKey:@"LCCertificatePassword"];
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificateData"];
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificatePassword"];
+    } else {
+        // Fallback when signer strips all Keychain entitlements.
+        [sharedDefaults setObject:certData forKey:@"LCCertificateData"];
+        [sharedDefaults setObject:(password ?: @"") forKey:@"LCCertificatePassword"];
+    }
+    [sharedDefaults setBool:YES forKey:@"LCJITLessConfigured"];
+    [sharedDefaults setObject:NSDate.date forKey:@"LCCertificateUpdateDate"];
+}
+
++ (void)clearCertificateData {
+    for (NSString *account in @[@"certificateData", @"certificatePassword"]) {
+        for (NSString *group in @[[self hostKeychainAccessGroup] ?: @"", [self appIdentifierKeychainAccessGroup] ?: @"", @""]) {
+            NSMutableDictionary *q = [self baseHostCertQueryForAccount:account accessGroup:(group.length > 0 ? group : nil)];
+            q[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+            SecItemDelete((__bridge CFDictionaryRef)q);
+        }
+    }
+
+    NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
+    [sharedDefaults removeObjectForKey:@"LCCertificateData"];
+    [sharedDefaults removeObjectForKey:@"LCCertificatePassword"];
+    [sharedDefaults removeObjectForKey:@"LCCertificateUpdateDate"];
+    [sharedDefaults setBool:NO forKey:@"LCJITLessConfigured"];
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificateData"];
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificatePassword"];
+}
+
++ (void)migrateCertificateToHostKeychainIfNeeded {
+    if (NSUserDefaults.isLiveProcess) {
+        return;
+    }
+    NSUserDefaults *sharedDefaults = [self sharedSigningDefaults];
+    NSData *legacyCert = [sharedDefaults objectForKey:@"LCCertificateData"];
+    NSString *legacyPwd = [sharedDefaults objectForKey:@"LCCertificatePassword"];
+    if (![legacyCert isKindOfClass:NSData.class]) {
+        legacyCert = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificateData"];
+    }
+    if (![legacyPwd isKindOfClass:NSString.class]) {
+        legacyPwd = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificatePassword"];
+    }
+
+    if ([legacyCert isKindOfClass:NSData.class] && legacyCert.length > 0 && [legacyPwd isKindOfClass:NSString.class]) {
+        NSData *pwdData = [legacyPwd dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+        BOOL savedCert = [self writeHostSigningSecret:legacyCert forAccount:@"certificateData"];
+        BOOL savedPwd = [self writeHostSigningSecret:pwdData forAccount:@"certificatePassword"];
+        if (savedCert && savedPwd) {
+            [sharedDefaults removeObjectForKey:@"LCCertificateData"];
+            [sharedDefaults removeObjectForKey:@"LCCertificatePassword"];
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificateData"];
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"LCCertificatePassword"];
+        }
+    }
+    [self isJITLessConfigured];
+}
+
++ (nullable NSUUID *)webKitStoreIdentifierForContainerUUID:(NSString *)dataUUID {
+    if (![dataUUID isKindOfClass:NSString.class] || dataUUID.length == 0) {
+        return nil;
+    }
+    NSUUID *direct = [[NSUUID alloc] initWithUUIDString:dataUUID];
+    if (direct) {
+        return direct;
+    }
+    NSData *input = [[@"com.livecontainer.webkit.container:" stringByAppendingString:dataUUID] dataUsingEncoding:NSUTF8StringEncoding];
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(input.bytes, (CC_LONG)input.length, digest);
+    digest[6] = (digest[6] & 0x0F) | 0x50;
+    digest[8] = (digest[8] & 0x3F) | 0x80;
+    return [[NSUUID alloc] initWithUUIDBytes:digest];
+}
+
++ (void)removeWebKitDataStoreForContainerUUID:(NSString *)dataUUID {
+    NSUUID *storeUUID = [self webKitStoreIdentifierForContainerUUID:dataUUID];
+    if (!storeUUID) {
+        return;
+    }
+    dispatch_block_t removeBlock = ^{
+        Class storeClass = NSClassFromString(@"WKWebsiteDataStore");
+        SEL removeSel = NSSelectorFromString(@"removeDataStoreForIdentifier:completionHandler:");
+        if (storeClass && [storeClass respondsToSelector:removeSel]) {
+            void (*fn)(id, SEL, NSUUID *, void (^)(NSError *)) = (void (*)(id, SEL, NSUUID *, void (^)(NSError *)))objc_msgSend;
+            fn(storeClass, removeSel, storeUUID, ^(NSError *error) {
+                if (error) {
+                    NSLog(@"[LC] Failed to remove WebKit data store %@: %@", storeUUID.UUIDString, error.localizedDescription);
+                }
+            });
+        }
+    };
+    if (NSThread.isMainThread) {
+        removeBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), removeBlock);
+    }
+}
+
++ (void)removeKeychainItemsForContainerUUID:(NSString *)dataUUID
+                            keychainGroupId:(NSInteger)keychainGroupId
+                            wipeEntireGroup:(BOOL)wipeEntireGroup {
+    NSArray *secClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity
+    ];
+    NSString *teamId = [self teamIdentifier];
+    NSString *scopedGroup = nil;
+    if (teamId.length > 0 && keychainGroupId >= 0) {
+        scopedGroup = keychainGroupId == 0
+            ? [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared", teamId]
+            : [NSString stringWithFormat:@"%@.com.kdt.livecontainer.shared.%ld", teamId, (long)keychainGroupId];
+    }
+
+    for (id secClass in secClasses) {
+        if (dataUUID.length > 0) {
+            NSMutableDictionary *aliasQuery = [@{
+                (__bridge id)kSecClass: secClass,
+                @"alis": dataUUID,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny
+            } mutableCopy];
+            if (scopedGroup.length > 0) {
+                aliasQuery[(__bridge id)kSecAttrAccessGroup] = scopedGroup;
+            }
+            SecItemDelete((__bridge CFDictionaryRef)aliasQuery);
+
+            if (scopedGroup.length > 0) {
+                // Also delete unscoped alias entries created when entitlements were stripped.
+                [aliasQuery removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
+                SecItemDelete((__bridge CFDictionaryRef)aliasQuery);
+            }
+        }
+
+        // Only wipe an entire access group when it is strictly a dedicated guest group (> 0).
+        if (wipeEntireGroup && keychainGroupId > 0 && scopedGroup.length > 0) {
+            NSDictionary *groupQuery = @{
+                (__bridge id)kSecClass: secClass,
+                (__bridge id)kSecAttrAccessGroup: scopedGroup,
+                (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny
+            };
+            SecItemDelete((__bridge CFDictionaryRef)groupQuery);
+        }
+    }
 }
 
 + (BOOL)launchToGuestAppWithClassicMode:(NSUInteger)classicMode {
@@ -153,7 +475,7 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
         raise(SIGKILL);
     };
     
-    if (!self.certificatePassword) {
+    if (!self.isJITLessConfigured) {
         NSString *urlScheme = nil;
         NSString *tsPath = [NSString stringWithFormat:@"%@/../_TrollStore", NSBundle.mainBundle.bundlePath];
         if (!access(tsPath.UTF8String, F_OK)) {
@@ -546,6 +868,24 @@ static NSString *sLCCachedGlobalTweaksFolderPath = nil;
             NSLog(@"[LC][StrictMode] Failed to remove %@ in container: %@", entry, removeError.localizedDescription);
         }
     }
+    NSString *containerDataUUID = containerPath.lastPathComponent;
+    NSInteger keychainGroupId = [info[@"keychainGroupId"] isKindOfClass:NSNumber.class]
+        ? [info[@"keychainGroupId"] integerValue]
+        : -1;
+    BOOL wipeEntireGroup = (keychainGroupId > 0) && [info[@"strictWipeEntireKeychainGroup"] boolValue];
+
+    [self removeKeychainItemsForContainerUUID:containerDataUUID
+                              keychainGroupId:keychainGroupId
+                              wipeEntireGroup:wipeEntireGroup];
+    [self removeWebKitDataStoreForContainerUUID:containerDataUUID];
+    if (containerDataUUID.length > 0) {
+        NSString *containerTmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:containerDataUUID];
+        BOOL tmpIsDir = NO;
+        if ([fm fileExistsAtPath:containerTmpPath isDirectory:&tmpIsDir] && tmpIsDir) {
+            [fm removeItemAtPath:containerTmpPath error:nil];
+        }
+    }
+
     [self ensureContainerDirectoriesAtPath:containerPath];
 }
 

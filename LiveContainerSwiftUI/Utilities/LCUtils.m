@@ -24,17 +24,14 @@
 #pragma mark Certificate & password
 
 + (NSData *)certificateData {
-    NSUserDefaults* nud = [[NSUserDefaults alloc] initWithSuiteName:[LCSharedUtils appGroupID]];
-    if(!nud) {
-        nud = NSUserDefaults.standardUserDefaults;
-    }
-    return [nud objectForKey:@"LCCertificateData"];
+    return [LCSharedUtils certificateData];
 }
 
-
 + (void)setCertificatePassword:(NSString *)certPassword {
-    [NSUserDefaults.standardUserDefaults setObject:certPassword forKey:@"LCCertificatePassword"];
-    [[[NSUserDefaults alloc] initWithSuiteName:[LCSharedUtils appGroupID]] setObject:certPassword forKey:@"LCCertificatePassword"];
+    NSData *certData = [LCSharedUtils certificateData];
+    if (certData) {
+        [LCSharedUtils saveCertificateData:certData password:(certPassword ?: @"")];
+    }
 }
 
 

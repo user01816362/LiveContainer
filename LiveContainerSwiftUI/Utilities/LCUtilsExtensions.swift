@@ -153,17 +153,16 @@ extension LCUtils {
         }
     }
     
-    public static func removeAppKeychain(dataUUID label: String) {
-        [kSecClassGenericPassword, kSecClassInternetPassword, kSecClassCertificate, kSecClassKey, kSecClassIdentity].forEach {
-          let status = SecItemDelete([
-            kSecClass as String: $0,
-            "alis": label,
-          ] as CFDictionary)
-          if status != errSecSuccess && status != errSecItemNotFound {
-              //Error while removing class $0
-              NSLog("[LC] Failed to find keychain items: \(status)")
-          }
-        }
+    public static func removeAppKeychain(
+        dataUUID label: String,
+        keychainGroupId: Int = -1,
+        wipeEntireGroup: Bool = false
+    ) {
+        LCSharedUtils.removeKeychainItems(
+            forContainerUUID: label,
+            keychainGroupId: keychainGroupId,
+            wipeEntireGroup: wipeEntireGroup
+        )
     }
     
     public static func forEachInstalledLC(isFree: Bool, block: (String, inout Bool) -> Void) {

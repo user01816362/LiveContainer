@@ -14,26 +14,15 @@ final class ShareExtensionViewModel: ObservableObject {
 
     var allApps: [ShareApp] = []
     var sharedDefaults: UserDefaults?
-    let privateDocURL: URL?
-    let privateDocAccessing: Bool
     var appGroupRootURL: URL?
     weak var currentContext: NSExtensionContext?
     private var loadTask: Task<Void, Never>?
 
     init() {
         let defaults = UserDefaults(suiteName: LCSharedUtils.appGroupID())
-        let resolvedPrivateDocURL = Self.resolvePrivateDocURL(sharedDefaults: defaults)
         self.sharedDefaults = defaults
         self.appGroupRootURL = LCSharedUtils.appGroupPath()?.appendingPathComponent("LiveContainer")
-        self.privateDocURL = resolvedPrivateDocURL
-        self.privateDocAccessing = resolvedPrivateDocURL != nil
         reloadApps()
-    }
-
-    deinit {
-        if privateDocAccessing {
-            privateDocURL?.stopAccessingSecurityScopedResource()
-        }
     }
 
     func loadPayload(from context: NSExtensionContext?) {
@@ -153,9 +142,7 @@ final class ShareExtensionViewModel: ObservableObject {
     
     func reloadApps() {
         var apps: [ShareApp] = []
-        if let privateDocURL {
-            apps.append(contentsOf: loadApps(root: privateDocURL, isShared: false))
-        }
+        apps.append(contentsOf: loadPrivateCatalogApps())
         if let appGroupRootURL {
             apps.append(contentsOf: loadApps(root: appGroupRootURL, isShared: true))
         }
@@ -236,6 +223,78 @@ final class ShareExtensionViewModel: ObservableObject {
 
     private func uniqueIdentifier(for app: ShareApp) -> String {
         "\(app.bundleIdentifier):\(app.relativeBundlePath)"
+    }
+
+    private func loadPrivateCatalogApps() -> [ShareApp] {
+        guard let catalog = sharedDefaults?.dictionary(forKey: "LCLaunchAppCatalog") as? [String: [String: Any]] else {
+            return []
+        }
+        let iconsRoot = appGroupRootURL?.appendingPathComponent("LaunchCatalogIcons", isDirectory: true)
+
+        return catalog.compactMap { relativeBundlePath, entry in
+            guard Self.isSafeSingleComponent(relativeBundlePath) else {
+                return nil
+            }
+            if entry["isShared"] as? Bool == true {
+                return nil
+            }
+
+            let rawContainers = (entry["containers"] as? [[String: Any]]) ?? []
+            let parsedContainers: [ShareContainer] = rawContainers.compactMap { dict in
+                guard let folderName = dict["folderName"] as? String,
+                      Self.isSafeSingleComponent(folderName) else {
+                    return nil
+                }
+                let name = (dict["name"] as? String) ?? folderName
+                return ShareContainer(
+                    id: "private|\(folderName)",
+                    folderName: folderName,
+                    name: name,
+                    isShared: false
+                )
+            }
+
+            let usableContainers: [ShareContainer]
+            if !parsedContainers.isEmpty {
+                usableContainers = parsedContainers
+            } else if let fallbackFolder = entry["LCDataUUID"] as? String,
+                      Self.isSafeSingleComponent(fallbackFolder) {
+                usableContainers = [
+                    ShareContainer(
+                        id: "private|\(fallbackFolder)",
+                        folderName: fallbackFolder,
+                        name: fallbackFolder,
+                        isShared: false
+                    )
+                ]
+            } else {
+                usableContainers = []
+            }
+
+            guard !usableContainers.isEmpty else {
+                return nil
+            }
+
+            let iconURL = iconsRoot
+                .map { $0.appendingPathComponent(relativeBundlePath, isDirectory: true) }
+                .flatMap { preferredIconURL(in: $0) }
+
+            return ShareApp(
+                id: "private|\(relativeBundlePath)",
+                relativeBundlePath: relativeBundlePath,
+                displayName: (entry["displayName"] as? String) ?? relativeBundlePath,
+                bundleIdentifier: (entry["bundleIdentifier"] as? String) ?? "Unknown",
+                isShared: false,
+                isHidden: entry["isHidden"] as? Bool ?? false,
+                isLocked: entry["isLocked"] as? Bool ?? false,
+                isJITNeeded: entry["isJITNeeded"] as? Bool ?? false,
+                containers: usableContainers,
+                iconURL: iconURL,
+                lastLaunched: entry["lastLaunched"] as? Date,
+                installationDate: entry["installationDate"] as? Date,
+                isBuiltInSideStore: false
+            )
+        }
     }
 
     private func loadApps(root: URL, isShared: Bool) -> [ShareApp] {
@@ -328,12 +387,12 @@ final class ShareExtensionViewModel: ObservableObject {
     }
 
     private func builtInSideStoreIconURL() -> URL? {
-        guard let privateDocURL else {
+        guard let appGroupRootURL else {
             return nil
         }
-        let iconCacheURL = privateDocURL
-            .appendingPathComponent("SideStore/Library/Caches", isDirectory: true)
-            .appendingPathComponent("BuiltInSideStoreIconCache", isDirectory: true)
+        let iconCacheURL = appGroupRootURL
+            .appendingPathComponent("LaunchCatalogIcons", isDirectory: true)
+            .appendingPathComponent("builtinSideStore", isDirectory: true)
         return preferredIconURL(in: iconCacheURL)
     }
 
@@ -587,24 +646,7 @@ final class ShareExtensionViewModel: ObservableObject {
         return nil
     }
     
-    static func resolvePrivateDocURL(sharedDefaults: UserDefaults?) -> URL? {
-        guard let bookmarkData = sharedDefaults?.data(forKey: "LCLaunchExtensionPrivateDocBookmark") else {
-            return nil
-        }
-        guard let url = resolveBookmarkURL(bookmarkData) else {
-            sharedDefaults?.set(nil, forKey: "LCLaunchExtensionPrivateDocBookmark")
-            return nil
-        }
-        _ = url.startAccessingSecurityScopedResource()
-        return url
-    }
-
-    private static func resolveBookmarkURL(_ bookmarkData: Data) -> URL? {
-        do {
-            var isStale = false
-            return try URL(resolvingBookmarkData: bookmarkData, bookmarkDataIsStale: &isStale)
-        } catch {
-            return nil
-        }
+    private static func isSafeSingleComponent(_ value: String) -> Bool {
+        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
     }
 }

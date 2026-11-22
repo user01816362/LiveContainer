@@ -493,8 +493,15 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             if shouldRemoveAppFolders {
                 for container in containers {
                     let dataUUID = container.folderName
-                    try fileManager.removeItem(at: LCPath.dataPath.appendingPathComponent(dataUUID))
-                    LCUtils.removeAppKeychain(dataUUID: dataUUID)
+                    try? fileManager.removeItem(at: LCPath.dataPath.appendingPathComponent(dataUUID))
+                    let isUniqueGroup = LCContainer.isKeychainGroupIdUnique(container.keychainGroupId, forFolderName: dataUUID)
+                    LCUtils.removeAppKeychain(
+                        dataUUID: dataUUID,
+                        keychainGroupId: container.keychainGroupId,
+                        wipeEntireGroup: isUniqueGroup
+                    )
+                    LCSharedUtils.removeWebKitDataStore(forContainerUUID: dataUUID)
+                    try? fileManager.removeItem(at: fileManager.temporaryDirectory.appendingPathComponent(dataUUID, isDirectory: true))
                     DataManager.shared.model.appDataFolderNames.removeAll { $0 == dataUUID }
                 }
             }

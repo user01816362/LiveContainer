@@ -24,6 +24,7 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
     @Published var uiIsJITNeeded : Bool {
         didSet {
             appInfo.isJITNeeded = uiIsJITNeeded
+            LCLaunchCatalogSync.syncFromSharedModel()
         }
     }
     @Published var uiHelperProcessesSupport: Bool {
@@ -34,12 +35,17 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
     @Published var uiClassicMode : Bool {
         didSet {
             appInfo.classicMode = uiClassicMode
+            LCLaunchCatalogSync.syncFromSharedModel()
         }
     }
     @Published var uiIsHidden : Bool
     @Published var uiIsLocked : Bool
     @Published var uiIsShared : Bool
-    @Published var uiDefaultDataFolder : String?
+    @Published var uiDefaultDataFolder : String? {
+        didSet {
+            LCLaunchCatalogSync.syncFromSharedModel()
+        }
+    }
     @Published var uiContainers : [LCContainer]
     @Published var uiSelectedContainer : LCContainer?
     @Published var uiIs32bit : Bool
@@ -254,7 +260,10 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
                 uiSelectedContainer = newContainer;
             }
             appInfo.containers = uiContainers;
-            newContainer.makeLCContainerInfoPlist(appIdentifier: appInfo.bundleIdentifier()!, keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount))
+            newContainer.makeLCContainerInfoPlist(
+                appIdentifier: appInfo.bundleIdentifier()!,
+                keychainGroupId: LCContainer.allocateKeychainGroupId(excluding: uiContainers)
+            )
             appInfo.dataUUID = newName
             uiDefaultDataFolder = newName
         }
@@ -622,6 +631,7 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
                 await toggleHidden()
             }
         }
+        LCLaunchCatalogSync.syncFromSharedModel()
     }
 
     func toggleHidden() async {
@@ -634,6 +644,7 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
             uiIsHidden = true
         }
         delegate?.changeAppVisibility(app: self)
+        LCLaunchCatalogSync.syncFromSharedModel()
     }
 
     func loadSupportedLanguages() throws {

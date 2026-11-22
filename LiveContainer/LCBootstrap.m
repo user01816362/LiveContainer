@@ -302,10 +302,10 @@ static void *getAppEntryPoint(void *handle) {
 NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], char *envp[], char *apple[]) {
     lcMainBundle = NSBundle.mainBundle;
     lcUserDefaults = NSUserDefaults.standardUserDefaults;
-    [LCSharedUtils certificatePassword];
     isLiveProcess = true;
     lcAppUrlScheme = @"liveprocess";
     lcSharedDefaults = [[NSUserDefaults alloc] initWithSuiteName:LCSharedUtils.appGroupID];
+    [LCSharedUtils isJITLessConfigured];
     lcAppGroupPath = [request[@"appGroupPath"] length] ? request[@"appGroupPath"] : nil;
     guestAppInfo = request[@"guestAppInfo"];
     guestContainerInfo = request[@"guestContainerInfo"];
@@ -349,14 +349,14 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
         initDead10ccFix();
     }
 
-    if (!LCSharedUtils.certificatePassword && !isSideStore) {
+    if (!LCSharedUtils.isJITLessConfigured && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
 #else
         if (checkJITEnabled()) init_bypassDyldLibValidation();
 #endif
     }
-    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword != nil;
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.isJITLessConfigured;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     appMainImageIndex = _dyld_image_count();
     __block void *handle = NULL;
@@ -386,7 +386,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
-    if (!LCSharedUtils.certificatePassword && !isSideStore) {
+    if (!LCSharedUtils.isJITLessConfigured && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
 #else
@@ -551,6 +551,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         }
     }
     
+    BOOL validContainerFolder = (dataUUID.length > 0 &&
+                                 [dataUUID rangeOfString:@"/"].location == NSNotFound &&
+                                 ![dataUUID isEqualToString:@"."] &&
+                                 ![dataUUID isEqualToString:@".."]);
     if(isSideStore) {
         if(isLiveProcess) {
             newHomePath = [lcUserDefaults stringForKey:@"specifiedSideStoreContainerPath"];;
@@ -560,6 +564,8 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         }
     } else if (bookmarkURL) {
         newHomePath = bookmarkURL.path;
+    } else if (!validContainerFolder) {
+        return [NSString stringWithFormat:@"Invalid container folder name: %@", dataUUID ?: @"(nil)"];
     } else if(isSharedBundle) {
         newHomePath = [NSString stringWithFormat:@"%@/Data/Application/%@", appGroupFolder.path, dataUUID];
         
@@ -568,45 +574,54 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     
     
+    NSString *kernelTmpDir = getenv("TMPDIR") ? @(getenv("TMPDIR")) : NSTemporaryDirectory();
+    if (kernelTmpDir.length > 1 && [kernelTmpDir hasSuffix:@"/"]) {
+        kernelTmpDir = [kernelTmpDir substringToIndex:kernelTmpDir.length - 1];
+    }
+
+    NSString *effectiveTmpDir = kernelTmpDir;
+    if (!isSideStore && validContainerFolder && kernelTmpDir.length > 0) {
+        NSString *containerTmp = [kernelTmpDir stringByAppendingPathComponent:dataUUID];
+        if ([fm createDirectoryAtPath:containerTmp withIntermediateDirectories:YES attributes:nil error:nil]) {
+            effectiveTmpDir = containerTmp;
+        }
+    }
+
     NSString *newTmpPath = [newHomePath stringByAppendingPathComponent:@"tmp"];
     remove(newTmpPath.UTF8String);
-    symlink(getenv("TMPDIR"), newTmpPath.UTF8String);
-    
-    if([guestAppInfo[@"doSymlinkInbox"] boolValue]) {
-        NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%s/%@-Inbox", getenv("TMPDIR"), [appBundle bundleIdentifier]];
+    symlink(effectiveTmpDir.UTF8String, newTmpPath.UTF8String);
+
+    if ([guestAppInfo[@"doSymlinkInbox"] boolValue] && kernelTmpDir.length > 0) {
+        NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%@/%@-Inbox", kernelTmpDir, [appBundle bundleIdentifier]];
         NSString* inboxPath = [newHomePath stringByAppendingPathComponent:@"Inbox"];
-        
+
         if (![fm fileExistsAtPath:inboxPath]) {
             [fm createDirectoryAtPath:inboxPath withIntermediateDirectories:YES attributes:nil error:&error];
         }
-        if([fm fileExistsAtPath:inboxSymlinkPath]) {
+        if ([fm fileExistsAtPath:inboxSymlinkPath]) {
             NSString* fileType = [fm attributesOfItemAtPath:inboxSymlinkPath error:&error][NSFileType];
-            if(fileType == NSFileTypeDirectory) {
+            if (fileType == NSFileTypeDirectory) {
                 NSArray* contents = [fm contentsOfDirectoryAtPath:inboxSymlinkPath error:&error];
-                for(NSString* content in contents) {
+                for (NSString* content in contents) {
                     [fm moveItemAtPath:[inboxSymlinkPath stringByAppendingPathComponent:content] toPath:[inboxPath stringByAppendingPathComponent:content] error:&error];
                 }
                 [fm removeItemAtPath:inboxSymlinkPath error:&error];
             }
         }
-        
-
         symlink(inboxPath.UTF8String, inboxSymlinkPath.UTF8String);
-    } else {
-        NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%s/%@-Inbox", getenv("TMPDIR"), [appBundle bundleIdentifier]];
+    } else if (kernelTmpDir.length > 0) {
+        NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%@/%@-Inbox", kernelTmpDir, [appBundle bundleIdentifier]];
         NSDictionary* targetAttribute = [fm attributesOfItemAtPath:inboxSymlinkPath error:&error];
-        if(targetAttribute) {
-            if(targetAttribute[NSFileType] == NSFileTypeSymbolicLink) {
-                [fm removeItemAtPath:inboxSymlinkPath error:&error];
-            }
+        if (targetAttribute && targetAttribute[NSFileType] == NSFileTypeSymbolicLink) {
+            [fm removeItemAtPath:inboxSymlinkPath error:&error];
         }
-
     }
-    
+
     setenv("CFFIXED_USER_HOME", newHomePath.UTF8String, 1);
     setenv("HOME", newHomePath.UTF8String, 1);
-    // we don't change TMP's env in case some apps clear cache by directly deleting the tmp folder,
-    // which if symlinked, the new tmp cannot be recreated (#1040, #1125) or the app may camplain about the tmp folder being a symlimk (#884)
+    if (!isSideStore && effectiveTmpDir.length > 0 && ![effectiveTmpDir isEqualToString:kernelTmpDir]) {
+        setenv("TMPDIR", [[effectiveTmpDir stringByAppendingString:@"/"] UTF8String], 1);
+    }
 
     // Setup directories
     [LCSharedUtils ensureContainerDirectoriesAtPath:newHomePath];
@@ -658,7 +673,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
-    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.isJITLessConfigured && isLiveProcess;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     
     // IDFV spoofing is handled by UIKit+GuestHooks.m via UIDevice.identifierForVendor swizzle,

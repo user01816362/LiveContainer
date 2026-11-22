@@ -280,7 +280,9 @@ struct LCDefaultProfileSettingsView: View {
                     continue
                 }
                 LCProfilePresetStore.applyConfiguredDefault(to: container)
-                let groupId = container.keychainGroupId >= 0 ? container.keychainGroupId : 0
+                let groupId = container.keychainGroupId >= 0
+                    ? container.keychainGroupId
+                    : LCContainer.allocateKeychainGroupId(excluding: app.uiContainers)
                 container.makeLCContainerInfoPlist(appIdentifier: bundleId, keychainGroupId: groupId)
                 updatedCount += 1
             }

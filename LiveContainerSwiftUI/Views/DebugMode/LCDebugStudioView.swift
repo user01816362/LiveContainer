@@ -346,7 +346,10 @@ struct LCDebugStudioView: View {
                 appModel.uiSelectedContainer = newContainer
             }
             appModel.appInfo.containers = appModel.uiContainers
-            newContainer.makeLCContainerInfoPlist(appIdentifier: appModel.bundleIdentifier, keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount))
+            newContainer.makeLCContainerInfoPlist(
+                appIdentifier: appModel.bundleIdentifier,
+                keychainGroupId: LCContainer.allocateKeychainGroupId()
+            )
             appModel.appInfo.dataUUID = newName
             appModel.uiDefaultDataFolder = newName
         }

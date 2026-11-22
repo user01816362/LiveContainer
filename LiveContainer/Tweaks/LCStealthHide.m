@@ -389,11 +389,17 @@ static NSDictionary<NSString *, NSString *> *lcFilterEnvironmentDict(NSDictionar
  guest-specific TweakLoader/Tweaks directories remain functional inside the
  process while appearing absent to external anti-tamper inspection.
  */
-void LCStealthHideInit(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        if (lcMainBundlePath) {
+void LCStealthRegisterInternalRanges(void) {
+    static dispatch_once_t regOnceToken;
+    dispatch_once(&regOnceToken, ^{
+        if (lcMainBundlePath && lcMainBundlePath[0] != '\0') {
             strlcpy(sLcMainBundlePath, lcMainBundlePath, sizeof(sLcMainBundlePath));
+        } else {
+            NSString *bundlePath = NSUserDefaults.lcMainBundle.bundlePath;
+            if (NSUserDefaults.isLiveProcess && [bundlePath.lastPathComponent isEqualToString:@"LiveProcess.appex"]) {
+                bundlePath = bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+            }
+            lcCapturePathCString(bundlePath, sLcMainBundlePath, sizeof(sLcMainBundlePath));
         }
         lcCapturePathCString([LCSharedUtils cachedGlobalTweaksFolderPath], sGlobalTweaksPath, sizeof(sGlobalTweaksPath));
         lcCapturePathCString(NSBundle.mainBundle.bundlePath, sGuestAppBundlePath, sizeof(sGuestAppBundlePath));
@@ -406,6 +412,13 @@ void LCStealthHideInit(void) {
             }
         }
         _dyld_register_func_for_add_image(lcStealthImageAdded);
+    });
+}
+
+void LCStealthHideInit(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        LCStealthRegisterInternalRanges();
 
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, hook_objc_copyImageNames, nil);
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, hook_class_getImageName, nil);

@@ -78,7 +78,7 @@ extension LCAppBannerViewController {
                 )
                 initialContainer.makeLCContainerInfoPlist(
                     appIdentifier: bundleId,
-                    keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+                    keychainGroupId: LCContainer.allocateKeychainGroupId()
                 )
                 clonedAppInfo.containers = [initialContainer]
                 clonedAppInfo.dataUUID = folderName

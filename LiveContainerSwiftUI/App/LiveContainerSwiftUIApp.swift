@@ -11,6 +11,7 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
     init() {
+        LCSharedUtils.migrateCertificateToHostKeychainIfNeeded()
         let fm = FileManager()
         var tempApps: [LCAppModel] = []
         var tempArm32EmuApps: [LCAppModel] = []
@@ -72,6 +73,7 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         DataManager.shared.model.apps = tempApps
         DataManager.shared.model.arm32EmuApps = tempArm32EmuApps
         DataManager.shared.model.hiddenApps = tempHiddenApps
+        LCLaunchCatalogSync.sync(apps: tempApps, hiddenApps: tempHiddenApps)
         if let tempURLSchemes {
             UserDefaults.lcShared().set(Array(tempURLSchemes), forKey: "LCGuestURLSchemes")
         }

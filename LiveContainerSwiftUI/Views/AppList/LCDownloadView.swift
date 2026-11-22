@@ -561,7 +561,7 @@ final class LCAppInstaller {
                 )
                 initialContainer.makeLCContainerInfoPlist(
                     appIdentifier: bundleId,
-                    keychainGroupId: Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+                    keychainGroupId: LCContainer.allocateKeychainGroupId()
                 )
                 finalNewApp.containers = [initialContainer]
                 finalNewApp.dataUUID = folderName
@@ -625,9 +625,7 @@ final class LCAppInstaller {
             return "App updated, but bundled container data was skipped because this app already uses the maximum number of containers."
         }
 
-        let usedGroups = Set(existingContainers.map(\.keychainGroupId))
-        let availableGroups = (0..<SharedModel.keychainAccessGroupCount).filter { !usedGroups.contains($0) }
-        let chosenGroup = availableGroups.randomElement() ?? Int.random(in: 0..<SharedModel.keychainAccessGroupCount)
+        let chosenGroup = LCContainer.allocateKeychainGroupId(excluding: existingContainers)
 
         let dataBaseURL = isSharedTarget ? LCPath.lcGroupDataPath : LCPath.dataPath
         let folderName = UUID().uuidString

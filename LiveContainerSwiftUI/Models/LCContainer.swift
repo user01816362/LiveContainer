@@ -38,6 +38,7 @@ class LCContainer : ObservableObject, Hashable {
     @Published var bookmarkResolved = false
     
     @Published var isolateAppGroup : Bool
+    @Published var isolateWebViewData: Bool
 
     @Published var spoofIdentifierForVendor : Bool {
         didSet {
@@ -177,6 +178,7 @@ class LCContainer : ObservableObject, Hashable {
         name: String,
         isShared : Bool,
         isolateAppGroup: Bool = false,
+        isolateWebViewData: Bool = false,
         spoofIdentifierForVendor: Bool = false,
         strictTestMode: Bool = false,
         strictAutoWipeOnExit: Bool = false,
@@ -271,6 +273,7 @@ class LCContainer : ObservableObject, Hashable {
         self.name = name
         self.isShared = isShared
         self.isolateAppGroup = isolateAppGroup
+        self.isolateWebViewData = isolateWebViewData
         self.spoofIdentifierForVendor = spoofIdentifierForVendor
         self.strictTestMode = strictTestMode
         self.strictAutoWipeOnExit = strictAutoWipeOnExit
@@ -522,12 +525,62 @@ class LCContainer : ObservableObject, Hashable {
         return ans
     }
     
+    static func allocateKeychainGroupId(excluding localContainers: [LCContainer] = []) -> Int {
+        var counts: [Int: Int] = [:]
+        let allApps = DataManager.shared.model.apps + DataManager.shared.model.hiddenApps
+        for app in allApps {
+            for container in app.uiContainers where container.keychainGroupId > 0 {
+                counts[container.keychainGroupId, default: 0] += 1
+            }
+        }
+        let localUsed = Set(localContainers.map(\.keychainGroupId).filter { $0 > 0 })
+        for groupId in localUsed where counts[groupId] == nil {
+            counts[groupId] = 1
+        }
+
+        // Reserve 0 exclusively for legacy containers; allocate new containers across 1..<keychainAccessGroupCount.
+        let validRange = 1..<SharedModel.keychainAccessGroupCount
+        let globallyFree = validRange.filter { counts[$0, default: 0] == 0 }
+        if let picked = globallyFree.randomElement() {
+            return picked
+        }
+
+        let locallyFree = validRange.filter { !localUsed.contains($0) }
+        if !locallyFree.isEmpty {
+            let minUsage = locallyFree.map { counts[$0, default: 0] }.min() ?? 0
+            let leastUsed = locallyFree.filter { counts[$0, default: 0] == minUsage }
+            if let picked = leastUsed.randomElement() {
+                return picked
+            }
+        }
+        return Int.random(in: validRange)
+    }
+
+    static func isKeychainGroupIdUnique(_ groupId: Int, forFolderName folderName: String) -> Bool {
+        guard groupId > 0 else {
+            return false
+        }
+        let allApps = DataManager.shared.model.apps + DataManager.shared.model.hiddenApps
+        var otherOwners = 0
+        for app in allApps {
+            for container in app.uiContainers where container.keychainGroupId == groupId {
+                if container.folderName != folderName {
+                    otherOwners += 1
+                }
+            }
+        }
+        return otherOwners == 0
+    }
+
     func makeLCContainerInfoPlist(appIdentifier : String, keychainGroupId : Int) {
+        let isUniqueGroup = LCContainer.isKeychainGroupIdUnique(keychainGroupId, forFolderName: folderName)
         infoDict = [
             "appIdentifier" : appIdentifier,
             "name" : name,
             "keychainGroupId" : keychainGroupId,
+            "strictWipeEntireKeychainGroup": isUniqueGroup,
             "isolateAppGroup" : isolateAppGroup,
+            "isolateWebViewData": isolateWebViewData,
             "spoofIdentifierForVendor": spoofIdentifierForVendor,
             "strictTestMode": strictTestMode,
             "strictAutoWipeOnExit": strictAutoWipeOnExit,
@@ -658,6 +711,7 @@ class LCContainer : ObservableObject, Hashable {
             name = dictionary["name"] as? String ?? "ERROR"
         }
         isolateAppGroup = dictionary["isolateAppGroup"] as? Bool ?? false
+        isolateWebViewData = dictionary["isolateWebViewData"] as? Bool ?? false
         spoofIdentifierForVendor = dictionary["spoofIdentifierForVendor"] as? Bool ?? false
         spoofedIdentifier = dictionary["spoofedIdentifierForVendor"] as? String
         strictTestMode = dictionary["strictTestMode"] as? Bool ?? false
@@ -823,7 +877,10 @@ extension LCAppInfo {
             return dictArr.map{ dict in
                 let ans = LCContainer(infoDict: dict, isShared: isShared)
                 if upgrade {
-                    ans.makeLCContainerInfoPlist(appIdentifier: bundleIdentifier()!, keychainGroupId: 0)
+                    ans.makeLCContainerInfoPlist(
+                        appIdentifier: bundleIdentifier()!,
+                        keychainGroupId: LCContainer.allocateKeychainGroupId()
+                    )
                 }
                 return ans
             }

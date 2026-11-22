@@ -755,20 +755,8 @@ struct LCAppSettingsView: View {
         
         sharedModel.appDataFolderNames.append(newName)
         let newContainer = LCContainer.makeNewContainer(folderName: newName, name: displayName, isShared: model.uiIsShared)
-        // assign keychain group
-        var keychainGroupSet : Set<Int> = Set(minimumCapacity: 3)
-        for i in 0..<SharedModel.keychainAccessGroupCount {
-            keychainGroupSet.insert(i)
-        }
-        for container in model.uiContainers {
-            keychainGroupSet.remove(container.keychainGroupId)
-        }
-        guard let freeKeyChainGroup = keychainGroupSet.randomElement() else {
-            errorInfo = "lc.container.notEnoughKeychainGroup".loc
-            errorShow = true
-            return
-        }
-        
+        let freeKeyChainGroup = LCContainer.allocateKeychainGroupId(excluding: model.uiContainers)
+
         model.uiContainers.append(newContainer)
         if model.uiSelectedContainer == nil {
             model.uiSelectedContainer = newContainer;
@@ -831,20 +819,8 @@ struct LCAppSettingsView: View {
                 )
                 freshContainer.bookmarkResolved = true
                 container = freshContainer
-                // assign keychain group
-                var keychainGroupSet : Set<Int> = Set(minimumCapacity: 3)
-                for i in 0..<SharedModel.keychainAccessGroupCount {
-                    keychainGroupSet.insert(i)
-                }
-                for container in model.uiContainers {
-                    keychainGroupSet.remove(container.keychainGroupId)
-                }
-                guard let freeKeyChainGroup = keychainGroupSet.randomElement() else {
-                    errorInfo = "lc.container.notEnoughKeychainGroup".loc
-                    errorShow = true
-                    return
-                }
-                
+                let freeKeyChainGroup = LCContainer.allocateKeychainGroupId(excluding: model.uiContainers)
+
                 if container!.bookmarkResolved {
                     container!.makeLCContainerInfoPlist(appIdentifier: appInfo.bundleIdentifier()!, keychainGroupId: freeKeyChainGroup)
                 }
@@ -924,6 +900,7 @@ struct LCAppSettingsView: View {
             appInfo.setBundlePath(LCPath.lcGroupBundlePath.appendingPathComponent(appInfo.relativeBundlePath).path)
             appInfo.isShared = true
             model.uiIsShared = true
+            LCLaunchCatalogSync.syncFromSharedModel()
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
@@ -985,6 +962,7 @@ struct LCAppSettingsView: View {
             for container in model.uiContainers {
                 container.isShared = false
             }
+            LCLaunchCatalogSync.syncFromSharedModel()
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
@@ -1300,6 +1278,7 @@ extension LCAppSettingsView : LCContainerViewDelegate {
         
         appInfo.dataUUID = newDefaultContainer.folderName
         model.uiDefaultDataFolder = newDefaultContainer.folderName
+        LCLaunchCatalogSync.syncFromSharedModel()
     }
     
     func saveContainer(container: LCContainer) {
@@ -1342,19 +1321,7 @@ extension LCAppSettingsView : LCSelectContainerViewDelegate {
             let newContainer = LCContainer(folderName: folderName, name: folderName, isShared: false)
             newContainer.loadName()
             if newContainer.keychainGroupId == -1 {
-                // assign keychain group for old containers
-                var keychainGroupSet : Set<Int> = Set(minimumCapacity: SharedModel.keychainAccessGroupCount)
-                for i in 0..<SharedModel.keychainAccessGroupCount {
-                    keychainGroupSet.insert(i)
-                }
-                for container in model.uiContainers {
-                    keychainGroupSet.remove(container.keychainGroupId)
-                }
-                guard let freeKeyChainGroup = keychainGroupSet.randomElement() else {
-                    errorInfo = "lc.container.notEnoughKeychainGroup".loc
-                    errorShow = true
-                    return
-                }
+                let freeKeyChainGroup = LCContainer.allocateKeychainGroupId(excluding: model.uiContainers)
                 newContainer.makeLCContainerInfoPlist(appIdentifier: appInfo.bundleIdentifier()!, keychainGroupId: freeKeyChainGroup)
             }
 

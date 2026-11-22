@@ -253,8 +253,21 @@ struct LCDataManagementView : View {
         do {
             let fm = FileManager()
             for folder in foldersToDelete {
-                try fm.removeItem(at: LCPath.dataPath.appendingPathComponent(folder))
-                LCUtils.removeAppKeychain(dataUUID: folder)
+                let folderURL = LCPath.dataPath.appendingPathComponent(folder)
+                let infoURL = folderURL.appendingPathComponent("LCContainerInfo.plist")
+                var keychainGroupId = -1
+                if let infoDict = NSDictionary(contentsOf: infoURL) as? [String: Any],
+                   let groupNumber = infoDict["keychainGroupId"] as? NSNumber {
+                    keychainGroupId = groupNumber.intValue
+                }
+                let wipeEntireGroup = keychainGroupId > 0 && LCContainer.isKeychainGroupIdUnique(keychainGroupId, forFolderName: folder)
+                try fm.removeItem(at: folderURL)
+                LCUtils.removeAppKeychain(dataUUID: folder, keychainGroupId: keychainGroupId, wipeEntireGroup: wipeEntireGroup)
+                LCSharedUtils.removeWebKitDataStore(forContainerUUID: folder)
+                let tmpSubdir = fm.temporaryDirectory.appendingPathComponent(folder, isDirectory: true)
+                if fm.fileExists(atPath: tmpSubdir.path) {
+                    try? fm.removeItem(at: tmpSubdir)
+                }
                 sharedModel.appDataFolderNames.removeAll(where: { s in
                     return s == folder
                 })

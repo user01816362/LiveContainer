@@ -18,33 +18,7 @@ private struct LaunchAppExtensionError: LocalizedError, CustomLocalizedStringRes
 
 private actor LaunchExtensionCoordinator {
     static let shared = LaunchExtensionCoordinator()
-    private var bookmarkResolved = false
     private var ext: NSExtension?
-
-    func resolvePrivateDocBookmarkIfNeeded(appGroupID: String) {
-        guard !bookmarkResolved else { return }
-        bookmarkResolved = true
-        guard
-            let defaults = UserDefaults(suiteName: appGroupID),
-            let bookmarkData = defaults.data(forKey: "LCLaunchExtensionPrivateDocBookmark")
-        else {
-            return
-        }
-        var isStale = false
-        do {
-            let url = try URL(resolvingBookmarkData: bookmarkData, bookmarkDataIsStale: &isStale)
-            let access = url.startAccessingSecurityScopedResource()
-            if access {
-                setenv("LC_HOME_PATH", (url.deletingLastPathComponent().path as NSString).utf8String, 1)
-            } else {
-                print("Failed to startAccessingSecurityScopedResource")
-                defaults.set(nil, forKey: "LCLaunchExtensionPrivateDocBookmark")
-            }
-        } catch {
-            print("Failed to resolve bookmark")
-            defaults.set(nil, forKey: "LCLaunchExtensionPrivateDocBookmark")
-        }
-    }
 
     func openURL(launchURL: URL, classicMode: UInt?) async throws {
         let extensionInstance: NSExtension
@@ -163,6 +137,9 @@ struct LaunchAppExtension: AppIntent {
             if queryItem.name == "bundle-name", let bundleId1 = queryItem.value {
                 bundleId = bundleId1
             } else if queryItem.name == "container-folder-name", let containerName1 = queryItem.value {
+                guard Self.isSafeContainerFolderName(containerName1) else {
+                    throw LaunchAppExtensionError("Invalid container-folder-name parameter.")
+                }
                 containerName = containerName1
             } else if queryItem.name == "jit", let forceJIT1 = queryItem.value {
                 if forceJIT1 == "true" {
@@ -175,38 +152,35 @@ struct LaunchAppExtension: AppIntent {
         guard let bundleId else {
             throw LaunchAppExtensionError("No bundle-name parameter found.")
         }
-                
-        // resolve private Documents bookmark
-        await LaunchExtensionCoordinator.shared.resolvePrivateDocBookmarkIfNeeded(appGroupID: appGroupId)
-        
-        // launch app
+
+        // Look up read-only launch catalog published by primary LiveContainer (no private Documents access needed).
         var isSharedApp = false
-        let appBundle = LCSharedUtils.findBundle(withBundleId: bundleId, isSharedAppOut: &isSharedApp)
-        guard let appBundle else {
-            // app bundle cannot be found, we pass the url as-is in case it can only be handled by lc1
+        var catalogEntry: [String: Any]? = (lcSharedDefaults.dictionary(forKey: "LCLaunchAppCatalog")?[bundleId] as? [String: Any])
+        if let catalogEntry {
+            isSharedApp = catalogEntry["isShared"] as? Bool ?? false
+        } else if let sharedBundle = LCSharedUtils.findBundle(withBundleId: bundleId, isSharedAppOut: &isSharedApp),
+                  isSharedApp,
+                  let appInfoURL = sharedBundle.url(forResource: "LCAppInfo", withExtension: "plist"),
+                  let data = try? Data(contentsOf: appInfoURL),
+                  let rawDict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+            catalogEntry = rawDict
+        }
+
+        guard let catalogEntry else {
+            // App metadata is not in shared catalog; forward the URL cleanly to primary LiveContainer.
             try await openURL(launchURL: launchURL)
             return .result()
         }
-        
-        // check if the app is locked/hidden/require JIT, if so we don't directly set keys in lcSharedDefaults
-        let appInfoURL = appBundle.url(forResource: "LCAppInfo", withExtension: "plist")
-        guard let appInfoURL else {
-            throw LaunchAppExtensionError("Failed to find AppInfo!")
-        }
 
-        let appInfo = try PropertyListSerialization.propertyList(from: try Data(contentsOf: appInfoURL), format: nil)
-        guard let appInfo = appInfo as? [String:Any] else {
-            throw LaunchAppExtensionError("Failed to load AppInfo!")
-        }
-        let isHiden = appInfo["isHidden"] as? Bool ?? false
-        let isLocked = appInfo["isLocked"] as? Bool ?? false
-        let isJITNeeded = appInfo["isJITNeeded"] as? Bool ?? false
-        
-        
+        let isHiden = catalogEntry["isHidden"] as? Bool ?? false
+        let isLocked = catalogEntry["isLocked"] as? Bool ?? false
+        let isJITNeeded = catalogEntry["isJITNeeded"] as? Bool ?? false
+
         var schemeToLaunch: String? = nil
         // if containerName is not specified, use LCDataUUID as default
-        if containerName == nil {
-            containerName = appInfo["LCDataUUID"] as? String
+        if containerName == nil, let defaultContainer = catalogEntry["LCDataUUID"] as? String,
+           Self.isSafeContainerFolderName(defaultContainer) {
+            containerName = defaultContainer
         }
         
         var newLaunch = false
@@ -235,7 +209,9 @@ struct LaunchAppExtension: AppIntent {
             return .result()
         }
         
-        if newLaunch && !forceJIT && !isHiden && !isLocked && !isJITNeeded {
+        let willDirectLaunch = newLaunch && !forceJIT && !isHiden && !isLocked && !isJITNeeded
+        if willDirectLaunch {
+            lcSharedDefaults.removeObject(forKey: "LCLaunchExtensionLaunchURL")
             lcSharedDefaults.set(schemeToLaunch, forKey: "LCLaunchExtensionScheme")
             lcSharedDefaults.set(bundleId, forKey: "LCLaunchExtensionBundleID")
             lcSharedDefaults.set(containerName, forKey: "LCLaunchExtensionContainerName")
@@ -248,14 +224,22 @@ struct LaunchAppExtension: AppIntent {
         }
 
         let classicMode: UInt?
-        if allowClassicMode {
-            classicMode = (appInfo["classicMode"] as? Bool ?? false)
-                ? ((appInfo["LCClassicModeCache"] as? [String: Any])?["defaultClassicMode"] as? NSNumber)?.uintValue ?? 0
-                : 0
+        if allowClassicMode && (!newLaunch || willDirectLaunch) {
+            if let directDefault = catalogEntry["defaultClassicMode"] as? NSNumber {
+                classicMode = (catalogEntry["classicMode"] as? Bool ?? false) ? directDefault.uintValue : 0
+            } else {
+                classicMode = (catalogEntry["classicMode"] as? Bool ?? false)
+                    ? ((catalogEntry["LCClassicModeCache"] as? [String: Any])?["defaultClassicMode"] as? NSNumber)?.uintValue ?? 0
+                    : 0
+            }
         } else {
             classicMode = nil
         }
         try await openURL(launchURL: newURL, classicMode: classicMode)
         return .result()
+    }
+
+    private static func isSafeContainerFolderName(_ value: String) -> Bool {
+        !value.isEmpty && value != "." && value != ".." && !value.contains("/") && !value.contains("\0")
     }
 }

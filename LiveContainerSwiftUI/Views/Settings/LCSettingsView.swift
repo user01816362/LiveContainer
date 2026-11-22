@@ -105,7 +105,7 @@ struct LCSettingsView: View {
     }
 
     init() {
-        _certificateDataFound = State(initialValue: LCSharedUtils.certificatePassword() != nil)
+        _certificateDataFound = State(initialValue: LCUtils.certificateData() != nil && LCSharedUtils.certificatePassword() != nil)
         _store = State(initialValue: LCUtils.store())
     }
 
@@ -274,6 +274,9 @@ struct LCSettingsView: View {
                     Section {
                         Toggle(isOn: $strictHiding) {
                             Text("lc.settings.strictHiding".loc)
+                        }
+                        .onChange(of: strictHiding) { _, _ in
+                            LCLaunchCatalogSync.syncFromSharedModel()
                         }
                     } footer: {
                         Text("lc.settings.strictHidingDesc".loc)
@@ -600,9 +603,7 @@ struct LCSettingsView: View {
             return
         }
 
-        LCUtils.appGroupUserDefault.set(certificateData, forKey: "LCCertificateData")
-        LCUtils.appGroupUserDefault.set(certificatePassword, forKey: "LCCertificatePassword")
-        LCUtils.appGroupUserDefault.set(NSDate.now, forKey: "LCCertificateUpdateDate")
+        LCSharedUtils.saveCertificateData(certificateData, password: certificatePassword)
         certificateDataFound = true
 
         UserDefaults.standard.set(LCSharedUtils.appGroupID(), forKey: "LCAppGroupID")
@@ -679,9 +680,7 @@ struct LCSettingsView: View {
         await UIApplication.shared.open(url)
     }
     func onSideStoreCertificateCallback(certificateData: Data, password: String) {
-        LCUtils.appGroupUserDefault.set(certificateData, forKey: "LCCertificateData")
-        LCUtils.appGroupUserDefault.set(password, forKey: "LCCertificatePassword")
-        LCUtils.appGroupUserDefault.set(NSDate.now, forKey: "LCCertificateUpdateDate")
+        LCSharedUtils.saveCertificateData(certificateData, password: password)
         certificateDataFound = true
     }
 
@@ -690,9 +689,7 @@ struct LCSettingsView: View {
             return
         }
 
-        LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificateData")
-        LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificatePassword")
-        LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificateUpdateDate")
+        LCSharedUtils.clearCertificateData()
         certificateDataFound = false
 
         UserDefaults.standard.set(nil, forKey: "LCAppGroupID")

@@ -33,6 +33,7 @@
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>
+		<string>AAAAA11111.com.kdt.livecontainer.host</string>
 		<string>AAAAA11111.com.kdt.livecontainer.shared</string>
 		<string>AAAAA11111.com.kdt.livecontainer.shared.1</string>
 		<string>AAAAA11111.com.kdt.livecontainer.shared.2</string>

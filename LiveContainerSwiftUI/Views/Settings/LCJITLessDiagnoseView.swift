@@ -132,13 +132,14 @@ struct LCEntitlementView : View {
                 }
             }
             if let keyChainAccessGroups = entitlementDict["keychain-access-groups"] as? Array<String> {
-                var notFound = true
-                if keyChainAccessGroups.contains("\(entitlementTeamId).com.kdt.livecontainer.shared") {
-                    notFound = false
+                var notFound = keyChainAccessGroups.first != "\(entitlementTeamId).com.kdt.livecontainer.host"
+                if !keyChainAccessGroups.contains("\(entitlementTeamId).com.kdt.livecontainer.shared") {
+                    notFound = true
+                } else {
                     for i in 1..<SharedModel.keychainAccessGroupCount {
                         if !keyChainAccessGroups.contains("\(entitlementTeamId).com.kdt.livecontainer.shared.\(i)") {
                             notFound = true
-                            continue
+                            break
                         }
                     }
                 }

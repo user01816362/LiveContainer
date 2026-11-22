@@ -14,6 +14,7 @@
 
 BOOL isolateAppGroup = NO;
 BOOL strictTestMode = NO;
+static BOOL isolateWebViewData = NO;
 static NSString *extensionParentContainerPath;
 void* webKitHeader = 0;
 static uintptr_t webKitTextStart = 0;
@@ -34,17 +35,27 @@ static void updateWebKitTextBounds(void) {
     }
 }
 void NSFMGuestExtensionHooksInit(NSString *parentContainerPath) {
+    LCStealthRegisterInternalRanges();
     extensionParentContainerPath = parentContainerPath;
-    strictTestMode = [NSUserDefaults.guestContainerInfo[@"strictTestMode"] boolValue];
-    isolateAppGroup = strictTestMode || [NSUserDefaults.guestContainerInfo[@"isolateAppGroup"] boolValue];
+    NSDictionary *infoDict = [NSUserDefaults guestContainerInfo];
+    strictTestMode = [infoDict[@"strictTestMode"] boolValue];
+    isolateAppGroup = strictTestMode || [infoDict[@"isolateAppGroup"] boolValue];
+    isolateWebViewData = strictTestMode || [infoDict[@"isolateWebViewData"] boolValue];
     swizzle(NSFileManager.class, @selector(containerURLForSecurityApplicationGroupIdentifier:), @selector(hook_containerURLForSecurityApplicationGroupIdentifier:));
 }
 
 void NSFMGuestHooksInit(void) {
+    LCStealthRegisterInternalRanges();
     NSDictionary* infoDict = [NSUserDefaults guestContainerInfo];
     strictTestMode = [infoDict[@"strictTestMode"] boolValue];
     isolateAppGroup = strictTestMode || [infoDict[@"isolateAppGroup"] boolValue];
+    isolateWebViewData = strictTestMode || [infoDict[@"isolateWebViewData"] boolValue];
     swizzle(NSFileManager.class, @selector(containerURLForSecurityApplicationGroupIdentifier:), @selector(hook_containerURLForSecurityApplicationGroupIdentifier:));
+
+    if (isolateWebViewData) {
+        // Native WKWebsiteDataStore isolation (dataStoreForIdentifier: / nonPersistentDataStore) handles cookies without symlinking.
+        return;
+    }
     
     /// To fix https://github.com/LiveContainer/LiveContainer/issues/888 i.e. WebKit being unable to save cookie issue, we have to hook -[NSFileManager createDirectoryAtPath:withIntermediateDirectories:attributes:error:] so that WebKit still creates bookmark for the symlinked lc's cookies folder, which is resolved by the kernel to the app's cookies folder
     /// see https://github.com/apple-oss-distributions/WebKit/blob/0c8cf3581e5c01d970ea411128007c9325ba2d48/Source/WebKit/Shared/Cocoa/SandboxExtensionCocoa.mm#L159 and https://github.com/apple-oss-distributions/WebKit/blob/0c8cf3581e5c01d970ea411128007c9325ba2d48/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStore.cpp#L2225
@@ -72,7 +83,15 @@ void NSFMGuestHooksInit(void) {
 
 - (nullable NSURL *)hook_containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
     if([groupIdentifier isEqualToString:[NSClassFromString(@"LCSharedUtils") appGroupID]]) {
-        return [NSURL fileURLWithPath: NSUserDefaults.lcAppGroupPath];
+        void *rawCaller = __builtin_return_address(0);
+#ifdef __PTRAUTH_INTRINSICS__
+        void *strippedCaller = ptrauth_strip(rawCaller, ptrauth_key_return_address);
+#else
+        void *strippedCaller = rawCaller;
+#endif
+        if (LCStealthIsInternalAddress(strippedCaller) && NSUserDefaults.lcAppGroupPath) {
+            return [NSURL fileURLWithPath:NSUserDefaults.lcAppGroupPath];
+        }
     }
     NSURL *result;
     if(isolateAppGroup) {

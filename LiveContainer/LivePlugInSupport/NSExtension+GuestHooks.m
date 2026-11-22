@@ -31,7 +31,8 @@ NSDictionary* prepareGuestPlugInConfig(NSBundle* guestBundle, NSError** errorOut
     }
     NSMutableArray *bookmarks = [NSMutableArray array];
     NSString *appGroupPath;
-    if ([NSUserDefaults.guestContainerInfo[@"isolateAppGroup"] boolValue]) {
+    NSDictionary *guestContainerInfo = NSUserDefaults.guestContainerInfo;
+    if ([guestContainerInfo[@"strictTestMode"] boolValue] || [guestContainerInfo[@"isolateAppGroup"] boolValue]) {
         appGroupPath = [guestExtensionsContainerURL.path stringByAppendingPathComponent:@"LCAppGroup"];
     } else if (NSUserDefaults.lcAppGroupPath.length) {
         appGroupPath = [NSUserDefaults.lcAppGroupPath stringByAppendingPathComponent:@"LiveContainer/Data/AppGroup"];

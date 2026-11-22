@@ -1,10 +1,21 @@
 @import Foundation;
 
 @interface LCSharedUtils : NSObject
-+ (NSString*) teamIdentifier;
-+ (NSString *)appGroupID;
-+ (NSURL*) appGroupPath;
-+ (NSString *)certificatePassword;
++ (nullable NSString *)teamIdentifier;
++ (nullable NSString *)appGroupID;
++ (nullable NSURL *)appGroupPath;
++ (nullable NSString *)hostKeychainAccessGroup;
++ (nullable NSData *)certificateData;
++ (nullable NSString *)certificatePassword;
++ (BOOL)isJITLessConfigured;
++ (void)saveCertificateData:(nonnull NSData *)certData password:(nonnull NSString *)password;
++ (void)clearCertificateData;
++ (void)migrateCertificateToHostKeychainIfNeeded;
++ (nullable NSUUID *)webKitStoreIdentifierForContainerUUID:(nonnull NSString *)dataUUID;
++ (void)removeWebKitDataStoreForContainerUUID:(nonnull NSString *)dataUUID;
++ (void)removeKeychainItemsForContainerUUID:(nonnull NSString *)dataUUID
+                            keychainGroupId:(NSInteger)keychainGroupId
+                            wipeEntireGroup:(BOOL)wipeEntireGroup;
 + (BOOL)launchToGuestAppWithClassicMode:(NSUInteger)classicMode;
 + (BOOL)launchToGuestAppWithURL:(NSURL *)url;
 + (void)setWebPageUrlForNextLaunch:(NSString*)urlString;

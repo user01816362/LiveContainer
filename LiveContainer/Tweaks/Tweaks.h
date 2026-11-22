@@ -24,6 +24,7 @@ void initDead10ccFix(void);
 void IDFVHookInit(NSUUID* uuid);
 void NSExtensionGuestHooksInit(NSURL *appURL, NSURL *containerURL);
 void GuestExtensionHooksInit(void);
+void LCStealthRegisterInternalRanges(void);
 void LCStealthHideInit(void);
 bool LCStealthIsHiddenPath(const char *path);
 bool LCStealthIsInternalAddress(const void *addr);
