@@ -132,7 +132,8 @@ struct LCEntitlementView : View {
                 }
             }
             if let keyChainAccessGroups = entitlementDict["keychain-access-groups"] as? Array<String> {
-                var notFound = keyChainAccessGroups.first != "\(entitlementTeamId).com.kdt.livecontainer.host"
+                let hostGroup = "\(entitlementTeamId).com.kdt.livecontainer.host"
+                var notFound = isLiveProcess ? keyChainAccessGroups.contains(hostGroup) : !keyChainAccessGroups.contains(hostGroup)
                 if !keyChainAccessGroups.contains("\(entitlementTeamId).com.kdt.livecontainer.shared") {
                     notFound = true
                 } else {
