@@ -5,6 +5,7 @@ typedef void (^ _Null_unspecified LCParseMachOCallback)(const char * _Null_unspe
 
 #define PATCH_EXEC_RESULT_NO_SPACE_FOR_TWEAKLOADER 1
 #define PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH 2
+#define PATCH_EXEC_RESULT_MISALIGNED_LINKEDIT_STRING_POOL 4
 
 void LCPatchAppBundleFixupARM64eSlice(NSURL * _Null_unspecified bundleURL);
 NSString * _Null_unspecified LCPatchMachOFixupARM64eSlice(const char * _Null_unspecified path);

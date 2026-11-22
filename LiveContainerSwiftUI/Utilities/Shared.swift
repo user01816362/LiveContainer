@@ -85,6 +85,9 @@ class SharedModel: ObservableObject {
         if let compatibilityEnabled = Bundle.main.infoDictionary?["UIDesignRequiresCompatibility"] as? Bool, compatibilityEnabled {
             return false
         }
+        if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_UISolariumEnabled") {
+            return unsafeBitCast(symbol, to: (@convention(c) () -> Bool).self)()
+        }
         return true
     }()
     

@@ -12,16 +12,10 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
     
     init() {
         let fm = FileManager()
-        var tempAppDataFolderNames : [String] = []
-        var tempTweakFolderNames : [String] = []
-        
         var tempApps: [LCAppModel] = []
         var tempArm32EmuApps: [LCAppModel] = []
         var tempHiddenApps: [LCAppModel] = []
         var tempURLSchemes: Set<String>? = DataManager.shared.model.multiLCStatus != 2 ? Set() : nil
-
-        // Cleanup stale export temp artifacts from previous runs/interrupted shares.
-        cleanupStaleExportArtifacts(fileManager: fm)
 
         do {
             // load apps
@@ -71,22 +65,56 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     }
                 }
             }
-            // load document folders
-            try fm.createDirectory(at: LCPath.dataPath, withIntermediateDirectories: true)
-            let dataDirs = try fm.contentsOfDirectory(atPath: LCPath.dataPath.path)
+        } catch {
+            NSLog("[LC] error:\(error)")
+        }
+
+        DataManager.shared.model.apps = tempApps
+        DataManager.shared.model.arm32EmuApps = tempArm32EmuApps
+        DataManager.shared.model.hiddenApps = tempHiddenApps
+        if let tempURLSchemes {
+            UserDefaults.lcShared().set(Array(tempURLSchemes), forKey: "LCGuestURLSchemes")
+        }
+
+        let dataPath = LCPath.dataPath
+        let tweakPath = LCPath.tweakPath
+        Task.detached(priority: .utility) {
+            let bgFM = FileManager()
+            cleanupStaleExportArtifacts(fileManager: bgFM)
+            let (dataFolderNames, tweakFolderNames) = Self.scanDataAndTweakFolders(
+                fileManager: bgFM,
+                dataPath: dataPath,
+                tweakPath: tweakPath
+            )
+            await MainActor.run {
+                DataManager.shared.model.appDataFolderNames = dataFolderNames
+                DataManager.shared.model.tweakFolderNames = tweakFolderNames
+            }
+        }
+    }
+
+    private nonisolated static func scanDataAndTweakFolders(
+        fileManager fm: FileManager,
+        dataPath: URL,
+        tweakPath: URL
+    ) -> ([String], [String]) {
+        var tempAppDataFolderNames: [String] = []
+        var tempTweakFolderNames: [String] = []
+        do {
+            try fm.createDirectory(at: dataPath, withIntermediateDirectories: true)
+            let dataDirs = try fm.contentsOfDirectory(atPath: dataPath.path)
             for dataDir in dataDirs {
-                let dataDirUrl = LCPath.dataPath.appendingPathComponent(dataDir)
+                let dataDirUrl = dataPath.appendingPathComponent(dataDir)
                 if !dataDirUrl.hasDirectoryPath {
                     continue
                 }
                 tempAppDataFolderNames.append(dataDir)
             }
-            
-            // load tweak folders
-            try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
-            let tweakDirs = try fm.contentsOfDirectory(atPath: LCPath.tweakPath.path)
+
+            try fm.createDirectory(at: tweakPath, withIntermediateDirectories: true)
+            let tweakDirs = try fm.contentsOfDirectory(atPath: tweakPath.path)
             for tweakDir in tweakDirs {
-                let tweakDirUrl = LCPath.tweakPath.appendingPathComponent(tweakDir)
+                let tweakDirUrl = tweakPath.appendingPathComponent(tweakDir)
                 if !tweakDirUrl.hasDirectoryPath {
                     continue
                 }
@@ -96,15 +124,7 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         } catch {
             NSLog("[LC] error:\(error)")
         }
-        
-        DataManager.shared.model.apps = tempApps
-        DataManager.shared.model.arm32EmuApps = tempArm32EmuApps
-        DataManager.shared.model.hiddenApps = tempHiddenApps
-        DataManager.shared.model.appDataFolderNames = tempAppDataFolderNames
-        DataManager.shared.model.tweakFolderNames = tempTweakFolderNames
-        if let tempURLSchemes {
-            UserDefaults.lcShared().set(Array(tempURLSchemes), forKey: "LCGuestURLSchemes")
-        }
+        return (tempAppDataFolderNames, tempTweakFolderNames)
     }
     
     var body: some Scene {
@@ -126,7 +146,7 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
     
 }
 
-private func cleanupStaleExportArtifacts(fileManager: FileManager) {
+private nonisolated func cleanupStaleExportArtifacts(fileManager: FileManager) {
     let exportDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent("LCExports", isDirectory: true)
     if fileManager.fileExists(atPath: exportDirectoryURL.path) {
         try? fileManager.removeItem(at: exportDirectoryURL)

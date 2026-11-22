@@ -839,10 +839,12 @@ void* jitless_hook_mmap(void *addr, size_t len, int prot, int flags, int fd, off
 }
 
 static void *machOChainedFixupsValidLinkedit;
+static void *machOHeaderValidLinkeditStructure;
 static void *machoErrorCtor;
 
-void bypass_seg_count_check(void (^block)(void)) {
+void bypass_linkedit_checks(void (^block)(void)) {
     void *validLinkedit = findDyldSymbolWithCache(@"__ZNK6mach_o13ChainedFixups13validLinkeditEybNSt3__14spanIKNS_13MappedSegmentELm18446744073709551615EEEb", &machOChainedFixupsValidLinkedit);
+    void *validLinkeditStructure = findDyldSymbolWithCache(@"__ZNK6mach_o6Header22validStructureLinkeditERKNS_6PolicyEy", &machOHeaderValidLinkeditStructure);
     arm_debug_state64_t origValidLinkeditDebugState = {0};
     exception_mask_t validLinkeditMask = EXC_MASK_BREAKPOINT;
     mach_msg_type_number_t validLinkeditMasksCnt = 1;
@@ -850,7 +852,8 @@ void bypass_seg_count_check(void (^block)(void)) {
     exception_behavior_t validLinkeditBehavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
     thread_state_flavor_t validLinkeditFlavor = ARM_THREAD_STATE64;
     mach_port_t thread = pthread_mach_thread_np(pthread_self());
-    if(validLinkedit) {
+    BOOL installedBreakpoints = (validLinkedit != NULL || validLinkeditStructure != NULL);
+    if (installedBreakpoints) {
         ensureBreakpointExceptionHandler();
         validLinkeditHandler = excPort;
         thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origValidLinkeditDebugState, &(mach_msg_type_number_t){ARM_DEBUG_STATE64_COUNT});
@@ -858,14 +861,20 @@ void bypass_seg_count_check(void (^block)(void)) {
         assert(validLinkeditMasksCnt == 1);
 
         arm_debug_state64_t hookDebugState = origValidLinkeditDebugState;
-        hookDebugState.__bvr[1] = (uint64_t)validLinkedit;
-        hookDebugState.__bcr[1] = 0x1e5;
+        if (validLinkedit) {
+            hookDebugState.__bvr[1] = (uint64_t)validLinkedit;
+            hookDebugState.__bcr[1] = 0x1e5;
+        }
+        if (validLinkeditStructure) {
+            hookDebugState.__bvr[2] = (uint64_t)validLinkeditStructure;
+            hookDebugState.__bcr[2] = 0x1e5;
+        }
         thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
     }
 
     block();
     
-    if(validLinkedit) {
+    if (installedBreakpoints) {
         thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origValidLinkeditDebugState, ARM_DEBUG_STATE64_COUNT);
         thread_swap_exception_ports(thread, validLinkeditMask, validLinkeditHandler, validLinkeditBehavior, validLinkeditFlavor, &validLinkeditMask, &validLinkeditMasksCnt, &validLinkeditHandler, &validLinkeditBehavior, &validLinkeditFlavor);
     }
@@ -912,7 +921,8 @@ kern_return_t catch_mach_exception_raise_state( mach_port_t exception_port, exce
         *new_stateCnt = old_stateCnt;
         arm_thread_state64_set_pc_fptr(*new, jitless_hook_mmap);
         return KERN_SUCCESS;
-    } else if (pc == (uint64_t)machOChainedFixupsValidLinkedit) {
+    } else if ((machOChainedFixupsValidLinkedit && pc == (uint64_t)machOChainedFixupsValidLinkedit) ||
+               (machOHeaderValidLinkeditStructure && pc == (uint64_t)machOHeaderValidLinkeditStructure)) {
         *new = *old;
         *new_stateCnt = old_stateCnt;
         static char emptyValidLinkeditBuffer[100] = "Create an issue on LiveContainer GitHub if you see this.";

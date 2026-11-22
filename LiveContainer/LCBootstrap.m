@@ -364,7 +364,7 @@ NSString *LCRunGuestExtension(NSDictionary *request, int argc, char *argv[], cha
         handle = dlopen_nolock(bundle.executablePath.fileSystemRepresentation, RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST);
     };
     NSDictionary *patchInfo = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"LCAppExtension.plist"]];
-    if ([patchInfo[@"segCountMismatch"] boolValue]) bypass_seg_count_check(load);
+    if ([patchInfo[@"segCountMismatch"] boolValue]) bypass_linkedit_checks(load);
     else load();
     if (!handle) {
         const char *error = dlerror();
@@ -722,7 +722,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     };
     
     if([guestAppInfo[@"segCountMismatch"] boolValue]) {
-        bypass_seg_count_check(dlopenBlock);
+        bypass_linkedit_checks(dlopenBlock);
     } else {
         dlopenBlock();
     }

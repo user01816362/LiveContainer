@@ -238,6 +238,13 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
             if (loadCommandSegCount != get_chained_fixups_seg_count((void *)header, (struct linkedit_data_command *)command)) {
                 ans |= PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH;
             }
+        } else if (command->cmd == LC_SYMTAB) {
+            if (command->cmdsize >= sizeof(struct symtab_command)) {
+                struct symtab_command *symtabCmd = (struct symtab_command *)command;
+                if (symtabCmd->stroff & 7) {
+                    ans |= PATCH_EXEC_RESULT_MISALIGNED_LINKEDIT_STRING_POOL;
+                }
+            }
         }
 
         command = (struct load_command *)((uint8_t *)command + command->cmdsize);
