@@ -260,6 +260,7 @@ struct LCFileExplorerView: View {
                         entry: entry,
                         rootURL: root.rootURL,
                         needsSecurityScope: root.needsSecurityScope,
+                        isReadOnly: root.isReadOnly,
                         onInspectBinary: onInspectBinary
                     )
                 } label: {

@@ -15,6 +15,7 @@ struct LCFilePreviewView: View {
     let entry: LCFileEntry
     let rootURL: URL
     let needsSecurityScope: Bool
+    var isReadOnly: Bool = true
     var onInspectBinary: ((URL) -> Void)? = nil
 
     @State private var forceHexMode = false
@@ -51,7 +52,8 @@ struct LCFilePreviewView: View {
                     LCPlistViewerView(
                         fileURL: entry.url,
                         rootURL: rootURL,
-                        needsSecurityScope: needsSecurityScope
+                        needsSecurityScope: needsSecurityScope,
+                        isReadOnly: isReadOnly
                     )
                 case .sqlite:
                     LCSQLiteViewerView(

@@ -106,7 +106,24 @@ extension LCAppBannerViewController {
 
     nonisolated private static func resetClonedAppInfo(at clonedBundleURL: URL, fileManager: FileManager) throws {
         let lcAppInfoPath = clonedBundleURL.appendingPathComponent("LCAppInfo.plist")
+        let infoPlistURL = clonedBundleURL.appendingPathComponent("Info.plist")
         if fileManager.fileExists(atPath: lcAppInfoPath.path) {
+            if let lcData = try? Data(contentsOf: lcAppInfoPath),
+               let lcDict = try? PropertyListSerialization.propertyList(from: lcData, format: nil) as? [String: Any],
+               (lcDict["doUseLCBundleId"] as? NSNumber)?.boolValue == true,
+               let originalBundleId = lcDict["LCOrignalBundleIdentifier"] as? String,
+               !originalBundleId.isEmpty,
+               fileManager.fileExists(atPath: infoPlistURL.path),
+               let infoData = try? Data(contentsOf: infoPlistURL) {
+                var format: PropertyListSerialization.PropertyListFormat = .binary
+                if var infoDict = try? PropertyListSerialization.propertyList(from: infoData, format: &format) as? [String: Any] {
+                    infoDict["CFBundleIdentifier"] = originalBundleId
+                    let writeFormat: PropertyListSerialization.PropertyListFormat = (format == .xml) ? .xml : .binary
+                    if let updatedData = try? PropertyListSerialization.data(fromPropertyList: infoDict, format: writeFormat, options: 0) {
+                        try updatedData.write(to: infoPlistURL, options: .atomic)
+                    }
+                }
+            }
             try fileManager.removeItem(at: lcAppInfoPath)
         }
 

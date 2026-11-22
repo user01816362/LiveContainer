@@ -58,8 +58,26 @@ struct LCAppSettingsView: View {
     var body: some View {
         Form {
             Section {
+                let _ = model.metadataRevision
+                HStack {
+                    Text("App Name")
+                    Spacer()
+                    Text(model.displayName)
+                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
                 HStack {
                     Text("lc.appSettings.bundleId".loc)
+                    Spacer()
+                    Text(model.bundleIdentifier)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
+                HStack {
+                    Text("Bundle Folder")
                     Spacer()
                     Text(appInfo.relativeBundlePath)
                         .foregroundColor(.gray)
@@ -67,6 +85,27 @@ struct LCAppSettingsView: View {
                         .textSelection(.enabled)
                 }
                 LCAppSettingsVersionRow(model: model)
+                NavigationLink {
+                    LCAppMetadataEditorView(model: model)
+                } label: {
+                    HStack(spacing: 8) {
+                        Label("Edit App Name, Bundle ID & Version", systemImage: "pencil.and.list.clipboard")
+                        Spacer()
+                        if appInfo.hasOriginalMetadataBackup() {
+                            Text("Edited")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(Color.blue)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.14), in: .capsule)
+                        }
+                    }
+                }
+                NavigationLink {
+                    LCAppInfoPlistEditorView(model: model)
+                } label: {
+                    Label("Edit Info.plist", systemImage: "doc.badge.gearshape")
+                }
                 HStack {
                     Text("lc.appSettings.remark".loc)
                     Spacer()
@@ -503,7 +542,7 @@ struct LCAppSettingsView: View {
             }
 
         }
-        .navigationTitle(appInfo.displayName())
+        .navigationTitle(model.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .alert("lc.common.error".loc, isPresented: $errorShow) {
             Button("lc.common.ok".loc, action: {

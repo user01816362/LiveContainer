@@ -285,7 +285,38 @@ enum LCFileExplorerService {
                 rawText = String(decoding: data, as: UTF8.self)
             }
 
-            return LCPlistDocument(formatLabel: formatLabel, nodes: nodes, rawText: rawText)
+            let isMobileProvision = url.pathExtension.lowercased() == "mobileprovision"
+            let writeFormat: PropertyListSerialization.PropertyListFormat = (format == .xml) ? .xml : .binary
+            return LCPlistDocument(
+                formatLabel: formatLabel,
+                nodes: nodes,
+                rawText: rawText,
+                writeFormatRaw: writeFormat.rawValue,
+                canEdit: !isMobileProvision
+            )
+        }
+    }
+
+    static func savePlistXML(
+        _ xmlText: String,
+        to url: URL,
+        rootURL: URL,
+        needsSecurityScope: Bool,
+        writeFormatRaw: UInt
+    ) throws {
+        guard let xmlData = xmlText.data(using: .utf8) else {
+            throw LCFileExplorerError.invalidPlist("Unable to encode text as UTF-8.")
+        }
+        let plistObject: Any
+        do {
+            plistObject = try PropertyListSerialization.propertyList(from: xmlData, options: [], format: nil)
+        } catch {
+            throw LCFileExplorerError.invalidPlist(error.localizedDescription)
+        }
+        let targetFormat = PropertyListSerialization.PropertyListFormat(rawValue: writeFormatRaw) ?? .binary
+        let serialized = try PropertyListSerialization.data(fromPropertyList: plistObject, format: targetFormat, options: 0)
+        try withSecurityScope(rootURL: rootURL, needsSecurityScope: needsSecurityScope) {
+            try serialized.write(to: url, options: .atomic)
         }
     }
 

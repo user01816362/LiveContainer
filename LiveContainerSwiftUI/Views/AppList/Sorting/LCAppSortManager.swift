@@ -192,5 +192,20 @@ class LCAppSortManager: ObservableObject {
         
         return sortedApps
     }
+
+    func updateBundleIdentifier(oldBundleId: String, newBundleId: String, relativeBundlePath: String) {
+        let oldKey = "\(oldBundleId):\(relativeBundlePath)"
+        let newKey = "\(newBundleId):\(relativeBundlePath)"
+        if let index = customSortOrder.firstIndex(of: oldKey) {
+            customSortOrder[index] = newKey
+        }
+    }
+
+    func refreshSort() {
+        sortedApps = getSortedApps(DataManager.shared.model.apps, sortType: appSortType, customSortOrder: customSortOrder)
+        if DataManager.shared.model.isHiddenAppUnlocked {
+            sortedHiddenApps = getSortedApps(DataManager.shared.model.hiddenApps, sortType: appSortType, customSortOrder: customSortOrder)
+        }
+    }
     
 }

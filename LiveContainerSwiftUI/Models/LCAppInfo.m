@@ -77,66 +77,71 @@
 - (NSMutableArray<NSString *>*)urlSchemes {
     // find all url schemes
     NSMutableArray* urlSchemes = [[NSMutableArray alloc] init];
-    int nowSchemeCount = 0;
-    if (_infoPlist[@"CFBundleURLTypes"]) {
-        NSMutableArray* urlTypes = _infoPlist[@"CFBundleURLTypes"];
+    id rawUrlTypes = _infoPlist[@"CFBundleURLTypes"];
+    if (![rawUrlTypes isKindOfClass:NSArray.class]) {
+        return urlSchemes;
+    }
 
-        for(int i = 0; i < [urlTypes count]; ++i) {
-            NSMutableDictionary* nowUrlType = [urlTypes objectAtIndex:i];
-            if (!nowUrlType[@"CFBundleURLSchemes"]){
-                continue;
-            }
-            NSMutableArray *schemes = nowUrlType[@"CFBundleURLSchemes"];
-            for(int j = 0; j < [schemes count]; ++j) {
-                [urlSchemes insertObject:[schemes objectAtIndex:j] atIndex:nowSchemeCount];
-                ++nowSchemeCount;
+    for (id item in (NSArray *)rawUrlTypes) {
+        if (![item isKindOfClass:NSDictionary.class]) {
+            continue;
+        }
+        id schemes = ((NSDictionary *)item)[@"CFBundleURLSchemes"];
+        if (![schemes isKindOfClass:NSArray.class]) {
+            continue;
+        }
+        for (id scheme in (NSArray *)schemes) {
+            if ([scheme isKindOfClass:NSString.class] && [(NSString *)scheme length] > 0) {
+                [urlSchemes addObject:scheme];
             }
         }
     }
-    
+
     return urlSchemes;
 }
 
 - (NSString*)displayName {
-    if (_infoPlist[@"CFBundleDisplayName"]) {
-        return _infoPlist[@"CFBundleDisplayName"];
-    } else if (_infoPlist[@"CFBundleName"]) {
-        return _infoPlist[@"CFBundleName"];
-    } else if (_infoPlist[@"CFBundleExecutable"]) {
-        return _infoPlist[@"CFBundleExecutable"];
-    } else {
-        return @"App Corrupted, Please Reinstall This App";
+    id disp = _infoPlist[@"CFBundleDisplayName"];
+    if ([disp isKindOfClass:NSString.class] && [(NSString *)disp length] > 0) {
+        return disp;
     }
+    id name = _infoPlist[@"CFBundleName"];
+    if ([name isKindOfClass:NSString.class] && [(NSString *)name length] > 0) {
+        return name;
+    }
+    id exec = _infoPlist[@"CFBundleExecutable"];
+    if ([exec isKindOfClass:NSString.class] && [(NSString *)exec length] > 0) {
+        return exec;
+    }
+    return @"App Corrupted, Please Reinstall This App";
 }
 
 - (NSString*)shortVersion {
-    return _infoPlist[@"CFBundleShortVersionString"];
+    id val = _infoPlist[@"CFBundleShortVersionString"];
+    return [val isKindOfClass:NSString.class] ? val : nil;
 }
 
 - (NSString*)buildVersion {
-    return _infoPlist[@"CFBundleVersion"];
+    id val = _infoPlist[@"CFBundleVersion"];
+    return [val isKindOfClass:NSString.class] ? val : nil;
 }
 
 - (NSString*)version {
-    NSString* version = _infoPlist[@"CFBundleShortVersionString"];
+    NSString* version = [self shortVersion];
     if (!version) {
-        version = _infoPlist[@"CFBundleVersion"];
+        version = [self buildVersion];
     }
-    if(version) {
-        return version;
-    } else {
-        return @"Unknown";
-    }
+    return version ?: @"Unknown";
 }
 
 - (NSString*)bundleIdentifier {
-    NSString* ans = nil;
+    id ans = nil;
     if([self doUseLCBundleId]) {
         ans = _info[@"LCOrignalBundleIdentifier"];
     } else {
         ans = _infoPlist[@"CFBundleIdentifier"];
     }
-    if(ans) {
+    if([ans isKindOfClass:NSString.class] && [(NSString *)ans length] > 0) {
         return ans;
     } else {
         return @"Unknown";
@@ -1068,6 +1073,628 @@
 - (void)setExportTweakSymbolsGlobally:(bool)exportTweakSymbolsGlobally {
     _info[@"exportTweakSymbolsGlobally"] = @(exportTweakSymbolsGlobally);
     [self save];
+}
+
+#pragma mark - App Metadata & Info.plist Editing
+
+- (nullable NSString *)bundleName {
+    id val = _infoPlist[@"CFBundleName"];
+    return [val isKindOfClass:NSString.class] ? val : nil;
+}
+
+- (nullable NSString *)executableName {
+    id val = _infoPlist[@"CFBundleExecutable"];
+    return [val isKindOfClass:NSString.class] ? val : nil;
+}
+
+- (nullable NSString *)minimumOSVersion {
+    id val = _infoPlist[@"MinimumOSVersion"];
+    return [val isKindOfClass:NSString.class] ? val : nil;
+}
+
+- (BOOL)hasOriginalMetadataBackup {
+    return [_info[@"LCFactoryOriginalInfoPlistData"] isKindOfClass:NSData.class];
+}
+
+- (NSDictionary<NSString *, id> *)editableInfoPlistDictionary {
+    NSMutableDictionary *snapshot = nil;
+    NSData *serialized = [NSPropertyListSerialization dataWithPropertyList:_infoPlist ?: @{}
+                                                                    format:NSPropertyListBinaryFormat_v1_0
+                                                                   options:0
+                                                                     error:nil];
+    if (serialized) {
+        snapshot = [NSPropertyListSerialization propertyListWithData:serialized
+                                                             options:NSPropertyListMutableContainersAndLeaves
+                                                              format:NULL
+                                                               error:nil];
+    }
+    if (![snapshot isKindOfClass:NSMutableDictionary.class]) {
+        snapshot = [_infoPlist mutableCopy] ?: [[NSMutableDictionary alloc] init];
+    }
+    if ([self doUseLCBundleId]) {
+        NSString *originalId = _info[@"LCOrignalBundleIdentifier"];
+        if ([originalId isKindOfClass:NSString.class] && originalId.length > 0) {
+            snapshot[@"CFBundleIdentifier"] = originalId;
+        }
+    }
+    return snapshot;
+}
+
+- (nullable NSDictionary<NSString *, id> *)originalInfoPlistDictionary {
+    NSData *backupData = _info[@"LCFactoryOriginalInfoPlistData"];
+    if (![backupData isKindOfClass:NSData.class]) {
+        return nil;
+    }
+    id decoded = [NSPropertyListSerialization propertyListWithData:backupData
+                                                           options:NSPropertyListImmutable
+                                                            format:NULL
+                                                             error:nil];
+    return [decoded isKindOfClass:NSDictionary.class] ? decoded : nil;
+}
+
+- (NSArray<NSString *> *)appExtensionNames {
+    NSString *pluginsPath = [_bundlePath stringByAppendingPathComponent:@"PlugIns"];
+    NSArray<NSString *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtPath:pluginsPath error:nil];
+    if (!items) {
+        return @[];
+    }
+    NSMutableArray<NSString *> *extensions = [[NSMutableArray alloc] init];
+    for (NSString *name in items) {
+        if ([name.pathExtension.lowercaseString isEqualToString:@"appex"]) {
+            [extensions addObject:name];
+        }
+    }
+    [extensions sortUsingSelector:@selector(localizedStandardCompare:)];
+    return extensions;
+}
+
+- (NSError *)lcMetadataErrorWithCode:(NSInteger)code message:(NSString *)message {
+    return [NSError errorWithDomain:@"com.livecontainer.metadata"
+                               code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message ?: @"Metadata operation failed."}];
+}
+
+- (BOOL)lcValidateBundleIdentifier:(NSString *)bundleId error:(NSError **)error {
+    if (![bundleId isKindOfClass:NSString.class] || bundleId.length == 0) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1001 message:@"Bundle Identifier cannot be empty."];
+        }
+        return NO;
+    }
+    if ([bundleId rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location != NSNotFound ||
+        [bundleId containsString:@"/"]) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1002 message:@"Bundle Identifier cannot contain spaces, newlines, or slashes."];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)lcValidateExecutableName:(NSString *)execName error:(NSError **)error {
+    if (![execName isKindOfClass:NSString.class] || execName.length == 0) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1005 message:@"Info.plist must include a non-empty CFBundleExecutable string."];
+        }
+        return NO;
+    }
+    if ([execName containsString:@"/"] ||
+        [execName containsString:@"\0"] ||
+        [execName isEqualToString:@"."] ||
+        [execName isEqualToString:@".."]) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1009 message:@"CFBundleExecutable cannot contain path separators or traversal segments."];
+        }
+        return NO;
+    }
+    NSString *standardizedBundle = [[NSURL fileURLWithPath:_bundlePath isDirectory:YES] URLByStandardizingPath].path;
+    NSString *bundlePrefix = [standardizedBundle hasSuffix:@"/"] ? standardizedBundle : [standardizedBundle stringByAppendingString:@"/"];
+    NSString *resolvedExec = [[NSURL fileURLWithPath:[_bundlePath stringByAppendingPathComponent:execName]] URLByStandardizingPath].path;
+    if (![resolvedExec hasPrefix:bundlePrefix]) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1010 message:@"CFBundleExecutable must stay inside the app bundle."];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (nullable NSData *)serializedOriginalInfoPlistSnapshot {
+    NSMutableDictionary *snapshot = [[self editableInfoPlistDictionary] mutableCopy];
+    return [NSPropertyListSerialization dataWithPropertyList:snapshot ?: @{}
+                                                      format:NSPropertyListBinaryFormat_v1_0
+                                                     options:0
+                                                       error:nil];
+}
+
+- (void)commitOriginalMetadataBackupSnapshot:(nullable NSData *)backupData {
+    if ([self hasOriginalMetadataBackup] || !backupData) {
+        return;
+    }
+    _info[@"LCFactoryOriginalInfoPlistData"] = backupData;
+    _info[@"LCFactoryInstalledSourceVersion"] = [_info[@"LCInstalledSourceVersion"] isKindOfClass:NSString.class] ? _info[@"LCInstalledSourceVersion"] : @"";
+    _info[@"LCFactoryInstalledSourceBuildVersion"] = [_info[@"LCInstalledSourceBuildVersion"] isKindOfClass:NSString.class] ? _info[@"LCInstalledSourceBuildVersion"] : @"";
+}
+
+- (BOOL)writeInfoPlistDictionaryAtomically:(NSDictionary *)dict error:(NSError **)error {
+    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:dict
+                                                                   format:NSPropertyListBinaryFormat_v1_0
+                                                                  options:0
+                                                                    error:error];
+    if (!plistData) {
+        return NO;
+    }
+    NSString *infoPath = [_bundlePath stringByAppendingPathComponent:@"Info.plist"];
+    return [plistData writeToFile:infoPath options:NSDataWritingAtomic error:error];
+}
+
+- (BOOL)applyCustomMetadataWithDisplayName:(nullable NSString *)displayName
+                                bundleName:(nullable NSString *)bundleName
+                          bundleIdentifier:(nullable NSString *)bundleIdentifier
+                              shortVersion:(nullable NSString *)shortVersion
+                              buildVersion:(nullable NSString *)buildVersion
+                          minimumOSVersion:(nullable NSString *)minimumOSVersion
+                  updateExtensionBundleIds:(BOOL)updateExtensions
+                      updateLocalizedNames:(BOOL)updateLocalized
+                                     error:(NSError * _Nullable * _Nullable)error {
+    NSString *trimmedDisplayName = [displayName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *trimmedBundleName = [bundleName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *trimmedBundleId = [bundleIdentifier stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *trimmedShortVersion = [shortVersion stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *trimmedBuildVersion = [buildVersion stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *trimmedMinOS = [minimumOSVersion stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+
+    if (bundleIdentifier != nil) {
+        if (![self lcValidateBundleIdentifier:trimmedBundleId error:error]) {
+            return NO;
+        }
+    } else {
+        trimmedBundleId = [self bundleIdentifier];
+        if (![self lcValidateBundleIdentifier:trimmedBundleId error:error]) {
+            return NO;
+        }
+    }
+
+    NSString *effectiveName = trimmedDisplayName.length > 0 ? trimmedDisplayName : trimmedBundleName;
+    if (effectiveName.length == 0) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1003 message:@"App Name cannot be empty."];
+        }
+        return NO;
+    }
+
+    NSString *oldBundleId = [[self bundleIdentifier] copy];
+    NSString *oldEffectiveDisplayName = [_infoPlist[@"CFBundleDisplayName"] isKindOfClass:NSString.class]
+        ? _infoPlist[@"CFBundleDisplayName"]
+        : [self displayName];
+    NSString *oldBundleName = [_infoPlist[@"CFBundleName"] isKindOfClass:NSString.class]
+        ? _infoPlist[@"CFBundleName"]
+        : @"";
+    BOOL hadExplicitDisplayName = [_infoPlist[@"CFBundleDisplayName"] isKindOfClass:NSString.class] && [(NSString *)_infoPlist[@"CFBundleDisplayName"] length] > 0;
+    BOOL displayNameChanged = ![trimmedDisplayName isEqualToString:(oldEffectiveDisplayName ?: @"")];
+    BOOL bundleNameChanged = ![trimmedBundleName isEqualToString:(oldBundleName ?: @"")];
+
+    NSData *pendingBackupSnapshot = [self hasOriginalMetadataBackup] ? nil : [self serializedOriginalInfoPlistSnapshot];
+
+    NSMutableDictionary *updatedInfoPlist = [[self editableInfoPlistDictionary] mutableCopy];
+    if (!updatedInfoPlist) {
+        updatedInfoPlist = [[NSMutableDictionary alloc] init];
+    }
+
+    if (hadExplicitDisplayName || displayNameChanged) {
+        if (trimmedDisplayName.length > 0) {
+            updatedInfoPlist[@"CFBundleDisplayName"] = trimmedDisplayName;
+        } else {
+            [updatedInfoPlist removeObjectForKey:@"CFBundleDisplayName"];
+        }
+    }
+
+    NSString *effectiveBundleName = trimmedBundleName.length > 0 ? trimmedBundleName : trimmedDisplayName;
+    if (effectiveBundleName.length > 0 && (![oldBundleName isEqualToString:@""] || bundleNameChanged || trimmedBundleName.length > 0)) {
+        updatedInfoPlist[@"CFBundleName"] = effectiveBundleName;
+    }
+
+    if ([self doUseLCBundleId]) {
+        updatedInfoPlist[@"CFBundleIdentifier"] = NSBundle.mainBundle.bundleIdentifier ?: trimmedBundleId;
+    } else {
+        updatedInfoPlist[@"CFBundleIdentifier"] = trimmedBundleId;
+    }
+
+    if (shortVersion != nil) {
+        if (trimmedShortVersion.length > 0) {
+            updatedInfoPlist[@"CFBundleShortVersionString"] = trimmedShortVersion;
+        } else {
+            [updatedInfoPlist removeObjectForKey:@"CFBundleShortVersionString"];
+        }
+    }
+
+    if (buildVersion != nil) {
+        if (trimmedBuildVersion.length > 0) {
+            updatedInfoPlist[@"CFBundleVersion"] = trimmedBuildVersion;
+        } else {
+            [updatedInfoPlist removeObjectForKey:@"CFBundleVersion"];
+        }
+    }
+
+    if (minimumOSVersion != nil) {
+        if (trimmedMinOS.length > 0) {
+            updatedInfoPlist[@"MinimumOSVersion"] = trimmedMinOS;
+        } else {
+            [updatedInfoPlist removeObjectForKey:@"MinimumOSVersion"];
+        }
+    }
+
+    if (![self writeInfoPlistDictionaryAtomically:updatedInfoPlist error:error]) {
+        return NO;
+    }
+
+    // Only mutate _info / _infoPlist after the atomic Info.plist write succeeded.
+    [self commitOriginalMetadataBackupSnapshot:pendingBackupSnapshot];
+    if ([self doUseLCBundleId]) {
+        _info[@"LCOrignalBundleIdentifier"] = trimmedBundleId;
+    }
+    _infoPlist = updatedInfoPlist;
+
+    if (shortVersion != nil && [_info[@"LCInstalledSourceVersion"] isKindOfClass:NSString.class]) {
+        if (trimmedShortVersion.length > 0) {
+            _info[@"LCInstalledSourceVersion"] = trimmedShortVersion;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceVersion"];
+        }
+    }
+    if (buildVersion != nil && [_info[@"LCInstalledSourceBuildVersion"] isKindOfClass:NSString.class]) {
+        if (trimmedBuildVersion.length > 0) {
+            _info[@"LCInstalledSourceBuildVersion"] = trimmedBuildVersion;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceBuildVersion"];
+        }
+    }
+
+    if (updateLocalized && (displayNameChanged || bundleNameChanged) && effectiveName.length > 0) {
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSArray<NSString *> *bundleItems = [fm contentsOfDirectoryAtPath:_bundlePath error:nil];
+        NSMutableDictionary<NSString *, NSData *> *stringsBackups = [_info[@"LCFactoryOriginalInfoPlistStrings"] mutableCopy];
+        if (![stringsBackups isKindOfClass:NSMutableDictionary.class]) {
+            stringsBackups = [[NSMutableDictionary alloc] init];
+        }
+        BOOL backupAdded = NO;
+
+        for (NSString *item in bundleItems) {
+            if (![item.pathExtension.lowercaseString isEqualToString:@"lproj"]) {
+                continue;
+            }
+            NSString *stringsPath = [[_bundlePath stringByAppendingPathComponent:item] stringByAppendingPathComponent:@"InfoPlist.strings"];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:stringsPath isDirectory:&isDir] || isDir) {
+                continue;
+            }
+            NSData *rawData = [NSData dataWithContentsOfFile:stringsPath];
+            if (!rawData) {
+                continue;
+            }
+            id parsed = [NSPropertyListSerialization propertyListWithData:rawData
+                                                                  options:NSPropertyListMutableContainersAndLeaves
+                                                                   format:NULL
+                                                                    error:nil];
+            if (![parsed isKindOfClass:NSMutableDictionary.class]) {
+                continue;
+            }
+            NSMutableDictionary *localizedDict = (NSMutableDictionary *)parsed;
+            BOOL touched = NO;
+            if (localizedDict[@"CFBundleDisplayName"] != nil) {
+                localizedDict[@"CFBundleDisplayName"] = effectiveName;
+                touched = YES;
+            }
+            if (localizedDict[@"CFBundleName"] != nil) {
+                localizedDict[@"CFBundleName"] = effectiveBundleName.length > 0 ? effectiveBundleName : effectiveName;
+                touched = YES;
+            }
+            if (!touched) {
+                continue;
+            }
+            if ([localizedDict writeBinToFile:stringsPath atomically:YES]) {
+                if (!stringsBackups[item]) {
+                    stringsBackups[item] = rawData;
+                    backupAdded = YES;
+                }
+            }
+        }
+        if (backupAdded) {
+            _info[@"LCFactoryOriginalInfoPlistStrings"] = stringsBackups;
+        }
+    }
+
+    if (updateExtensions &&
+        oldBundleId.length > 0 &&
+        ![oldBundleId isEqualToString:@"Unknown"] &&
+        ![oldBundleId isEqualToString:trimmedBundleId]) {
+        NSString *pluginsPath = [_bundlePath stringByAppendingPathComponent:@"PlugIns"];
+        NSArray<NSString *> *pluginNames = [self appExtensionNames];
+        NSMutableDictionary<NSString *, NSData *> *extBackups = [_info[@"LCFactoryOriginalExtensionInfoPlists"] mutableCopy];
+        if (![extBackups isKindOfClass:NSMutableDictionary.class]) {
+            extBackups = [[NSMutableDictionary alloc] init];
+        }
+        BOOL extBackupAdded = NO;
+        NSString *oldPrefix = [oldBundleId stringByAppendingString:@"."];
+        NSString *newPrefix = [trimmedBundleId stringByAppendingString:@"."];
+
+        for (NSString *appexName in pluginNames) {
+            NSString *extInfoPath = [[pluginsPath stringByAppendingPathComponent:appexName] stringByAppendingPathComponent:@"Info.plist"];
+            NSData *rawExtData = [NSData dataWithContentsOfFile:extInfoPath];
+            if (!rawExtData) {
+                continue;
+            }
+            id parsed = [NSPropertyListSerialization propertyListWithData:rawExtData
+                                                                  options:NSPropertyListMutableContainersAndLeaves
+                                                                   format:NULL
+                                                                    error:nil];
+            if (![parsed isKindOfClass:NSMutableDictionary.class]) {
+                continue;
+            }
+            NSMutableDictionary *extPlist = (NSMutableDictionary *)parsed;
+            BOOL touched = NO;
+            NSString *extBundleId = extPlist[@"CFBundleIdentifier"];
+            if ([extBundleId isKindOfClass:NSString.class]) {
+                if ([extBundleId isEqualToString:oldBundleId]) {
+                    extPlist[@"CFBundleIdentifier"] = trimmedBundleId;
+                    touched = YES;
+                } else if ([extBundleId hasPrefix:oldPrefix]) {
+                    extPlist[@"CFBundleIdentifier"] = [newPrefix stringByAppendingString:[extBundleId substringFromIndex:oldPrefix.length]];
+                    touched = YES;
+                }
+            }
+            id nsExtension = extPlist[@"NSExtension"];
+            if ([nsExtension isKindOfClass:NSMutableDictionary.class]) {
+                id extAttrs = nsExtension[@"NSExtensionAttributes"];
+                if ([extAttrs isKindOfClass:NSMutableDictionary.class]) {
+                    NSString *wkAppId = extAttrs[@"WKAppBundleIdentifier"];
+                    if ([wkAppId isKindOfClass:NSString.class] && [wkAppId isEqualToString:oldBundleId]) {
+                        extAttrs[@"WKAppBundleIdentifier"] = trimmedBundleId;
+                        touched = YES;
+                    }
+                }
+            }
+            if (!touched) {
+                continue;
+            }
+            if ([extPlist writeBinToFile:extInfoPath atomically:YES]) {
+                if (!extBackups[appexName]) {
+                    extBackups[appexName] = rawExtData;
+                    extBackupAdded = YES;
+                }
+            }
+        }
+        if (extBackupAdded) {
+            _info[@"LCFactoryOriginalExtensionInfoPlists"] = extBackups;
+        }
+    }
+
+    [self save];
+    return YES;
+}
+
+- (BOOL)replaceInfoPlistWithDictionary:(NSDictionary<NSString *, id> *)newInfoPlist
+                                 error:(NSError * _Nullable * _Nullable)error {
+    if (![newInfoPlist isKindOfClass:NSDictionary.class]) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1004 message:@"Top-level Info.plist must be a dictionary."];
+        }
+        return NO;
+    }
+
+    id execVal = newInfoPlist[@"CFBundleExecutable"];
+    if (![execVal isKindOfClass:NSString.class] || ![self lcValidateExecutableName:execVal error:error]) {
+        return NO;
+    }
+
+    id bundleIdVal = newInfoPlist[@"CFBundleIdentifier"];
+    NSString *trimmedBundleId = [bundleIdVal isKindOfClass:NSString.class]
+        ? [(NSString *)bundleIdVal stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    if (![self lcValidateBundleIdentifier:trimmedBundleId error:error]) {
+        return NO;
+    }
+
+    NSArray<NSString *> *stringKeys = @[
+        @"CFBundleDisplayName",
+        @"CFBundleName",
+        @"CFBundleShortVersionString",
+        @"CFBundleVersion",
+        @"MinimumOSVersion"
+    ];
+    for (NSString *key in stringKeys) {
+        id value = newInfoPlist[key];
+        if (value != nil && ![value isKindOfClass:NSString.class]) {
+            if (error) {
+                *error = [self lcMetadataErrorWithCode:1011 message:[NSString stringWithFormat:@"%@ must be a String value.", key]];
+            }
+            return NO;
+        }
+    }
+
+    id urlTypes = newInfoPlist[@"CFBundleURLTypes"];
+    if (urlTypes != nil) {
+        if (![urlTypes isKindOfClass:NSArray.class]) {
+            if (error) {
+                *error = [self lcMetadataErrorWithCode:1012 message:@"CFBundleURLTypes must be an Array of Dictionaries."];
+            }
+            return NO;
+        }
+        for (id entry in (NSArray *)urlTypes) {
+            if (![entry isKindOfClass:NSDictionary.class]) {
+                if (error) {
+                    *error = [self lcMetadataErrorWithCode:1012 message:@"CFBundleURLTypes must contain Dictionary items."];
+                }
+                return NO;
+            }
+        }
+    }
+
+    NSData *serialized = [NSPropertyListSerialization dataWithPropertyList:newInfoPlist
+                                                                    format:NSPropertyListBinaryFormat_v1_0
+                                                                   options:0
+                                                                     error:error];
+    if (!serialized) {
+        return NO;
+    }
+
+    NSMutableDictionary *mutablePlist = [NSPropertyListSerialization propertyListWithData:serialized
+                                                                                  options:NSPropertyListMutableContainersAndLeaves
+                                                                                   format:NULL
+                                                                                    error:error];
+    if (![mutablePlist isKindOfClass:NSMutableDictionary.class]) {
+        if (error && !*error) {
+            *error = [self lcMetadataErrorWithCode:1006 message:@"Failed to encode Info.plist dictionary."];
+        }
+        return NO;
+    }
+
+    NSData *pendingBackupSnapshot = [self hasOriginalMetadataBackup] ? nil : [self serializedOriginalInfoPlistSnapshot];
+
+    if ([self doUseLCBundleId]) {
+        mutablePlist[@"CFBundleIdentifier"] = NSBundle.mainBundle.bundleIdentifier ?: trimmedBundleId;
+    } else {
+        mutablePlist[@"CFBundleIdentifier"] = trimmedBundleId;
+    }
+
+    if (![self writeInfoPlistDictionaryAtomically:mutablePlist error:error]) {
+        return NO;
+    }
+
+    // Commit _info / _infoPlist mutations only after atomic Info.plist write succeeds.
+    [self commitOriginalMetadataBackupSnapshot:pendingBackupSnapshot];
+    if ([self doUseLCBundleId]) {
+        _info[@"LCOrignalBundleIdentifier"] = trimmedBundleId;
+    }
+    _infoPlist = mutablePlist;
+
+    if ([_info[@"LCInstalledSourceVersion"] isKindOfClass:NSString.class]) {
+        NSString *newShortVersion = [mutablePlist[@"CFBundleShortVersionString"] isKindOfClass:NSString.class]
+            ? mutablePlist[@"CFBundleShortVersionString"]
+            : @"";
+        if (newShortVersion.length > 0) {
+            _info[@"LCInstalledSourceVersion"] = newShortVersion;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceVersion"];
+        }
+    }
+    if ([_info[@"LCInstalledSourceBuildVersion"] isKindOfClass:NSString.class]) {
+        NSString *newBuildVersion = [mutablePlist[@"CFBundleVersion"] isKindOfClass:NSString.class]
+            ? mutablePlist[@"CFBundleVersion"]
+            : @"";
+        if (newBuildVersion.length > 0) {
+            _info[@"LCInstalledSourceBuildVersion"] = newBuildVersion;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceBuildVersion"];
+        }
+    }
+
+    [self clearIconCache];
+    [self save];
+    return YES;
+}
+
+- (BOOL)resetInfoPlistToOriginalWithError:(NSError * _Nullable * _Nullable)error {
+    NSData *backupData = _info[@"LCFactoryOriginalInfoPlistData"];
+    if (![backupData isKindOfClass:NSData.class]) {
+        if (error) {
+            *error = [self lcMetadataErrorWithCode:1007 message:@"No original Info.plist backup is available for this app."];
+        }
+        return NO;
+    }
+
+    NSMutableDictionary *restored = [NSPropertyListSerialization propertyListWithData:backupData
+                                                                              options:NSPropertyListMutableContainersAndLeaves
+                                                                               format:NULL
+                                                                                error:error];
+    if (![restored isKindOfClass:NSMutableDictionary.class]) {
+        if (error && !*error) {
+            *error = [self lcMetadataErrorWithCode:1008 message:@"Stored Info.plist backup is corrupted."];
+        }
+        return NO;
+    }
+
+    NSString *origId = [restored[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? restored[@"CFBundleIdentifier"] : nil;
+    if ([self doUseLCBundleId]) {
+        restored[@"CFBundleIdentifier"] = NSBundle.mainBundle.bundleIdentifier ?: origId ?: @"";
+    }
+
+    if (![self writeInfoPlistDictionaryAtomically:restored error:error]) {
+        return NO;
+    }
+
+    if ([self doUseLCBundleId] && origId.length > 0) {
+        _info[@"LCOrignalBundleIdentifier"] = origId;
+    }
+
+    NSDictionary<NSString *, NSData *> *stringsBackups = _info[@"LCFactoryOriginalInfoPlistStrings"];
+    if ([stringsBackups isKindOfClass:NSDictionary.class]) {
+        [stringsBackups enumerateKeysAndObjectsUsingBlock:^(NSString *lprojName, NSData *rawData, BOOL *stop) {
+            if ([lprojName isKindOfClass:NSString.class] && [rawData isKindOfClass:NSData.class]) {
+                NSString *stringsPath = [[_bundlePath stringByAppendingPathComponent:lprojName] stringByAppendingPathComponent:@"InfoPlist.strings"];
+                [rawData writeToFile:stringsPath options:NSDataWritingAtomic error:nil];
+            }
+        }];
+    }
+
+    NSDictionary<NSString *, NSData *> *extBackups = _info[@"LCFactoryOriginalExtensionInfoPlists"];
+    if ([extBackups isKindOfClass:NSDictionary.class]) {
+        NSString *pluginsPath = [_bundlePath stringByAppendingPathComponent:@"PlugIns"];
+        [extBackups enumerateKeysAndObjectsUsingBlock:^(NSString *appexName, NSData *rawData, BOOL *stop) {
+            if ([appexName isKindOfClass:NSString.class] && [rawData isKindOfClass:NSData.class]) {
+                NSString *extInfoPath = [[pluginsPath stringByAppendingPathComponent:appexName] stringByAppendingPathComponent:@"Info.plist"];
+                [rawData writeToFile:extInfoPath options:NSDataWritingAtomic error:nil];
+            }
+        }];
+    }
+
+    NSString *factorySrcVer = _info[@"LCFactoryInstalledSourceVersion"];
+    if ([factorySrcVer isKindOfClass:NSString.class]) {
+        if (factorySrcVer.length > 0) {
+            _info[@"LCInstalledSourceVersion"] = factorySrcVer;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceVersion"];
+        }
+    }
+    NSString *factorySrcBuild = _info[@"LCFactoryInstalledSourceBuildVersion"];
+    if ([factorySrcBuild isKindOfClass:NSString.class]) {
+        if (factorySrcBuild.length > 0) {
+            _info[@"LCInstalledSourceBuildVersion"] = factorySrcBuild;
+        } else {
+            [_info removeObjectForKey:@"LCInstalledSourceBuildVersion"];
+        }
+    }
+
+    [_info removeObjectForKey:@"LCFactoryOriginalInfoPlistData"];
+    [_info removeObjectForKey:@"LCFactoryOriginalInfoPlistStrings"];
+    [_info removeObjectForKey:@"LCFactoryOriginalExtensionInfoPlists"];
+    [_info removeObjectForKey:@"LCFactoryInstalledSourceVersion"];
+    [_info removeObjectForKey:@"LCFactoryInstalledSourceBuildVersion"];
+
+    _infoPlist = restored;
+    [self clearIconCache];
+    [self save];
+    return YES;
+}
+
+- (void)reloadInfoPlistFromDisk {
+    NSString *infoPath = [_bundlePath stringByAppendingPathComponent:@"Info.plist"];
+    NSMutableDictionary *diskDict = [NSMutableDictionary dictionaryWithContentsOfFile:infoPath];
+    if (![diskDict isKindOfClass:NSMutableDictionary.class]) {
+        return;
+    }
+    if ([self doUseLCBundleId]) {
+        NSString *diskId = diskDict[@"CFBundleIdentifier"];
+        NSString *lcId = NSBundle.mainBundle.bundleIdentifier;
+        if ([diskId isKindOfClass:NSString.class] && diskId.length > 0 && lcId.length > 0 && ![diskId isEqualToString:lcId]) {
+            _info[@"LCOrignalBundleIdentifier"] = diskId;
+            diskDict[@"CFBundleIdentifier"] = lcId;
+            [self writeInfoPlistDictionaryAtomically:diskDict error:nil];
+            [self save];
+        }
+    }
+    _infoPlist = diskDict;
+    [self clearIconCache];
 }
 
 @end

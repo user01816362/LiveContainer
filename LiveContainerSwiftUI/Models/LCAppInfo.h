@@ -76,6 +76,26 @@ typedef NS_ENUM(NSInteger, MultitaskSpecified){
 - (NSString * _Null_unspecified)version;
 - (NSString * _Null_unspecified)shortVersion;
 - (NSString * _Null_unspecified)buildVersion;
+- (nullable NSString *)bundleName;
+- (nullable NSString *)executableName;
+- (nullable NSString *)minimumOSVersion;
+- (BOOL)hasOriginalMetadataBackup;
+- (nonnull NSDictionary<NSString *, id> *)editableInfoPlistDictionary;
+- (nullable NSDictionary<NSString *, id> *)originalInfoPlistDictionary;
+- (nonnull NSArray<NSString *> *)appExtensionNames;
+- (BOOL)applyCustomMetadataWithDisplayName:(nullable NSString *)displayName
+                                bundleName:(nullable NSString *)bundleName
+                          bundleIdentifier:(nullable NSString *)bundleIdentifier
+                              shortVersion:(nullable NSString *)shortVersion
+                              buildVersion:(nullable NSString *)buildVersion
+                          minimumOSVersion:(nullable NSString *)minimumOSVersion
+                  updateExtensionBundleIds:(BOOL)updateExtensions
+                      updateLocalizedNames:(BOOL)updateLocalized
+                                     error:(NSError * _Nullable * _Nullable)error;
+- (BOOL)replaceInfoPlistWithDictionary:(nonnull NSDictionary<NSString *, id> *)newInfoPlist
+                                 error:(NSError * _Nullable * _Nullable)error;
+- (BOOL)resetInfoPlistToOriginalWithError:(NSError * _Nullable * _Nullable)error;
+- (void)reloadInfoPlistFromDisk;
 - (NSMutableArray<NSString *> * _Null_unspecified)urlSchemes;
 - (instancetype _Null_unspecified)initWithBundlePath:(NSString * _Null_unspecified)bundlePath;
 - (UIImage * _Null_unspecified)generateLiveContainerWrappedIconWithStyle:(GeneratedIconStyle)style;

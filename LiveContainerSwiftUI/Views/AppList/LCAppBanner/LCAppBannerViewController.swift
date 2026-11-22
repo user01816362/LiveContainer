@@ -248,10 +248,25 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         sectionChildren.append(addToHomeScreenMenu)
 
         let dataExportDisabled: UIMenuElement.Attributes = model.uiSelectedContainer == nil ? [.disabled] : []
+        let metadataEditDisabled: UIMenuElement.Attributes = !isPrimaryLC ? [.disabled] : []
         sectionChildren.append(UIMenu(
             title: "Inspect & Files",
             image: UIImage(systemName: "cpu.fill"),
             children: [
+                UIAction(
+                    title: "Edit App Info & Metadata",
+                    image: UIImage(systemName: "pencil.and.list.clipboard"),
+                    attributes: metadataEditDisabled
+                ) { [weak self] _ in
+                    self?.openAppMetadataEditor()
+                },
+                UIAction(
+                    title: "Edit Info.plist",
+                    image: UIImage(systemName: "doc.badge.gearshape"),
+                    attributes: metadataEditDisabled
+                ) { [weak self] _ in
+                    self?.openInfoPlistEditor()
+                },
                 UIAction(
                     title: "Inspect Binary & Dump",
                     image: UIImage(systemName: "doc.text.magnifyingglass")
@@ -360,6 +375,14 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
 
     private func openSettings() {
         delegate.openNavigationView(view: AnyView(LCAppSettingsView(model: configuration.model)))
+    }
+
+    private func openAppMetadataEditor() {
+        delegate.openNavigationView(view: AnyView(LCAppMetadataEditorView(model: configuration.model)))
+    }
+
+    private func openInfoPlistEditor() {
+        delegate.openNavigationView(view: AnyView(LCAppInfoPlistEditorView(model: configuration.model)))
     }
 
     private func openBinaryInspector() {

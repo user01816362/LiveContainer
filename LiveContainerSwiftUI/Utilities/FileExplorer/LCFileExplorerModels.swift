@@ -128,6 +128,8 @@ struct LCPlistDocument: Sendable {
     let formatLabel: String
     let nodes: [LCPlistNode]
     let rawText: String
+    let writeFormatRaw: UInt
+    let canEdit: Bool
 }
 
 /// Bounded text/JSON preview payload.

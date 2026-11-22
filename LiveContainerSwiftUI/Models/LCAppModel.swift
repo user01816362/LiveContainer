@@ -18,6 +18,7 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
     @Published var isAppRunning = false
     @Published var isSigningInProgress = false
     @Published var signProgress = 0.0
+    @Published var metadataRevision: Int = 0
     private var observer : NSKeyValueObservation?
 
     @Published var uiIsJITNeeded : Bool {
@@ -422,6 +423,122 @@ final class LCAppModel: ObservableObject, Identifiable, Hashable {
             isAppRunning = false
         }
         try await signApp(force: true)
+    }
+
+    func validateCanModifyBundleMetadata() throws {
+        if DataManager.shared.model.multiLCStatus == 2 {
+            throw "App metadata cannot be edited from a secondary LiveContainer."
+        }
+        if DataManager.shared.model.activeDebugApp == self {
+            throw "Close Debug Studio for \(displayName) before editing metadata."
+        }
+        if isAppRunning || isSigningInProgress {
+            throw "Wait until the app finishes launching or signing before editing metadata."
+        }
+        for container in uiContainers {
+            if MultitaskManager.isUsing(container: container.folderName) {
+                throw "Close \(displayName) in Multitask before editing metadata."
+            }
+            if let runningLC = LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) {
+                throw "This app is currently running in \(runningLC). Close it before editing metadata."
+            }
+        }
+    }
+
+    func applyCustomMetadata(
+        displayName: String,
+        bundleName: String,
+        bundleIdentifier: String,
+        shortVersion: String,
+        buildVersion: String,
+        minimumOSVersion: String?,
+        updateExtensionBundleIds: Bool,
+        updateLocalizedNames: Bool,
+        resignAfterSave: Bool
+    ) async throws {
+        try validateCanModifyBundleMetadata()
+        let oldBundleId = appInfo.bundleIdentifier() ?? ""
+        try appInfo.applyCustomMetadata(
+            withDisplayName: displayName,
+            bundleName: bundleName,
+            bundleIdentifier: bundleIdentifier,
+            shortVersion: shortVersion,
+            buildVersion: buildVersion,
+            minimumOSVersion: minimumOSVersion,
+            updateExtensionBundleIds: updateExtensionBundleIds,
+            updateLocalizedNames: updateLocalizedNames
+        )
+        try await finishMetadataMutation(oldBundleId: oldBundleId, resignAfterSave: resignAfterSave)
+    }
+
+    func replaceInfoPlist(_ dictionary: [String: Any], resignAfterSave: Bool) async throws {
+        try validateCanModifyBundleMetadata()
+        let oldBundleId = appInfo.bundleIdentifier() ?? ""
+        try appInfo.replaceInfoPlist(with: dictionary)
+        try await finishMetadataMutation(oldBundleId: oldBundleId, resignAfterSave: resignAfterSave)
+    }
+
+    func resetMetadataToOriginal(resignAfterSave: Bool) async throws {
+        try validateCanModifyBundleMetadata()
+        let oldBundleId = appInfo.bundleIdentifier() ?? ""
+        try appInfo.resetInfoPlistToOriginal()
+        try await finishMetadataMutation(oldBundleId: oldBundleId, resignAfterSave: resignAfterSave)
+    }
+
+    func notifyMetadataReloadedFromDisk() {
+        let oldBundleId = appInfo.bundleIdentifier() ?? ""
+        appInfo.reloadInfoPlistFromDisk()
+        let newBundleId = appInfo.bundleIdentifier() ?? oldBundleId
+        syncContainersAndSharedState(oldBundleId: oldBundleId, newBundleId: newBundleId)
+        metadataRevision &+= 1
+        objectWillChange.send()
+    }
+
+    private func finishMetadataMutation(oldBundleId: String, resignAfterSave: Bool) async throws {
+        let newBundleId = appInfo.bundleIdentifier() ?? oldBundleId
+        syncContainersAndSharedState(oldBundleId: oldBundleId, newBundleId: newBundleId)
+        metadataRevision &+= 1
+        objectWillChange.send()
+
+        if resignAfterSave, !uiDontSign, !uiIs32bit {
+            try await forceResign()
+            metadataRevision &+= 1
+            objectWillChange.send()
+        }
+    }
+
+    private func syncContainersAndSharedState(oldBundleId: String, newBundleId: String) {
+        if !newBundleId.isEmpty && newBundleId != oldBundleId {
+            for container in uiContainers where container.keychainGroupId >= 0 {
+                if container.storageBookMark != nil {
+                    guard let resolvedURL = container.resolvedContainerURL,
+                          resolvedURL.startAccessingSecurityScopedResource() else {
+                        continue
+                    }
+                    defer { resolvedURL.stopAccessingSecurityScopedResource() }
+                    container.makeLCContainerInfoPlist(appIdentifier: newBundleId, keychainGroupId: container.keychainGroupId)
+                } else {
+                    container.makeLCContainerInfoPlist(appIdentifier: newBundleId, keychainGroupId: container.keychainGroupId)
+                }
+            }
+            if let relPath = appInfo.relativeBundlePath {
+                LCAppSortManager.shared.updateBundleIdentifier(
+                    oldBundleId: oldBundleId,
+                    newBundleId: newBundleId,
+                    relativeBundlePath: relPath
+                )
+            }
+        }
+        LCAppSortManager.shared.refreshSort()
+        AltStoreSourcesViewModel.shared.recomputeAvailableUpdates()
+
+        var guestSchemes = Set<String>()
+        for app in DataManager.shared.model.apps {
+            if let schemes = app.appInfo.urlSchemes() as? [String] {
+                guestSchemes.formUnion(schemes)
+            }
+        }
+        UserDefaults.lcShared().set(Array(guestSchemes), forKey: "LCGuestURLSchemes")
     }
 
     func signApp(force: Bool = false) async throws {
