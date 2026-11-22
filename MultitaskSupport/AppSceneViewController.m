@@ -27,6 +27,8 @@
 @property(nonatomic) NSString *sceneID;
 @property(nonatomic) NSExtension* extension;
 @property(nonatomic) bool isAppTerminationCleanUpCalled;
+@property(nonatomic) BOOL isTerminating;
+@property(nonatomic) BOOL isRegisteredForSceneDiff;
 @end
 
 static UIScreen *LCFallbackActiveScreen(void) {
@@ -139,15 +141,26 @@ static UIScreen *LCFallbackActiveScreen(void) {
     }];
     [_extension beginExtensionRequestWithInputItems:@[item] completion:^(NSUUID *identifier) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+            if (strongSelf.isTerminating || strongSelf.isAppTerminationCleanUpCalled) {
+                if (identifier) {
+                    [strongSelf.extension _kill:SIGTERM];
+                }
+                [strongSelf appTerminationCleanUp];
+                return;
+            }
             if(identifier) {
-                [MultitaskManager registerMultitaskContainerWithContainer:self.dataUUID];
-                self.identifier = identifier;
-                self.pid = [self.extension pidForRequestIdentifier:self.identifier];
-                [delegate appSceneVC:self didInitializeWithError:nil];
-                [self setUpAppPresenter];
+                [MultitaskManager registerMultitaskContainerWithContainer:strongSelf.dataUUID];
+                strongSelf.identifier = identifier;
+                strongSelf.pid = [strongSelf.extension pidForRequestIdentifier:strongSelf.identifier];
+                [strongSelf.delegate appSceneVC:strongSelf didInitializeWithError:nil];
+                [strongSelf setUpAppPresenter];
             } else {
                 NSError* error = [NSError errorWithDomain:@"LiveProcess" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to start app. Child process has unexpectedly crashed"}];
-                [delegate appSceneVC:self didInitializeWithError:error];
+                [strongSelf.delegate appSceneVC:strongSelf didInitializeWithError:error];
             }
         });
     }];
@@ -155,7 +168,24 @@ static UIScreen *LCFallbackActiveScreen(void) {
     return self;
 }
 
+- (void)unregisterHostSceneDiffAction {
+    if (!self.sceneID) {
+        self.hostScene = nil;
+        self.isRegisteredForSceneDiff = NO;
+        return;
+    }
+    UIWindowScene *sceneToUnregister = self.hostScene ?: self.view.window.windowScene;
+    if (sceneToUnregister) {
+        [sceneToUnregister _unregisterSettingsDiffActionArrayForKey:self.sceneID];
+    }
+    self.hostScene = nil;
+    self.isRegisteredForSceneDiff = NO;
+}
+
 - (void)setUpAppPresenter {
+    if (self.isTerminating || self.isAppTerminationCleanUpCalled) {
+        return;
+    }
     RBSProcessPredicate* predicate = [PrivClass(RBSProcessPredicate) predicateMatchingIdentifier:@(self.pid)];
     FBProcessManager *manager = [PrivClass(FBProcessManager) sharedInstance];
     // At this point, the process is spawned and we're ready to create a scene to render in our app
@@ -242,25 +272,42 @@ static UIScreen *LCFallbackActiveScreen(void) {
     self.contentView.layer.position = CGPointMake(0, 0);
     
     self.hostScene = self.view.window.windowScene;
-    if (self.hostScene && self.sceneID) {
+    if (self.hostScene && self.sceneID && !self.isTerminating && !self.isAppTerminationCleanUpCalled) {
         [self.hostScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
+        self.isRegisteredForSceneDiff = YES;
     }
 }
 
 - (void)terminate {
+    self.isTerminating = YES;
+    if (NSThread.isMainThread) {
+        [self unregisterHostSceneDiffAction];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self unregisterHostSceneDiffAction];
+        });
+    }
     if(self.isAppRunning) {
-        [self.extension _kill:SIGTERM];
+        NSExtension *ext = self.extension;
+        int targetPid = self.pid;
+        [ext _kill:SIGTERM];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self.extension _kill:SIGKILL];
+            if (targetPid > 0 && getpgid(targetPid) > 0) {
+                [ext _kill:SIGKILL];
+            }
         });
     }
 }
 
 - (void)_performActionsForUIScene:(UIScene *)scene withUpdatedFBSScene:(id)fbsScene settingsDiff:(FBSSceneSettingsDiff *)diff fromSettings:(UIApplicationSceneSettings *)settings transitionContext:(id)context lifecycleActionType:(uint32_t)actionType {
-    if(!self.isAppRunning) {
+    if (self.isTerminating || self.isAppTerminationCleanUpCalled || !self.isAppRunning) {
+        [self unregisterHostSceneDiffAction];
         [self appTerminationCleanUp];
+        return;
     }
-    if(!diff) return;
+    if (!diff || !self.presenter || !self.presenter.scene) {
+        return;
+    }
     
     UIMutableApplicationSceneSettings *baseSettings = [diff settingsByApplyingToMutableCopyOfSettings:settings];
     UIApplicationSceneTransitionContext *newContext = [context copy];
@@ -277,7 +324,7 @@ static UIScreen *LCFallbackActiveScreen(void) {
 - (void)updateFrameWithSettingsBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block {
     __block int currentDebounceToken = ++_resizeDebounceToken;
     dispatch_block_t queueBlock = ^{
-        if(currentDebounceToken != self.resizeDebounceToken) {
+        if(currentDebounceToken != self.resizeDebounceToken || self.isTerminating || self.isAppTerminationCleanUpCalled || !self.presenter) {
             return;
         }
         [self updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
@@ -339,9 +386,12 @@ static UIScreen *LCFallbackActiveScreen(void) {
         return;
     }
     _isAppTerminationCleanUpCalled = true;
+    self.isTerminating = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
+        [self unregisterHostSceneDiffAction];
         if(self.sceneID) {
             [[PrivClass(FBSceneManager) sharedInstance] destroyScene:self.sceneID withTransitionContext:nil];
+            self.sceneID = nil;
         }
         if(self.hostingController) {
             [self.hostingController invalidate];
@@ -350,11 +400,14 @@ static UIScreen *LCFallbackActiveScreen(void) {
             [self.hostingController.sceneViewController removeFromParentViewController];
             self.hostingController = nil;
         }
+        self.contentView = nil;
         self.presenter = nil;
 
         [LCSharedUtils wipeStrictContainerForDataUUIDIfNeeded:self.dataUUID];
         
-        [self.delegate appSceneVCAppDidExit:self];
+        id<AppSceneViewControllerDelegate> delegate = self.delegate;
+        self.delegate = nil;
+        [delegate appSceneVCAppDidExit:self];
         [MultitaskManager unregisterMultitaskContainerWithContainer:self.dataUUID];
     });
 }
@@ -371,14 +424,14 @@ static UIScreen *LCFallbackActiveScreen(void) {
 - (void)viewDidMoveToWindow:(UIWindow *)newWindow shouldAppearOrDisappear:(BOOL)appear {
     [super viewDidMoveToWindow:newWindow shouldAppearOrDisappear:appear];
     if(!newWindow) {
-        if(self.sceneID) {
-            UIWindowScene *sceneToUnregister = self.hostScene ?: self.view.window.windowScene;
-            [sceneToUnregister _unregisterSettingsDiffActionArrayForKey:self.sceneID];
-            self.hostScene = nil;
-        }
+        [self unregisterHostSceneDiffAction];
         self.delegate = nil;
-    } else {
+    } else if (!self.isTerminating && !self.isAppTerminationCleanUpCalled) {
         self.hostScene = newWindow.windowScene;
+        if (self.sceneID && self.hostScene && !self.isRegisteredForSceneDiff) {
+            [self.hostScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
+            self.isRegisteredForSceneDiff = YES;
+        }
     }
 }
 

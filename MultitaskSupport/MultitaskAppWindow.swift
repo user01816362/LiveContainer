@@ -81,13 +81,14 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
                 }
             }
             // fix live resize
-            vc.contentView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            vc.contentView?.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         }
         
         func appSceneVC(_ vc: AppSceneViewController, didUpdateFrom settings: UIMutableApplicationSceneSettings, transitionContext context: Any?, lifecycleActionType actionType: UInt32) {
+            guard let scene = vc.presenter?.scene else { return }
             settings.interruptionPolicy = 0
             //settings.peripheryInsets = vc.view.window?.safeAreaInsets ?? .zero
-            vc.presenter.scene.updateSettings(settings, withTransitionContext: context, completion: nil)
+            scene.updateSettings(settings, withTransitionContext: context, completion: nil)
             // Not sure what actionType 2 is, but it's only set when this scene enters foreground, so we can pass URL scheme here
             if actionType == 2, let launchUrl = UserDefaults.standard.string(forKey: "launchAppUrlScheme") {
                 UserDefaults.standard.removeObject(forKey: "launchAppUrlScheme")

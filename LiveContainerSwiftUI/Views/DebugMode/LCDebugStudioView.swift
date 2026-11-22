@@ -22,7 +22,6 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
         let onInitialized: (Int32, Error?) -> Void
         let onExit: () -> Void
         var didTerminate = false
-        var shouldTerminateOnDismantle = false
 
         init(onInitialized: @escaping (Int32, Error?) -> Void, onExit: @escaping () -> Void) {
             self.onInitialized = onInitialized
@@ -54,12 +53,13 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
                     settings.setFrame(CGRect(x: 0, y: 0, width: vc.view.frame.size.width, height: vc.view.frame.size.height))
                 }
             }
-            vc.contentView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            vc.contentView?.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         }
 
         func appSceneVC(_ vc: AppSceneViewController, didUpdateFrom settings: UIMutableApplicationSceneSettings, transitionContext context: Any?, lifecycleActionType actionType: UInt32) {
+            guard !didTerminate, let scene = vc.presenter?.scene else { return }
             settings.interruptionPolicy = 0
-            vc.presenter.scene.updateSettings(settings, withTransitionContext: context, completion: nil)
+            scene.updateSettings(settings, withTransitionContext: context, completion: nil)
         }
     }
 
@@ -76,7 +76,6 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
         if terminateSignal {
-            context.coordinator.shouldTerminateOnDismantle = true
             if !context.coordinator.didTerminate, let vc = uiViewController as? AppSceneViewController {
                 context.coordinator.didTerminate = true
                 vc.terminate()
@@ -85,7 +84,7 @@ private struct LCDebugGuestSceneRepresentable: UIViewControllerRepresentable {
     }
 
     static func dismantleUIViewController(_ uiViewController: UIViewController, coordinator: Coordinator) {
-        if coordinator.shouldTerminateOnDismantle, !coordinator.didTerminate, let vc = uiViewController as? AppSceneViewController {
+        if !coordinator.didTerminate, let vc = uiViewController as? AppSceneViewController {
             coordinator.didTerminate = true
             vc.terminate()
         }
@@ -106,6 +105,7 @@ struct LCDebugStudioView: View {
     @State private var readyRelativePath: String? = nil
     @State private var readyDataUUID: String? = nil
     @State private var terminateSignal = false
+    @State private var hasDismissed = false
 
     @State private var viewportScale: CGFloat = 0.86
     @State private var drawerDetent: LCDebugDrawerDetent = .docked
@@ -385,6 +385,8 @@ struct LCDebugStudioView: View {
     private func stopAndDismiss() {
         terminateSignal = true
         manager.disconnect()
+        guard !hasDismissed else { return }
+        hasDismissed = true
         dismiss()
     }
 

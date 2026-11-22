@@ -29,9 +29,9 @@ NS_SWIFT_UI_ACTOR
 @property(nonatomic) BOOL isAppRunning;
 @property(nonatomic) BOOL shouldIgnoreSceneUpdates, shouldSkipDebounceOnce;
 @property(nonatomic) CGFloat scaleRatio;
-@property(nonatomic, null_unspecified) UIView* contentView;
-@property(nonatomic, null_unspecified) _UIScenePresenter *presenter;
-@property(nonatomic, null_unspecified) _UISceneHostingController *hostingController;
+@property(nonatomic, nullable) UIView* contentView;
+@property(nonatomic, nullable) _UIScenePresenter *presenter;
+@property(nonatomic, nullable) _UISceneHostingController *hostingController;
 - (instancetype _Null_unspecified)initWithBundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID delegate:(id<AppSceneViewControllerDelegate> _Null_unspecified)delegate;
 - (instancetype _Null_unspecified)initWithBundleId:(NSString * _Null_unspecified)bundleId dataUUID:(NSString * _Null_unspecified)dataUUID debugMode:(BOOL)debugMode delegate:(id<AppSceneViewControllerDelegate> _Null_unspecified)delegate;
 - (void)setBackgroundNotificationEnabled:(bool)enabled;
