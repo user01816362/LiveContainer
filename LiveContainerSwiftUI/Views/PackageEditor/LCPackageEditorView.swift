@@ -25,22 +25,15 @@ final class LCPackageEditorStore {
     var actionError: String?
     var didHandOffSession = false
 
+    private(set) var activeAppTweakURLs: [URL] = []
     private var didStartLoad = false
 
     init(session: LCPackageStagingSession) {
         self.session = session
     }
 
-    var availableLiveContainerTweaksCount: Int {
-        LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: session.appTweakFolder)
-            .reduce(0) { $0 + $1.urls.count }
-    }
-
     var activeAppTweaksCount: Int {
-        guard let folder = session.appTweakFolder, !folder.isEmpty else { return 0 }
-        return LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: folder)
-            .filter { $0.title.contains(folder) }
-            .reduce(0) { $0 + $1.urls.count }
+        activeAppTweakURLs.count
     }
 
     var removedComponentsCount: Int {
@@ -52,8 +45,10 @@ final class LCPackageEditorStore {
     }
 
     var willAutoEmbedElleKit: Bool {
-        guard let snapshot, !snapshot.alreadyHasSubstrate else { return false }
-        return queuedTweaks.contains(where: { $0.needsElleKit })
+        let hasEnabledSubstrate = components.contains {
+            $0.isEnabled && ($0.name == "CydiaSubstrate.framework" || $0.name == "ElleKit.framework")
+        }
+        return !hasEnabledSubstrate && queuedTweaks.contains(where: { $0.needsElleKit })
     }
 
     func loadIfNeeded() async {
@@ -63,13 +58,24 @@ final class LCPackageEditorStore {
         loadError = nil
 
         do {
-            let loaded = try await LCPackageStagingManager.inspectStagedBundle(
+            let folder = session.appTweakFolder
+            async let snapshotTask = LCPackageStagingManager.inspectStagedBundle(
                 at: session.stagedAppURL,
                 mode: session.mode
             )
+            async let appTweaksTask = lcRunOffMain {
+                guard let folder, !folder.isEmpty else { return [URL]() }
+                return LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: folder)
+                    .filter { $0.isAppFolder }
+                    .flatMap(\.urls)
+            }
+
+            let loaded = try await snapshotTask
+            let discoveredAppTweaks = try? await appTweaksTask
             self.snapshot = loaded
             self.metadata = loaded.metadata
             self.components = loaded.components
+            self.activeAppTweakURLs = discoveredAppTweaks ?? []
             self.isLoading = false
         } catch {
             self.loadError = error.localizedDescription
@@ -78,13 +84,43 @@ final class LCPackageEditorStore {
     }
 
     func addTweaks(from urls: [URL], sourceLabel: String) async {
-        for url in urls {
-            let stdPath = url.standardizedFileURL.path
+        let fm = FileManager.default
+        let queuedDir = session.stagingRootURL.appendingPathComponent("QueuedTweaks", isDirectory: true)
+        for originalURL in urls {
+            let targetURL: URL
+            if sourceLabel == "Files" {
+                let needsScope = originalURL.startAccessingSecurityScopedResource()
+                defer {
+                    if needsScope {
+                        originalURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+                do {
+                    try fm.createDirectory(at: queuedDir, withIntermediateDirectories: true)
+                    let destURL = queuedDir.appendingPathComponent(originalURL.lastPathComponent)
+                    let stdDest = destURL.standardizedFileURL.path
+                    if queuedTweaks.contains(where: { $0.sourceURL.standardizedFileURL.path == stdDest }) {
+                        continue
+                    }
+                    if fm.fileExists(atPath: destURL.path) {
+                        try fm.removeItem(at: destURL)
+                    }
+                    try fm.copyItem(at: originalURL, to: destURL)
+                    targetURL = destURL
+                } catch {
+                    actionError = error.localizedDescription
+                    continue
+                }
+            } else {
+                targetURL = originalURL
+            }
+
+            let stdPath = targetURL.standardizedFileURL.path
             if queuedTweaks.contains(where: { $0.sourceURL.standardizedFileURL.path == stdPath }) {
                 continue
             }
             do {
-                let inspected = try await LCTweakDependencyResolver.inspectTweakFile(at: url, sourceLabel: sourceLabel)
+                let inspected = try await LCTweakDependencyResolver.inspectTweakFile(at: targetURL, sourceLabel: sourceLabel)
                 queuedTweaks.append(inspected)
             } catch {
                 actionError = error.localizedDescription
@@ -93,11 +129,8 @@ final class LCPackageEditorStore {
     }
 
     func addAppActiveTweaks() async {
-        guard let folder = session.appTweakFolder, !folder.isEmpty else { return }
-        let appSections = LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: folder)
-            .filter { $0.title.contains(folder) }
-        let urls = appSections.flatMap(\.urls)
-        await addTweaks(from: urls, sourceLabel: "App Tweak")
+        guard !activeAppTweakURLs.isEmpty else { return }
+        await addTweaks(from: activeAppTweakURLs, sourceLabel: "App Tweak")
     }
 
     func removeTweaks(at offsets: IndexSet) {
@@ -264,7 +297,7 @@ struct LCPackageEditorView: View {
             }
             .betterFileImporter(
                 isPresented: $showTweakFileImporter,
-                types: [.dylib, .deb, .lcFramework, .zipArchive],
+                types: [.dylib, .deb, .lcFramework, .zipArchive, .ipa, .tipa, .tarArchiveCompat, .gzArchive, .tgzArchive, .xzArchive, .bz2Archive],
                 multiple: true,
                 callback: { urls in
                     Task { await store.addTweaks(from: urls, sourceLabel: "Files") }
@@ -284,11 +317,6 @@ struct LCPackageEditorView: View {
             }
             .task {
                 await store.loadIfNeeded()
-            }
-        }
-        .onDisappear {
-            if !store.didHandOffSession {
-                store.session.cleanup()
             }
         }
     }
@@ -371,30 +399,21 @@ struct LCPackageEditorView: View {
             }
 
             Section {
-                NavigationLink {
-                    LCPackageMetadataSectionView(metadata: Binding(
-                        get: { store.metadata! },
-                        set: { store.metadata = $0 }
-                    ))
-                } label: {
-                    LabeledContent {
-                        let count = store.metadata?.modifiedFieldCount ?? 0
-                        Text(count > 0 ? "\(count) modified" : "Default")
-                            .foregroundStyle(count > 0 ? Color.accentColor : Color.secondary)
+                if let metadataBinding = Binding($store.metadata) {
+                    NavigationLink {
+                        LCPackageMetadataSectionView(metadata: metadataBinding)
                     } label: {
-                        Label("Metadata & Bundle Options", systemImage: "slider.horizontal.3")
+                        LabeledContent {
+                            let count = store.metadata?.modifiedFieldCount ?? 0
+                            Text(count > 0 ? "\(count) modified" : "Default")
+                                .foregroundStyle(count > 0 ? Color.accentColor : Color.secondary)
+                        } label: {
+                            Label("Metadata & Bundle Options", systemImage: "slider.horizontal.3")
+                        }
                     }
-                }
 
-                if let _ = store.metadata {
-                    Toggle("Remove UISupportedDevices", isOn: Binding(
-                        get: { store.metadata?.removeSupportedDevices ?? false },
-                        set: { store.metadata?.removeSupportedDevices = $0 }
-                    ))
-                    Toggle("Enable Files App Sharing", isOn: Binding(
-                        get: { store.metadata?.enableFileSharing ?? false },
-                        set: { store.metadata?.enableFileSharing = $0 }
-                    ))
+                    Toggle("Remove UISupportedDevices", isOn: metadataBinding.removeSupportedDevices)
+                    Toggle("Enable Files App Sharing", isOn: metadataBinding.enableFileSharing)
                 }
             } header: {
                 Text("Packaging & Plist")

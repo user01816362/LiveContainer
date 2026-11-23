@@ -11,21 +11,58 @@ struct LCPackageComponentsView: View {
     let hiddenSystemDylibCount: Int
 
     @State private var searchText = ""
+    @State private var inspectedItem: LCPackageComponentItem?
+
+    private var hasAnyVisibleComponent: Bool {
+        LCPackageComponentKind.allCases.contains { !matchingIndices(for: $0).isEmpty }
+    }
 
     var body: some View {
-        List {
-            ForEach(LCPackageComponentKind.allCases, id: \.self) { kind in
-                let indices = matchingIndices(for: kind)
-                if !indices.isEmpty {
+        Group {
+            if store.components.isEmpty {
+                List {
                     Section {
-                        ForEach(indices, id: \.self) { idx in
-                            componentRow(item: $store.components[idx])
-                        }
-                    } header: {
-                        Text("\(kind.sectionTitle) (\(indices.count))")
-                    } footer: {
-                        if kind == .linkedDylib && hiddenSystemDylibCount > 0 {
+                        ContentUnavailableView(
+                            "No Frameworks or Extensions Found",
+                            systemImage: "shippingbox",
+                            description: Text("This bundle does not embed custom Frameworks, Dylibs, PlugIns, or Watch apps.")
+                        )
+                        .listRowBackground(Color.clear)
+                    }
+                    if hiddenSystemDylibCount > 0 {
+                        Section {
                             Text("\(hiddenSystemDylibCount) required system libraries (/System/Library, /usr/lib) not shown.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } else if !hasAnyVisibleComponent && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                ContentUnavailableView.search(text: searchText)
+            } else {
+                List {
+                    ForEach(LCPackageComponentKind.allCases, id: \.self) { kind in
+                        let indices = matchingIndices(for: kind)
+                        if !indices.isEmpty {
+                            Section {
+                                ForEach(indices, id: \.self) { idx in
+                                    componentRow(item: $store.components[idx])
+                                }
+                            } header: {
+                                Text("\(kind.sectionTitle) (\(indices.count))")
+                            } footer: {
+                                if kind == .linkedDylib && hiddenSystemDylibCount > 0 {
+                                    Text("\(hiddenSystemDylibCount) required system libraries (/System/Library, /usr/lib) not shown.")
+                                }
+                            }
+                        }
+                    }
+
+                    if hiddenSystemDylibCount > 0 && matchingIndices(for: .linkedDylib).isEmpty {
+                        Section {
+                            Text("\(hiddenSystemDylibCount) required system libraries (/System/Library, /usr/lib) not shown.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -34,6 +71,23 @@ struct LCPackageComponentsView: View {
         .searchable(text: $searchText, prompt: "Filter frameworks, dylibs, plugins")
         .navigationTitle("Bundle Components")
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(item: $inspectedItem) { item in
+            if let binaryURL = item.binaryURL {
+                LCBinaryInspectorView(
+                    binaryURL: binaryURL,
+                    title: item.name,
+                    bundleRootURL: stagedAppURL,
+                    rootURL: stagedAppURL,
+                    needsSecurityScope: false
+                )
+            } else {
+                ContentUnavailableView(
+                    "No Mach-O Binary",
+                    systemImage: "doc.questionmark",
+                    description: Text("\(item.name) does not have a local Mach-O binary inside the staged bundle.")
+                )
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -108,21 +162,17 @@ struct LCPackageComponentsView: View {
                 }
             }
 
-            if let binaryURL = val.binaryURL {
-                NavigationLink {
-                    LCBinaryInspectorView(
-                        binaryURL: binaryURL,
-                        title: val.name,
-                        bundleRootURL: stagedAppURL,
-                        rootURL: stagedAppURL,
-                        needsSecurityScope: false
-                    )
+            if val.binaryURL != nil {
+                Button {
+                    inspectedItem = val
                 } label: {
                     Image(systemName: "stethoscope")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
                 }
-                .fixedSize()
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Inspect \(val.name)")
             }
         }
     }

@@ -25,52 +25,86 @@ enum LCTweakDependencyResolver {
         var sections: [LCLiveContainerTweakSection] = []
         var visitedDirs = Set<String>()
 
-        func scanFolder(_ folderURL: URL, title: String) {
-            let stdPath = folderURL.standardizedFileURL.path
-            guard visitedDirs.insert(stdPath).inserted, fm.fileExists(atPath: stdPath) else {
-                return
-            }
+        func scanTree(rootURL: URL, baseTitle: String, isAppTree: Bool) {
+            let stdRoot = rootURL.standardizedFileURL.path
+            guard fm.fileExists(atPath: stdRoot) else { return }
 
-            let tweakInfoURL = folderURL.appendingPathComponent("TweakInfo.plist")
-            let disabledNames: Set<String> = {
-                guard let dict = NSDictionary(contentsOf: tweakInfoURL) as? [String: Any],
-                      let list = dict["disabledItems"] as? [String] else {
-                    return []
+            var queue: [(url: URL, relativeSubpath: String)] = [(rootURL, "")]
+            var queueIdx = 0
+
+            while queueIdx < queue.count {
+                let entry = queue[queueIdx]
+                queueIdx += 1
+
+                let folderURL = entry.url
+                let stdPath = folderURL.standardizedFileURL.path
+                guard visitedDirs.insert(stdPath).inserted else { continue }
+
+                let items = (try? fm.contentsOfDirectory(
+                    at: folderURL,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles]
+                )) ?? []
+
+                var tweaks: [URL] = []
+                var subfolders: [(url: URL, relativeSubpath: String)] = []
+
+                for item in items {
+                    let name = item.lastPathComponent
+                    if name == "TweakLoader.dylib" || name == "TweakInfo.plist" || name == "__MACOSX" {
+                        continue
+                    }
+
+                    let normalizedName = LCTweakFormatDetector.strippedDisabledSuffix(name)
+                    let ext = URL(fileURLWithPath: normalizedName).pathExtension.lowercased()
+                    let isSupportedTweak = (ext == "dylib" || ext == "framework" || ext == "deb" || ext == "zip")
+
+                    if isSupportedTweak {
+                        tweaks.append(item)
+                        continue
+                    }
+
+                    let rv = try? item.resourceValues(forKeys: [.isDirectoryKey])
+                    if rv?.isDirectory == true {
+                        // Do not descend into bundle directories (.bundle, .app, .appex, etc.)
+                        let lowerExt = ext
+                        if lowerExt == "bundle" || lowerExt == "app" || lowerExt == "appex" || lowerExt == "lproj" {
+                            continue
+                        }
+                        let subRel = entry.relativeSubpath.isEmpty ? name : "\(entry.relativeSubpath)/\(name)"
+                        subfolders.append((item, subRel))
+                    }
                 }
-                return Set(list)
-            }()
 
-            let items = (try? fm.contentsOfDirectory(
-                at: folderURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
-
-            let tweaks = items.filter { url in
-                let name = url.lastPathComponent
-                if name == "TweakLoader.dylib" || name == "TweakInfo.plist" || name.hasSuffix(".disabled") {
-                    return false
+                if !tweaks.isEmpty {
+                    let sortedTweaks = tweaks.sorted {
+                        $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+                    }
+                    let title = entry.relativeSubpath.isEmpty
+                        ? baseTitle
+                        : "\(baseTitle) / \(entry.relativeSubpath)"
+                    let matchesAppFolder = isAppTree || (appTweakFolder != nil && !appTweakFolder!.isEmpty && entry.relativeSubpath.localizedCaseInsensitiveCompare(appTweakFolder!) == .orderedSame)
+                    sections.append(LCLiveContainerTweakSection(
+                        folderPath: stdPath,
+                        title: title,
+                        isAppFolder: matchesAppFolder,
+                        urls: sortedTweaks
+                    ))
                 }
-                if disabledNames.contains(name) {
-                    return false
-                }
-                let ext = url.pathExtension.lowercased()
-                return ext == "dylib" || ext == "framework" || ext == "deb" || ext == "zip"
-            }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 
-            if !tweaks.isEmpty {
-                sections.append(LCLiveContainerTweakSection(title: title, urls: tweaks))
+                for sub in subfolders.sorted(by: { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }) {
+                    queue.append(sub)
+                }
             }
         }
 
         if let appTweakFolder, !appTweakFolder.isEmpty {
-            scanFolder(LCPath.tweakPath.appendingPathComponent(appTweakFolder, isDirectory: true), title: "App Tweaks (\(appTweakFolder))")
-            scanFolder(LCPath.lcGroupTweakPath.appendingPathComponent(appTweakFolder, isDirectory: true), title: "Shared App Tweaks (\(appTweakFolder))")
+            scanTree(rootURL: LCPath.tweakPath.appendingPathComponent(appTweakFolder, isDirectory: true), baseTitle: "App Tweaks (\(appTweakFolder))", isAppTree: true)
+            scanTree(rootURL: LCPath.lcGroupTweakPath.appendingPathComponent(appTweakFolder, isDirectory: true), baseTitle: "Shared App Tweaks (\(appTweakFolder))", isAppTree: true)
         }
 
-        scanFolder(LCPath.tweakPath, title: "Global Tweaks")
-        scanFolder(LCPath.lcGroupTweakPath, title: "Shared Global Tweaks")
+        scanTree(rootURL: LCPath.tweakPath, baseTitle: "Global Tweaks", isAppTree: false)
+        scanTree(rootURL: LCPath.lcGroupTweakPath, baseTitle: "Shared Global Tweaks", isAppTree: false)
         return sections
     }
 
@@ -84,15 +118,28 @@ enum LCTweakDependencyResolver {
             }
 
             let fm = FileManager.default
-            let ext = sourceURL.pathExtension.lowercased()
+            let displayName = LCTweakFormatDetector.strippedDisabledSuffix(sourceURL.lastPathComponent)
+            let ext = URL(fileURLWithPath: displayName).pathExtension.lowercased()
+            let detectedFormat = LCTweakFormatDetector.detectFormat(at: sourceURL, fileManager: fm)
             let kind: LCTweakPackageKind
-            switch ext {
-            case "dylib": kind = .dylib
-            case "framework": kind = .framework
-            case "deb": kind = .deb
-            case "zip": kind = .zip
-            default:
-                throw "Unsupported tweak format: .\(ext)"
+            switch detectedFormat {
+            case .dylib: kind = .dylib
+            case .framework: kind = .framework
+            case .deb: kind = .deb
+            case .zip, .ipa, .tar: kind = .zip
+            case .zstdUnsupported:
+                throw "'\(displayName)' uses Zstandard (.zst) compression, which is not supported on iOS."
+            case .htmlErrorPage:
+                throw "'\(displayName)' is an HTML page, not a valid tweak binary or archive."
+            case .unknown:
+                switch ext {
+                case "dylib": kind = .dylib
+                case "framework": kind = .framework
+                case "deb": kind = .deb
+                case "zip", "ipa", "tipa", "tar", "gz", "tgz", "xz", "txz", "bz2", "tbz2", "lzma": kind = .zip
+                default:
+                    throw "Unsupported tweak format: \(displayName)"
+                }
             }
 
             let probeDir = fm.temporaryDirectory.appendingPathComponent("LCTweakProbe-\(UUID().uuidString)", isDirectory: true)
@@ -102,7 +149,7 @@ enum LCTweakDependencyResolver {
             let payloads = try unpackTweakSynchronously(from: sourceURL, kind: kind, into: probeDir, fileManager: fm)
             let machOURLs: [URL] = payloads.dylibs + payloads.frameworks.compactMap { LCBoundedFileReader.resolveMachOExecutableURL(for: $0) }
             guard !machOURLs.isEmpty else {
-                throw "No .dylib or .framework executable found inside \(sourceURL.lastPathComponent)."
+                throw "No .dylib or .framework executable found inside \(displayName)."
             }
 
             // Build set of sibling payload identifiers present in the same tweak package.
@@ -132,7 +179,7 @@ enum LCTweakDependencyResolver {
             return LCPackageQueuedTweak(
                 id: UUID(),
                 sourceURL: sourceURL,
-                displayName: sourceURL.lastPathComponent,
+                displayName: displayName,
                 sourceLabel: sourceLabel,
                 kind: kind,
                 needsElleKit: needsElleKit,

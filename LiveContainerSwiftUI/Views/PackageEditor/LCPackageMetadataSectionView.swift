@@ -35,7 +35,7 @@ struct LCPackageMetadataSectionView: View {
                 Toggle("Update Localized Names (InfoPlist.strings)", isOn: $metadata.updateLocalizedNames)
             }
 
-            Section("Standalone Plist Tweaks") {
+            Section("Info.plist Options") {
                 Toggle("Remove UISupportedDevices", isOn: $metadata.removeSupportedDevices)
                 Toggle("Enable Files App Sharing", isOn: $metadata.enableFileSharing)
                 Toggle("Remove Custom URL Schemes", isOn: $metadata.removeURLSchemes)

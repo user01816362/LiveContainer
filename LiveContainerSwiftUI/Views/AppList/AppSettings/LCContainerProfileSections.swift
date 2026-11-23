@@ -121,7 +121,7 @@ struct LCContainerLaunchRotationSection: View {
             }
             Toggle("Use Real Device Templates", isOn: $container.rotateUsesRealDeviceTemplates)
                 .onChange(of: container.rotateUsesRealDeviceTemplates) { _, _ in _ = onSave() }
-            Text("Enter comma-separated OS major versions. Real Device Templates rotate among verified 2026–2027 iPhone/iPad specs cleanly.")
+            Text("Enter comma-separated OS major versions. Real Device Templates rotate among verified iPhone and iPad hardware specs cleanly.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

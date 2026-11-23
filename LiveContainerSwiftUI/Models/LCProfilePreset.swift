@@ -16,7 +16,7 @@ import UIKit
 struct LCDeviceModelSpec: Identifiable, Hashable, Sendable {
     /// UI grouping categories for the hardware picker.
     enum GroupKind: String, CaseIterable, Identifiable, Sendable {
-        case iPhone18AndDuo = "iPhone 18 & Duo (2026–2027)"
+        case iPhone18AndDuo = "iPhone 18 & Duo"
         case iPhone17AndAir = "iPhone 17 & Air"
         case iPhone16AndEarlier = "iPhone 16 / 15 / 14"
         case iPad = "iPad Pro & Air"

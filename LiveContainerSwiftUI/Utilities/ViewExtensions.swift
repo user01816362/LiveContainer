@@ -75,9 +75,8 @@ extension View {
 }
 
 public struct DocModifier: ViewModifier {
-    @EnvironmentObject var sceneDelegate: SceneDelegate
     @State private var docController: UIDocumentPickerViewController?
-    private let delegate: Coordinator
+    @StateObject private var delegate = Coordinator()
 
     @Binding var isPresented: Bool
 
@@ -91,7 +90,6 @@ public struct DocModifier: ViewModifier {
         self.onDismiss = onDismiss
         self.types = types
         self.multiple = multiple
-        self.delegate = Coordinator(callback: callback, onDismiss: onDismiss)
         self._isPresented = isPresented
     }
 
@@ -100,37 +98,48 @@ public struct DocModifier: ViewModifier {
             if newValue, docController == nil {
                 let controller = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
                 controller.allowsMultipleSelection = multiple
+                delegate.onPick = { urls in
+                    self.docController = nil
+                    self.isPresented = false
+                    self.callback(urls)
+                    self.onDismiss()
+                }
+                delegate.onCancel = {
+                    self.docController = nil
+                    self.isPresented = false
+                    self.onDismiss()
+                }
                 controller.delegate = delegate
+                controller.presentationController?.delegate = delegate
                 self.docController = controller
-                UIApplication.shared.lcTopmostViewController(in: sceneDelegate.window)?.present(controller, animated: true)
+                if let hostVC = UIApplication.shared.lcTopmostViewController(in: nil) {
+                    hostVC.present(controller, animated: true)
+                } else {
+                    self.docController = nil
+                    self.isPresented = false
+                }
             } else if !newValue, let docController = docController {
-                docController.dismiss(animated: true)
                 self.docController = nil
+                docController.dismiss(animated: true)
             }
         }
     }
 
-    private func shutdown() {
-        isPresented = false
-        docController = nil
-    }
-
     @MainActor
-    class Coordinator: NSObject, UIDocumentPickerDelegate {
-        var callback: ([URL]) -> ()
-        private let onDismiss: () -> Void
-
-        init(callback: @escaping ([URL]) -> Void, onDismiss: @escaping () -> Void) {
-            self.callback = callback
-            self.onDismiss = onDismiss
-        }
+    final class Coordinator: NSObject, ObservableObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
+        var onPick: (([URL]) -> Void)?
+        var onCancel: (() -> Void)?
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            callback(urls)
-            onDismiss()
+            onPick?(urls)
         }
+
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            onDismiss()
+            onCancel?()
+        }
+
+        func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+            onCancel?()
         }
     }
 

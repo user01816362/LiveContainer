@@ -18,6 +18,8 @@ struct LCTabView: View {
     @EnvironmentObject var downloadManager: LCDownloadManager
     @ObservedObject var sourcesViewModel = AltStoreSourcesViewModel.shared
     @State var shouldToggleMainWindowOpen = false
+    @State private var lastPresentedDownloadRequest: LCPendingDownloadPreInstallRequest?
+    @State private var handedOffDownloadRequestIds: Set<UUID> = []
     @Environment(\.scenePhase) var scenePhase
     @Environment(\.openWindow) private var openWindow
 
@@ -47,19 +49,32 @@ struct LCTabView: View {
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
-        .sheet(item: $downloadManager.pendingPreInstallRequest) { request in
+        .sheet(item: $downloadManager.pendingPreInstallRequest, onDismiss: {
+            if let dismissed = lastPresentedDownloadRequest {
+                if handedOffDownloadRequestIds.remove(dismissed.id) == nil {
+                    downloadManager.cancelPendingPreInstall(dismissed)
+                }
+                lastPresentedDownloadRequest = nil
+            }
+        }) { request in
             LCPackageEditorView(
                 session: request.session,
                 onCancel: {
                     downloadManager.cancelPendingPreInstall(request)
                 },
                 onPreInstallReady: { _ in
+                    handedOffDownloadRequestIds.insert(request.id)
                     downloadManager.pendingPreInstallRequest = nil
                     Task {
+                        try? await Task.sleep(for: .milliseconds(300))
                         await downloadManager.finalizePendingPreInstall(request)
                     }
                 }
             )
+            .id(request.id)
+            .onAppear {
+                lastPresentedDownloadRequest = request
+            }
         }
         .overlay(alignment: .bottom) {
             LCDownloadPillBar()

@@ -63,7 +63,7 @@ struct LCProfilePresetControlBar: View {
                         }
                     }
                 }
-                Section("Built-in 2026–2027 & Privacy Templates") {
+                Section("Built-in & Privacy Templates") {
                     ForEach(presetStore.builtInPresets) { preset in
                         Button {
                             onApplyPreset(preset)

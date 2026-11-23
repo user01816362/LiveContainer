@@ -121,24 +121,56 @@ struct LCLiveContainerTweakPickerSheet: View {
 
     @State private var sections: [LCLiveContainerTweakSection] = []
     @State private var selectedPaths: Set<String> = []
+    @State private var isLoading = true
+    @State private var searchText = ""
+
+    private var filteredSections: [LCLiveContainerTweakSection] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return sections }
+        return sections.compactMap { section in
+            if section.title.localizedCaseInsensitiveContains(query) {
+                return section
+            }
+            let matchingURLs = section.urls.filter {
+                LCTweakFormatDetector.strippedDisabledSuffix($0.lastPathComponent)
+                    .localizedCaseInsensitiveContains(query)
+            }
+            guard !matchingURLs.isEmpty else { return nil }
+            return LCLiveContainerTweakSection(
+                folderPath: section.folderPath,
+                title: section.title,
+                isAppFolder: section.isAppFolder,
+                urls: matchingURLs
+            )
+        }
+    }
 
     var body: some View {
         NavigationStack {
             Group {
-                if sections.isEmpty {
+                if isLoading {
+                    ProgressView("Scanning LiveContainer Tweaks…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if sections.isEmpty {
                     ContentUnavailableView(
                         "No LiveContainer Tweaks Found",
                         systemImage: "folder",
                         description: Text("Import .dylib, .framework, or .deb files in Tweaks Management or pick directly from Files.")
                     )
+                } else if filteredSections.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
                 } else {
                     List {
-                        ForEach(sections) { section in
+                        ForEach(filteredSections) { section in
                             Section(section.title) {
                                 ForEach(section.urls, id: \.path) { url in
                                     let stdPath = url.standardizedFileURL.path
                                     let isAlreadyQueued = alreadySelectedURLs.contains(stdPath)
                                     let isSelected = selectedPaths.contains(stdPath)
+                                    let rawName = url.lastPathComponent
+                                    let isDisabledInLC = rawName.lowercased().hasSuffix(".disabled")
+                                    let cleanName = LCTweakFormatDetector.strippedDisabledSuffix(rawName)
+
                                     Button {
                                         if isAlreadyQueued { return }
                                         if isSelected {
@@ -147,12 +179,20 @@ struct LCLiveContainerTweakPickerSheet: View {
                                             selectedPaths.insert(stdPath)
                                         }
                                     } label: {
-                                        HStack {
+                                        HStack(spacing: 10) {
                                             Image(systemName: (isAlreadyQueued || isSelected) ? "checkmark.circle.fill" : "circle")
                                                 .foregroundStyle(isAlreadyQueued ? AnyShapeStyle(.secondary) : (isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary)))
-                                            Text(url.lastPathComponent)
+                                            Text(cleanName)
                                                 .foregroundStyle(isAlreadyQueued ? .secondary : .primary)
                                             Spacer()
+                                            if isDisabledInLC {
+                                                Text("Disabled")
+                                                    .font(.caption2.weight(.semibold))
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.orange.opacity(0.14), in: Capsule())
+                                                    .foregroundStyle(.orange)
+                                            }
                                             if isAlreadyQueued {
                                                 Text("Added")
                                                     .font(.caption)
@@ -165,6 +205,7 @@ struct LCLiveContainerTweakPickerSheet: View {
                             }
                         }
                     }
+                    .searchable(text: $searchText, prompt: "Filter tweaks or folders")
                 }
             }
             .navigationTitle("LiveContainer Tweaks")
@@ -187,10 +228,12 @@ struct LCLiveContainerTweakPickerSheet: View {
                 }
             }
             .task {
+                isLoading = true
                 let folder = appTweakFolder
                 sections = (try? await lcRunOffMain {
                     LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: folder)
                 }) ?? []
+                isLoading = false
             }
         }
     }

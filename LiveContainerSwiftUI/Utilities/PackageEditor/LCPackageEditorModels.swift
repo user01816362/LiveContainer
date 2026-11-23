@@ -174,7 +174,9 @@ struct LCPackageProgress: Sendable {
 }
 
 struct LCLiveContainerTweakSection: Identifiable, Sendable {
-    var id: String { title }
+    var id: String { folderPath }
+    let folderPath: String
     let title: String
+    let isAppFolder: Bool
     let urls: [URL]
 }

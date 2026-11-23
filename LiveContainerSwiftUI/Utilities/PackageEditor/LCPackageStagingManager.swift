@@ -79,7 +79,7 @@ enum LCPackageStagingManager {
     private nonisolated static let stagingFolderName = "LCStaging"
     private nonisolated static let activeSessionNames = OSAllocatedUnfairLock(initialState: Set<String>())
 
-    fileprivate nonisolated static func unregisterActiveSession(_ folderName: String) {
+    nonisolated static func unregisterActiveSession(_ folderName: String) {
         activeSessionNames.withLock { _ = $0.remove(folderName) }
     }
 
@@ -147,6 +147,7 @@ enum LCPackageStagingManager {
                     appTweakFolder: tweakFolder
                 )
             } catch {
+                unregisterActiveSession(sessionDir.lastPathComponent)
                 try? fm.removeItem(at: sessionDir)
                 throw error
             }
@@ -203,13 +204,12 @@ enum LCPackageStagingManager {
                 hasURLSchemes: hasURLSchemes
             )
 
-            let execURL = LCBoundedFileReader.resolveMachOExecutableURL(for: stagedAppURL)
-            var overview: LCMachOOverviewResult? = nil
-            var architectures: [String] = []
-            if let execURL, let ctx = try? LCMachOParser.parseSliceContext(at: execURL) {
-                overview = ctx.overview
-                architectures = ctx.overview.slices.map(\.architectureName)
+            guard let execURL = LCBoundedFileReader.resolveMachOExecutableURL(for: stagedAppURL),
+                  let ctx = try? LCMachOParser.parseSliceContext(at: execURL) else {
+                throw "Unable to locate or inspect the main executable inside \(stagedAppURL.lastPathComponent)."
             }
+            let overview: LCMachOOverviewResult? = ctx.overview
+            let architectures: [String] = ctx.overview.slices.map(\.architectureName)
 
             let iconData: Data? = {
                 guard let tempAppInfo = LCAppInfo(bundlePath: stagedAppURL.path),
@@ -221,26 +221,20 @@ enum LCPackageStagingManager {
 
             let totalBundleSize = directoryAllocatedSize(at: stagedAppURL, fileManager: fm)
 
-            // Collect embedded Frameworks & Dylibs and cross-reference Mach-O dependencies.
+            // Collect embedded Frameworks & Dylibs across standard and third-party bundle locations.
             let nonIDDeps = (overview?.dylibs ?? []).filter { $0.kind != .id }
             var depsByInstallName: [String: LCMachODylibDependency] = [:]
             for dep in nonIDDeps where depsByInstallName[dep.path] == nil {
                 depsByInstallName[dep.path] = dep
             }
 
-            // Track which Frameworks link other Frameworks so removing a shared framework shows a clear warning.
-            let frameworksURL = stagedAppURL.appendingPathComponent("Frameworks", isDirectory: true)
-            let frameworkItemsRaw = (try? fm.contentsOfDirectory(
-                at: frameworksURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
+            let embeddedEntries = collectEmbeddedBinaries(in: stagedAppURL, fileManager: fm)
 
             var reverseFrameworkDependents: [String: [String]] = [:]
-            for itemURL in frameworkItemsRaw where itemURL.pathExtension.lowercased() == "framework" {
-                if let fwExec = LCBoundedFileReader.resolveMachOExecutableURL(for: itemURL),
+            for entry in embeddedEntries where entry.isFramework {
+                if let fwExec = entry.execURL,
                    let fwCtx = try? LCMachOParser.parseSliceContext(at: fwExec) {
-                    let parentName = itemURL.lastPathComponent
+                    let parentName = entry.url.lastPathComponent
                     for dep in fwCtx.overview.dylibs where dep.kind != .id {
                         if let matchedKey = matchedFrameworkOrDylibKey(for: dep.path), matchedKey != parentName {
                             reverseFrameworkDependents[matchedKey, default: []].append(parentName)
@@ -253,18 +247,22 @@ enum LCPackageStagingManager {
             var matchedDepPaths = Set<String>()
             var alreadyHasSubstrate = false
 
-            for itemURL in frameworkItemsRaw.sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }) {
-                let ext = itemURL.pathExtension.lowercased()
+            for entry in embeddedEntries {
+                let itemURL = entry.url
                 let itemName = itemURL.lastPathComponent
-                let relPath = "Frameworks/\(itemName)"
+                let relPath = entry.relativePath
                 if itemName == "CydiaSubstrate.framework" || itemName == "ElleKit.framework" {
                     alreadyHasSubstrate = true
                 }
 
-                if ext == "framework" {
-                    let fwExec = LCBoundedFileReader.resolveMachOExecutableURL(for: itemURL)
+                if entry.isFramework {
+                    let fwExec = entry.execURL
                     let execFileName = fwExec?.lastPathComponent ?? itemURL.deletingPathExtension().lastPathComponent
-                    let aliases = candidateLoadPaths(frameworkFolder: itemName, execName: execFileName)
+                    let aliases = candidateLoadPaths(
+                        frameworkFolder: itemName,
+                        execName: execFileName,
+                        bundleRelativePath: relPath
+                    )
                     let linkedDep = aliases.lazy.compactMap { depsByInstallName[$0] }.first
                     for alias in aliases where depsByInstallName[alias] != nil {
                         matchedDepPaths.insert(alias)
@@ -285,9 +283,12 @@ enum LCPackageStagingManager {
                         isEnabled: true,
                         dependentNames: depsList
                     ))
-                } else if ext == "dylib" {
+                } else {
                     let aliases = [
                         "@rpath/\(itemName)",
+                        "@rpath/\(relPath)",
+                        "@executable_path/\(relPath)",
+                        "@loader_path/\(relPath)",
                         "@executable_path/Frameworks/\(itemName)",
                         "@loader_path/Frameworks/\(itemName)",
                         "@executable_path/\(itemName)"
@@ -298,9 +299,10 @@ enum LCPackageStagingManager {
                     }
                     let size = fileAllocatedSize(at: itemURL)
                     let depsList = Array(Set(reverseFrameworkDependents[itemName] ?? [])).sorted()
+                    let isRootDylib = !relPath.contains("/")
                     components.append(LCPackageComponentItem(
-                        id: "frameworkdylib:\(relPath)",
-                        kind: .framework,
+                        id: isRootDylib ? "rootdylib:\(itemName)" : "frameworkdylib:\(relPath)",
+                        kind: isRootDylib ? .linkedDylib : .framework,
                         name: itemName,
                         subtitle: linkedDep?.path ?? relPath,
                         loadCommandPath: linkedDep?.path,
@@ -313,35 +315,6 @@ enum LCPackageStagingManager {
                         dependentNames: depsList
                     ))
                 }
-            }
-
-            // Root-level dylibs copied directly into `.app/`
-            let rootItems = (try? fm.contentsOfDirectory(
-                at: stagedAppURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
-            for itemURL in rootItems where itemURL.pathExtension.lowercased() == "dylib" {
-                let itemName = itemURL.lastPathComponent
-                let aliases = ["@executable_path/\(itemName)", "@rpath/\(itemName)"]
-                let linkedDep = aliases.lazy.compactMap { depsByInstallName[$0] }.first
-                for alias in aliases where depsByInstallName[alias] != nil {
-                    matchedDepPaths.insert(alias)
-                }
-                components.append(LCPackageComponentItem(
-                    id: "rootdylib:\(itemName)",
-                    kind: .linkedDylib,
-                    name: itemName,
-                    subtitle: linkedDep?.path ?? itemName,
-                    loadCommandPath: linkedDep?.path,
-                    loadCommandAliases: aliases,
-                    bundleRelativePath: itemName,
-                    binaryURL: itemURL,
-                    fileSize: fileAllocatedSize(at: itemURL),
-                    isWeakLinked: linkedDep?.kind == .weak,
-                    isEnabled: true,
-                    dependentNames: []
-                ))
             }
 
             // Non-system linked dylib commands in main executable that did not map to an item above
@@ -455,13 +428,90 @@ enum LCPackageStagingManager {
         path.hasPrefix("/System/Library/") || path.hasPrefix("/usr/lib/")
     }
 
-    private nonisolated static func candidateLoadPaths(frameworkFolder: String, execName: String) -> [String] {
-        [
+    private struct EmbeddedEntry {
+        let url: URL
+        let relativePath: String
+        let isFramework: Bool
+        let execURL: URL?
+    }
+
+    private nonisolated static func collectEmbeddedBinaries(in appURL: URL, fileManager fm: FileManager) -> [EmbeddedEntry] {
+        let basePath = appURL.standardizedFileURL.path
+        var results: [EmbeddedEntry] = []
+        var seenRelPaths = Set<String>()
+
+        func appendIfValid(url: URL, isFramework: Bool) {
+            let stdPath = url.standardizedFileURL.path
+            let relPath: String
+            if stdPath.hasPrefix(basePath + "/") {
+                relPath = String(stdPath.dropFirst(basePath.count + 1))
+            } else {
+                relPath = url.lastPathComponent
+            }
+            guard seenRelPaths.insert(relPath).inserted else { return }
+            let execURL = isFramework ? LCBoundedFileReader.resolveMachOExecutableURL(for: url) : url
+            results.append(EmbeddedEntry(url: url, relativePath: relPath, isFramework: isFramework, execURL: execURL))
+        }
+
+        // Scan top-level `.app/*.dylib` and common binary folders (`Frameworks`, `Dylibs`, `Tweaks`, `Libraries`), plus nested frameworks and `PlugIns/*.appex/Frameworks`.
+        var scanQueue: [URL] = [
+            appURL.appendingPathComponent("Frameworks", isDirectory: true),
+            appURL.appendingPathComponent("Dylibs", isDirectory: true),
+            appURL.appendingPathComponent("Tweaks", isDirectory: true),
+            appURL.appendingPathComponent("Libraries", isDirectory: true)
+        ]
+
+        if let plugIns = try? fm.contentsOfDirectory(at: appURL.appendingPathComponent("PlugIns", isDirectory: true), includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for appex in plugIns where appex.pathExtension.lowercased() == "appex" {
+                scanQueue.append(appex.appendingPathComponent("Frameworks", isDirectory: true))
+            }
+        }
+
+        if let rootItems = try? fm.contentsOfDirectory(at: appURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for itemURL in rootItems where itemURL.pathExtension.lowercased() == "dylib" {
+                appendIfValid(url: itemURL, isFramework: false)
+            }
+        }
+
+        var idx = 0
+        while idx < scanQueue.count {
+            let dirURL = scanQueue[idx]
+            idx += 1
+            let children = (try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+            for child in children {
+                let ext = child.pathExtension.lowercased()
+                if ext == "framework" {
+                    appendIfValid(url: child, isFramework: true)
+                    let nestedFW = child.appendingPathComponent("Frameworks", isDirectory: true)
+                    if fm.fileExists(atPath: nestedFW.path) {
+                        scanQueue.append(nestedFW)
+                    }
+                } else if ext == "dylib" {
+                    appendIfValid(url: child, isFramework: false)
+                }
+            }
+        }
+
+        return results.sorted { $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending }
+    }
+
+    private nonisolated static func candidateLoadPaths(
+        frameworkFolder: String,
+        execName: String,
+        bundleRelativePath: String? = nil
+    ) -> [String] {
+        var paths = [
             "@rpath/\(frameworkFolder)/\(execName)",
+            "@rpath/\(frameworkFolder)/Versions/A/\(execName)",
             "@executable_path/Frameworks/\(frameworkFolder)/\(execName)",
             "@loader_path/Frameworks/\(frameworkFolder)/\(execName)",
             "@executable_path/../../Frameworks/\(frameworkFolder)/\(execName)"
         ]
+        if let bundleRelativePath, !bundleRelativePath.isEmpty {
+            paths.append("@executable_path/\(bundleRelativePath)/\(execName)")
+            paths.append("@loader_path/\(bundleRelativePath)/\(execName)")
+        }
+        return paths
     }
 
     private nonisolated static func matchedFrameworkOrDylibKey(for loadPath: String) -> String? {
@@ -484,7 +534,7 @@ enum LCPackageStagingManager {
         guard let enumerator = fileManager.enumerator(
             at: url,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsPackageDescendants]
+            options: []
         ) else {
             return fileAllocatedSize(at: url)
         }

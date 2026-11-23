@@ -56,6 +56,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     @State var choosingIPA = false
     @State var choosingIPAForEdit = false
     @State var pendingPreInstallSession: LCPackageStagingSession?
+    @State private var lastPresentedPreInstallSession: LCPackageStagingSession?
+    @State private var handedOffPreInstallSessionIds: Set<UUID> = []
     @State var errorShow = false
     @State var errorInfo = ""
     
@@ -497,17 +499,32 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             .sheet(isPresented: $customSortViewPresent) {
                 LCCustomSortView()
             }
-            .sheet(item: $pendingPreInstallSession) { session in
+            .sheet(item: $pendingPreInstallSession, onDismiss: {
+                if let dismissed = lastPresentedPreInstallSession {
+                    if handedOffPreInstallSessionIds.remove(dismissed.id) == nil {
+                        dismissed.cleanup(deleteSourceIPA: true)
+                    }
+                    lastPresentedPreInstallSession = nil
+                }
+            }) { session in
                 LCPackageEditorView(
                     session: session,
                     onCancel: {
                         pendingPreInstallSession = nil
                     },
                     onPreInstallReady: { readySession in
+                        handedOffPreInstallSessionIds.insert(session.id)
                         pendingPreInstallSession = nil
-                        Task { await finalizeEditedPreInstallSession(readySession) }
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(300))
+                            await finalizeEditedPreInstallSession(readySession)
+                        }
                     }
                 )
+                .id(session.id)
+                .onAppear {
+                    lastPresentedPreInstallSession = session
+                }
             }
             .onAppear {
                 if !isViewAppeared {
@@ -731,11 +748,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             do {
                 let stagedSession = try await LCAppInstaller.stageIPA(
                     at: fileUrl,
-                    sourceIPAURLToDeleteOnFinish: fileUrl,
+                    sourceIPAURLToDeleteOnFinish: nil,
                     progressHandler: { fraction, _ in
                         self.installProgressPercentage = Float(fraction)
                     }
                 )
+                try? FileManager.default.removeItem(at: fileUrl)
                 self.installprogressVisible = false
                 self.pendingPreInstallSession = stagedSession
             } catch {

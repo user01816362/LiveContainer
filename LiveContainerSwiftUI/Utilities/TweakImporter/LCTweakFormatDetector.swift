@@ -28,12 +28,13 @@ enum LCTweakFormatDetector {
     /// Detects the actual format of `url` using file-header magic bytes first,
     /// falling back to path extension when magic bytes are ambiguous.
     nonisolated static func detectFormat(at url: URL, fileManager: FileManager = .default) -> LCTweakSourceFormat {
+        let normalizedName = strippedDisabledSuffix(url.lastPathComponent)
+        let ext = URL(fileURLWithPath: normalizedName).pathExtension.lowercased()
+
         var isDir = ObjCBool(false)
         if fileManager.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-            return url.pathExtension.lowercased() == "framework" ? .framework : .unknown
+            return ext == "framework" ? .framework : .unknown
         }
-
-        let ext = url.pathExtension.lowercased()
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             return formatFromExtension(ext)
         }
@@ -197,6 +198,12 @@ enum LCTweakFormatDetector {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "\0", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    nonisolated static func strippedDisabledSuffix(_ fileName: String) -> String {
+        fileName.lowercased().hasSuffix(".disabled")
+            ? String(fileName.dropLast(".disabled".count))
+            : fileName
     }
 
     private nonisolated static func formatFromExtension(_ ext: String) -> LCTweakSourceFormat {

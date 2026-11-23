@@ -224,6 +224,13 @@ final class LCBoundedFileReader: @unchecked Sendable {
             return isMachOFile(at: url) ? url : nil
         }
 
+        let fm = FileManager.default
+        let topItems = (try? fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
         // Check Info.plist -> CFBundleExecutable
         let infoPlistURL = url.appendingPathComponent("Info.plist")
         if let plistData = try? Data(contentsOf: infoPlistURL),
@@ -234,6 +241,16 @@ final class LCBoundedFileReader: @unchecked Sendable {
             if isMachOFile(at: candidate) {
                 return candidate
             }
+            if let caseMatch = topItems.first(where: { $0.lastPathComponent.caseInsensitiveCompare(execName) == .orderedSame }),
+               isMachOFile(at: caseMatch) {
+                return caseMatch
+            }
+            for verCandidate in [
+                url.appendingPathComponent("Versions/Current/\(execName)"),
+                url.appendingPathComponent("Versions/A/\(execName)")
+            ] where isMachOFile(at: verCandidate) {
+                return verCandidate
+            }
         }
 
         // Fallback for `.framework` / `.framework.disabled` bundles without Info.plist
@@ -243,9 +260,23 @@ final class LCBoundedFileReader: @unchecked Sendable {
         }
         let stem = (baseName as NSString).deletingPathExtension
         if !stem.isEmpty {
-            let direct = url.appendingPathComponent(stem)
-            if isMachOFile(at: direct) {
-                return direct
+            for candidate in [
+                url.appendingPathComponent(stem),
+                url.appendingPathComponent("Versions/Current/\(stem)"),
+                url.appendingPathComponent("Versions/A/\(stem)")
+            ] where isMachOFile(at: candidate) {
+                return candidate
+            }
+        }
+
+        // Last resort: scan top-level binary files in the bundle
+        for itemURL in topItems {
+            let ext = itemURL.pathExtension.lowercased()
+            if ext == "plist" || ext == "png" || ext == "strings" || ext == "nib" || ext == "car" || ext == "mobileprovision" {
+                continue
+            }
+            if isMachOFile(at: itemURL) {
+                return itemURL
             }
         }
 

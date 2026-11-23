@@ -18,6 +18,9 @@ enum LCPackagePatchPipeline {
     ) async throws {
         try await lcRunOffMain {
             let fm = FileManager.default
+            guard fm.fileExists(atPath: stagedAppURL.path) else {
+                throw "The staged app session directory no longer exists on disk."
+            }
             guard let mainExecURL = LCBoundedFileReader.resolveMachOExecutableURL(for: stagedAppURL) else {
                 throw "Unable to locate the main executable inside \(stagedAppURL.lastPathComponent)."
             }
@@ -188,7 +191,7 @@ enum LCPackagePatchPipeline {
             }
 
             for dylibURL in payloads.dylibs {
-                let fileName = dylibURL.lastPathComponent
+                let fileName = LCTweakFormatDetector.strippedDisabledSuffix(dylibURL.lastPathComponent)
                 let destURL = frameworksDir.appendingPathComponent(fileName)
                 if fm.fileExists(atPath: destURL.path) {
                     try fm.removeItem(at: destURL)
@@ -206,7 +209,7 @@ enum LCPackagePatchPipeline {
             }
 
             for fwURL in payloads.frameworks {
-                let fwName = fwURL.lastPathComponent
+                let fwName = LCTweakFormatDetector.strippedDisabledSuffix(fwURL.lastPathComponent)
                 let destFWURL = frameworksDir.appendingPathComponent(fwName, isDirectory: true)
                 if fm.fileExists(atPath: destFWURL.path) {
                     try fm.removeItem(at: destFWURL)
@@ -252,7 +255,7 @@ enum LCPackagePatchPipeline {
                 if let err = LCMachORemoveRPathAtPath(substrateExec.path, liveContainerTweaksRPath) {
                     throw err
                 }
-                if plan.mode == .standaloneExport, let err = LCMachOStripCodeSignatureAtPath(substrateExec.path) {
+                if let err = LCMachOStripCodeSignatureAtPath(substrateExec.path) {
                     throw err
                 }
                 if let err = LCPatchMachOFixupARM64eSlice(substrateExec.path) {
@@ -295,10 +298,8 @@ enum LCPackagePatchPipeline {
                 }
             }
 
-            if plan.mode == .standaloneExport {
-                if let err = LCMachOStripCodeSignatureAtPath(item.binaryURL.path) {
-                    throw err
-                }
+            if let err = LCMachOStripCodeSignatureAtPath(item.binaryURL.path) {
+                throw err
             }
             if let err = LCPatchMachOFixupARM64eSlice(item.binaryURL.path) {
                 throw err
@@ -306,11 +307,9 @@ enum LCPackagePatchPipeline {
             try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: item.binaryURL.path)
         }
 
-        // Strip code signature on mainExec before injecting when in standalone export so 16 B headroom is maximized.
-        if plan.mode == .standaloneExport {
-            if let err = LCMachOStripCodeSignatureAtPath(mainExecURL.path) {
-                throw err
-            }
+        // Strip code signature on mainExec before injecting so load-command header headroom is maximized.
+        if let err = LCMachOStripCodeSignatureAtPath(mainExecURL.path) {
+            throw err
         }
 
         if let err = LCMachOEnsureRPathAtPath(mainExecURL.path, "@executable_path/Frameworks") {
@@ -354,9 +353,7 @@ enum LCPackagePatchPipeline {
 
             if item.injectIntoExtensions {
                 for extExec in extensionExecURLs {
-                    if plan.mode == .standaloneExport {
-                        _ = LCMachOStripCodeSignatureAtPath(extExec.path)
-                    }
+                    _ = LCMachOStripCodeSignatureAtPath(extExec.path)
                     if let rpathErr = LCMachOEnsureRPathAtPath(extExec.path, "@executable_path/../../Frameworks") {
                         throw rpathErr
                     }

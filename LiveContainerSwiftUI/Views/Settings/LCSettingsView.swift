@@ -101,7 +101,7 @@ struct LCSettingsView: View {
         } header: {
             Text("Privacy & Device Presets")
         } footer: {
-            Text("Automatically apply a 2026–2027 hardware preset or coherent randomized identity whenever new app containers are created.")
+            Text("Automatically apply a hardware preset or coherent randomized identity whenever new app containers are created.")
         }
     }
 

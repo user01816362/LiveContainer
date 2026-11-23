@@ -240,7 +240,8 @@ enum LCTweakArchiveUnpacker {
         fileManager fm: FileManager = .default
     ) throws -> LCExtractedSimplePayloads {
         let format = LCTweakFormatDetector.detectFormat(at: sourceURL, fileManager: fm)
-        let stagedInput = workDir.appendingPathComponent(sourceURL.lastPathComponent, isDirectory: format == .framework)
+        let normalizedName = LCTweakFormatDetector.strippedDisabledSuffix(sourceURL.lastPathComponent)
+        let stagedInput = workDir.appendingPathComponent(normalizedName, isDirectory: format == .framework)
         if sourceURL.standardizedFileURL != stagedInput.standardizedFileURL {
             if fm.fileExists(atPath: stagedInput.path) {
                 try fm.removeItem(at: stagedInput)

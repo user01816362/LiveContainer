@@ -306,6 +306,7 @@ final class LCAppInstaller {
                 sourceIPAURLToDelete: sourceIPAURLToDeleteOnFinish
             )
         } catch {
+            LCPackageStagingManager.unregisterActiveSession(stagingDir.lastPathComponent)
             try? fm.removeItem(at: stagingDir)
             throw error
         }
@@ -673,6 +674,7 @@ final class LCPendingDownloadPreInstallRequest: Identifiable, @unchecked Sendabl
     let id = UUID()
     let downloadItemId: UUID
     let session: LCPackageStagingSession
+    let originalBundleId: String?
     let sourceURL: String?
     let sourceVersion: String?
     let sourceBuildVersion: String?
@@ -682,6 +684,7 @@ final class LCPendingDownloadPreInstallRequest: Identifiable, @unchecked Sendabl
     init(
         downloadItemId: UUID,
         session: LCPackageStagingSession,
+        originalBundleId: String?,
         sourceURL: String?,
         sourceVersion: String?,
         sourceBuildVersion: String?,
@@ -690,6 +693,7 @@ final class LCPendingDownloadPreInstallRequest: Identifiable, @unchecked Sendabl
     ) {
         self.downloadItemId = downloadItemId
         self.session = session
+        self.originalBundleId = originalBundleId
         self.sourceURL = sourceURL
         self.sourceVersion = sourceVersion
         self.sourceBuildVersion = sourceBuildVersion
@@ -1211,9 +1215,11 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                         items[liveIdx].state = .installing("Ready to edit…")
                         persistQueue()
                     }
+                    let originalBundleId = LCAppInfo(bundlePath: stagedSession.stagedAppURL.path)?.bundleIdentifier()
                     let request = LCPendingDownloadPreInstallRequest(
                         downloadItemId: item.id,
                         session: stagedSession,
+                        originalBundleId: originalBundleId,
                         sourceURL: sourceURL,
                         sourceVersion: version,
                         sourceBuildVersion: buildVersion,
@@ -1287,12 +1293,19 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
     func finalizePendingPreInstall(_ request: LCPendingDownloadPreInstallRequest) async {
         defer { request.session.cleanup(deleteSourceIPA: false) }
         do {
+            let finalBundleId = LCAppInfo(bundlePath: request.session.stagedAppURL.path)?.bundleIdentifier()
+            let didChangeBundleId: Bool = {
+                guard let orig = request.originalBundleId, let updated = finalBundleId else { return false }
+                return orig != updated
+            }()
+            let effectiveTargetRelPath = didChangeBundleId ? nil : request.targetRelPath
+
             let outcome = try await LCAppInstaller.finalizeStagedInstall(
                 session: request.session,
                 sourceURL: request.sourceURL,
                 sourceVersion: request.sourceVersion,
                 sourceBuildVersion: request.sourceBuildVersion,
-                preferredTargetRelativePath: request.targetRelPath,
+                preferredTargetRelativePath: effectiveTargetRelPath,
                 ignoreUpdateKeyAfterInstall: request.ignoreUpdateKeyAfterInstall,
                 progressHandler: { [weak self] fraction, label in
                     guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == request.downloadItemId }) else { return }
@@ -1324,7 +1337,8 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
             pendingPreInstallRequest = nil
         }
         request.session.cleanup(deleteSourceIPA: false)
-        if let liveIdx = items.firstIndex(where: { $0.id == request.downloadItemId }) {
+        if let liveIdx = items.firstIndex(where: { $0.id == request.downloadItemId }),
+           case .installing = items[liveIdx].state {
             items[liveIdx].state = .failed("Installation cancelled.")
             persistQueue()
         }
