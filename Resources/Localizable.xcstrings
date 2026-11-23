@@ -35068,13 +35068,13 @@
         "ar" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "إخفاء الزر العائم بالكامل عند طيّه وبعد عدم التفاعل (مفيد لالتقاط الشاشة). اسحب من حافة الشاشة أو المس الحافة أو شريط النافذة لإظهاره."
+            "value" : "إخفاء الزر العائم بالكامل عند طيّه وسحبه للحافة بعد عدم التفاعل (مفيد لالتقاط الشاشة). المس الشاشة لإظهار الزر الشفاف، أو اسحب من الحافة لفتحه."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Completely hides the floating dock after inactivity when collapsed (great for clean screenshots). Swipe from the screen edge, tap the edge sliver, or touch a window bar to show it again."
+            "value" : "Completely hides the collapsed side-tucked floating dock after inactivity (great for clean screenshots). Touch the screen to wake it cleanly, or swipe/tap the edge to unhide."
           }
         }
       }
