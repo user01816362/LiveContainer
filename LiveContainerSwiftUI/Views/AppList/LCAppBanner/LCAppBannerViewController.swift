@@ -302,6 +302,14 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
                     }
                 },
                 UIAction(
+                    title: "Export Standalone / Tweaked IPA…",
+                    image: UIImage(systemName: "wrench.and.screwdriver")
+                ) { [weak self] _ in
+                    Task { [weak self] in
+                        await self?.openStandaloneIPAEditor()
+                    }
+                },
+                UIAction(
                     title: "Export Data",
                     image: UIImage(systemName: "folder.fill"),
                     attributes: dataExportDisabled

@@ -295,8 +295,150 @@ final class LCAppInstaller {
         }
     }
 
+    static func stageIPA(
+        at ipaFileURL: URL,
+        sourceIPAURLToDeleteOnFinish: URL? = nil,
+        progressHandler: (@MainActor (Double, String) -> Void)? = nil
+    ) async throws -> LCPackageStagingSession {
+        await acquireSerialInstallSlot()
+        defer { releaseSerialInstallSlot() }
+
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "LCAppStageIPA")
+        defer {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+        }
+
+        let fm = FileManager.default
+        let stagingDir = try LCPackageStagingManager.makeSessionDirectory(fileManager: fm)
+
+        do {
+            let installProgress = Progress.discreteProgress(totalUnitCount: 100)
+            let decompressProgress = Progress.discreteProgress(totalUnitCount: 100)
+            installProgress.addChild(decompressProgress, withPendingUnitCount: 100)
+
+            let relay = InstallProgressRelay(progressHandler)
+            let observer = installProgress.observe(\.fractionCompleted) { p, _ in
+                let fraction = p.fractionCompleted * 0.70
+                Task { @MainActor in
+                    relay.handler?(fraction, "Unpacking…")
+                }
+            }
+            defer { observer.invalidate() }
+
+            progressHandler?(0.02, "Unpacking…")
+            let ipaPath = ipaFileURL.path
+            let destPath = stagingDir.path
+            let extractCode = await Task.detached(priority: .userInitiated) {
+                extract(ipaPath, destPath, decompressProgress)
+            }.value
+            guard extractCode == 0 else {
+                throw "lc.appList.urlFileIsNotIpaError".loc
+            }
+
+            let (stagedBundleURL, importedDataURL) = try await lcRunOffMain { () throws -> (URL, URL?) in
+                let localFM = FileManager.default
+                let archiveRootDir: URL
+                let directPayload = stagingDir.appendingPathComponent("Payload", isDirectory: true)
+                if localFM.fileExists(atPath: directPayload.path) {
+                    archiveRootDir = stagingDir
+                } else {
+                    // Defensive fallback: rescue legacy single-wrapper archives if Payload/ sits one level down
+                    let topItems = (try? localFM.contentsOfDirectory(
+                        at: stagingDir,
+                        includingPropertiesForKeys: [.isDirectoryKey],
+                        options: [.skipsHiddenFiles]
+                    )) ?? []
+                    let wrapperCandidates = topItems.filter { item in
+                        item.lastPathComponent != "__MACOSX"
+                            && ((try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true)
+                            && localFM.fileExists(atPath: item.appendingPathComponent("Payload", isDirectory: true).path)
+                    }
+                    guard wrapperCandidates.count == 1, let rescuedRoot = wrapperCandidates.first else {
+                        throw "lc.appList.bundleNotFondError".loc
+                    }
+                    archiveRootDir = rescuedRoot
+                }
+
+                let payloadPath = archiveRootDir.appendingPathComponent("Payload", isDirectory: true)
+                let payloadItems = try localFM.contentsOfDirectory(
+                    at: payloadPath,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: []
+                )
+                guard let bundleItem = payloadItems.first(where: { item in
+                    let name = item.lastPathComponent
+                    let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    return !name.hasPrefix("._")
+                        && name.hasSuffix(".app")
+                        && values?.isDirectory == true
+                        && values?.isSymbolicLink != true
+                }) else {
+                    throw "lc.appList.bundleNotFondError".loc
+                }
+
+                // Extract sibling LCContainerData (or legacy LCUserData) OUT of the bundle BEFORE
+                // LCAppInfo/ZSign touch it so user data is never signed as app bundle resources.
+                var resolvedImportedDataURL: URL? = nil
+                let siblingDataURL = archiveRootDir.appendingPathComponent("LCContainerData", isDirectory: true)
+                let siblingValues = try? siblingDataURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                if siblingValues?.isDirectory == true && siblingValues?.isSymbolicLink != true {
+                    resolvedImportedDataURL = siblingDataURL
+                } else {
+                    let legacyUserDataURL = bundleItem.appendingPathComponent("LCUserData", isDirectory: true)
+                    let legacyValues = try? legacyUserDataURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    if legacyValues?.isDirectory == true && legacyValues?.isSymbolicLink != true {
+                        let relocatedURL = stagingDir.appendingPathComponent("LCImportedLegacyData-\(UUID().uuidString)", isDirectory: true)
+                        try localFM.moveItem(at: legacyUserDataURL, to: relocatedURL)
+                        resolvedImportedDataURL = relocatedURL
+                    }
+                }
+
+                // Strip any leaked LiveContainer metadata/icon caches and restore original bundle ID before LCAppInfo reads it.
+                try lcSanitizeStagedAppBundle(at: bundleItem, unpatchExecutables: false, fileManager: localFM)
+                return (bundleItem, resolvedImportedDataURL)
+            }
+
+            return LCPackageStagingSession(
+                mode: .preInstall,
+                stagingRootURL: stagingDir,
+                stagedAppURL: stagedBundleURL,
+                importedDataURL: importedDataURL,
+                sourceIPAURLToDelete: sourceIPAURLToDeleteOnFinish
+            )
+        } catch {
+            try? fm.removeItem(at: stagingDir)
+            throw error
+        }
+    }
+
     static func installIPA(
         at ipaFileURL: URL,
+        sourceURL: String? = nil,
+        sourceVersion: String? = nil,
+        sourceBuildVersion: String? = nil,
+        preferredTargetRelativePath: String? = nil,
+        ignoreUpdateKeyAfterInstall: String? = nil,
+        chooseAppToReplace: (@MainActor ([AppReplaceOption]) async -> AppReplaceOption?)? = nil,
+        progressHandler: (@MainActor (Double, String) -> Void)? = nil
+    ) async throws -> LCAppInstallOutcome {
+        let session = try await stageIPA(at: ipaFileURL, sourceIPAURLToDeleteOnFinish: nil, progressHandler: progressHandler)
+        defer { session.cleanup(deleteSourceIPA: false) }
+        return try await finalizeStagedInstall(
+            session: session,
+            sourceURL: sourceURL,
+            sourceVersion: sourceVersion,
+            sourceBuildVersion: sourceBuildVersion,
+            preferredTargetRelativePath: preferredTargetRelativePath,
+            ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall,
+            chooseAppToReplace: chooseAppToReplace,
+            progressHandler: progressHandler
+        )
+    }
+
+    static func finalizeStagedInstall(
+        session: LCPackageStagingSession,
         sourceURL: String? = nil,
         sourceVersion: String? = nil,
         sourceBuildVersion: String? = nil,
@@ -316,96 +458,17 @@ final class LCAppInstaller {
         }
 
         let fm = FileManager.default
-        let stagingDir = fm.temporaryDirectory.appendingPathComponent("LCInstall-\(UUID().uuidString)", isDirectory: true)
-        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: stagingDir) }
-
+        let stagedBundleURL = session.stagedAppURL
+        let importedDataURL = session.importedDataURL
         let installProgress = Progress.discreteProgress(totalUnitCount: 100)
-        let decompressProgress = Progress.discreteProgress(totalUnitCount: 100)
-        installProgress.addChild(decompressProgress, withPendingUnitCount: 75)
-
         let relay = InstallProgressRelay(progressHandler)
         let observer = installProgress.observe(\.fractionCompleted) { p, _ in
-            let fraction = p.fractionCompleted
+            let fraction = 0.75 + p.fractionCompleted * 0.20
             Task { @MainActor in
-                let label = fraction < 0.75 ? "Unpacking…" : "Signing…"
-                relay.handler?(fraction, label)
+                relay.handler?(fraction, "Signing…")
             }
         }
         defer { observer.invalidate() }
-
-        progressHandler?(0.02, "Unpacking…")
-        let ipaPath = ipaFileURL.path
-        let destPath = stagingDir.path
-        let extractCode = await Task.detached(priority: .userInitiated) {
-            extract(ipaPath, destPath, decompressProgress)
-        }.value
-        guard extractCode == 0 else {
-            throw "lc.appList.urlFileIsNotIpaError".loc
-        }
-
-        let (stagedBundleURL, importedDataURL) = try await lcRunOffMain { () throws -> (URL, URL?) in
-            let localFM = FileManager.default
-            let archiveRootDir: URL
-            let directPayload = stagingDir.appendingPathComponent("Payload", isDirectory: true)
-            if localFM.fileExists(atPath: directPayload.path) {
-                archiveRootDir = stagingDir
-            } else {
-                // Defensive fallback: rescue legacy single-wrapper archives if Payload/ sits one level down
-                let topItems = (try? localFM.contentsOfDirectory(
-                    at: stagingDir,
-                    includingPropertiesForKeys: [.isDirectoryKey],
-                    options: [.skipsHiddenFiles]
-                )) ?? []
-                let wrapperCandidates = topItems.filter { item in
-                    item.lastPathComponent != "__MACOSX"
-                        && ((try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true)
-                        && localFM.fileExists(atPath: item.appendingPathComponent("Payload", isDirectory: true).path)
-                }
-                guard wrapperCandidates.count == 1, let rescuedRoot = wrapperCandidates.first else {
-                    throw "lc.appList.bundleNotFondError".loc
-                }
-                archiveRootDir = rescuedRoot
-            }
-
-            let payloadPath = archiveRootDir.appendingPathComponent("Payload", isDirectory: true)
-            let payloadItems = try localFM.contentsOfDirectory(
-                at: payloadPath,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: []
-            )
-            guard let bundleItem = payloadItems.first(where: { item in
-                let name = item.lastPathComponent
-                let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                return !name.hasPrefix("._")
-                    && name.hasSuffix(".app")
-                    && values?.isDirectory == true
-                    && values?.isSymbolicLink != true
-            }) else {
-                throw "lc.appList.bundleNotFondError".loc
-            }
-
-            // Extract sibling LCContainerData (or legacy LCUserData) OUT of the bundle BEFORE
-            // LCAppInfo/ZSign touch it so user data is never signed as app bundle resources.
-            var resolvedImportedDataURL: URL? = nil
-            let siblingDataURL = archiveRootDir.appendingPathComponent("LCContainerData", isDirectory: true)
-            let siblingValues = try? siblingDataURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            if siblingValues?.isDirectory == true && siblingValues?.isSymbolicLink != true {
-                resolvedImportedDataURL = siblingDataURL
-            } else {
-                let legacyUserDataURL = bundleItem.appendingPathComponent("LCUserData", isDirectory: true)
-                let legacyValues = try? legacyUserDataURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                if legacyValues?.isDirectory == true && legacyValues?.isSymbolicLink != true {
-                    let relocatedURL = stagingDir.appendingPathComponent("LCImportedLegacyData-\(UUID().uuidString)", isDirectory: true)
-                    try localFM.moveItem(at: legacyUserDataURL, to: relocatedURL)
-                    resolvedImportedDataURL = relocatedURL
-                }
-            }
-
-            // Strip any leaked LiveContainer metadata/icon caches and restore original bundle ID before LCAppInfo reads it.
-            try lcSanitizeStagedAppBundle(at: bundleItem, unpatchExecutables: false, fileManager: localFM)
-            return (bundleItem, resolvedImportedDataURL)
-        }
 
         guard let stagedAppInfo = LCAppInfo(bundlePath: stagedBundleURL.path) else {
             throw "lc.appList.infoPlistCannotReadError".loc

@@ -54,12 +54,16 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     @State var didAppear = false
     // ipa choosing stuff
     @State var choosingIPA = false
+    @State var choosingIPAForEdit = false
+    @State var pendingPreInstallSession: LCPackageStagingSession?
     @State var errorShow = false
     @State var errorInfo = ""
     
     // ipa installing stuff
     @State var installprogressVisible = false
     @State var installProgressPercentage : Float = 0.0
+
+    @AppStorage("LCEditBeforeInstall", store: LCUtils.appGroupUserDefault) private var editBeforeInstall = false
 
     @State var installOptions: [AppReplaceOption] = []
     @StateObject var installReplaceAlert = AlertHelper<AppReplaceOption>()
@@ -358,6 +362,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         Button("lc.appList.installFromIpa".loc, systemImage: "doc.badge.plus", action: {
                             choosingIPA = true
                         })
+                        Button("lc.appList.installAndEditIpa".loc, systemImage: "slider.horizontal.2.square.on.square", action: {
+                            choosingIPAForEdit = true
+                        })
                         Button("lc.appList.installFromUrl".loc, systemImage: "link.badge.plus", action: {
                             Task { await startInstallFromUrl() }
                         })
@@ -383,9 +390,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 Text(errorInfo)
             }
             .betterFileImporter(isPresented: $choosingIPA, types: [.ipa, .tipa], multiple: false, callback: { fileUrls in
-                Task { await startInstallApp(fileUrls[0]) }
+                Task { await startInstallApp(fileUrls[0], forceEdit: false) }
             }, onDismiss: {
                 choosingIPA = false
+            })
+            .betterFileImporter(isPresented: $choosingIPAForEdit, types: [.ipa, .tipa], multiple: false, callback: { fileUrls in
+                Task { await startInstallApp(fileUrls[0], forceEdit: true) }
+            }, onDismiss: {
+                choosingIPAForEdit = false
             })
             .alert("lc.appList.installation".loc, isPresented: $installReplaceAlert.show) {
                 ForEach(installOptions, id: \.self) { installOption in
@@ -484,6 +496,18 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
             .sheet(isPresented: $customSortViewPresent) {
                 LCCustomSortView()
+            }
+            .sheet(item: $pendingPreInstallSession) { session in
+                LCPackageEditorView(
+                    session: session,
+                    onCancel: {
+                        pendingPreInstallSession = nil
+                    },
+                    onPreInstallReady: { readySession in
+                        pendingPreInstallSession = nil
+                        Task { await finalizeEditedPreInstallSession(readySession) }
+                    }
+                )
             }
             .onAppear {
                 if !isViewAppeared {
@@ -700,7 +724,29 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
 
     
-    func startInstallApp(_ fileUrl:URL) async {
+    func startInstallApp(_ fileUrl: URL, forceEdit: Bool = false) async {
+        if forceEdit || editBeforeInstall {
+            self.installProgressPercentage = 0.0
+            self.installprogressVisible = true
+            do {
+                let stagedSession = try await LCAppInstaller.stageIPA(
+                    at: fileUrl,
+                    sourceIPAURLToDeleteOnFinish: fileUrl,
+                    progressHandler: { fraction, _ in
+                        self.installProgressPercentage = Float(fraction)
+                    }
+                )
+                self.installprogressVisible = false
+                self.pendingPreInstallSession = stagedSession
+            } catch {
+                try? FileManager.default.removeItem(at: fileUrl)
+                errorInfo = error.localizedDescription
+                errorShow = true
+                self.installprogressVisible = false
+            }
+            return
+        }
+
         do {
             self.installprogressVisible = true
             try await installIpaFile(fileUrl)
@@ -709,6 +755,33 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             errorInfo = error.localizedDescription
             errorShow = true
             self.installprogressVisible = false
+        }
+    }
+
+    func finalizeEditedPreInstallSession(_ session: LCPackageStagingSession) async {
+        defer { session.cleanup(deleteSourceIPA: true) }
+        self.installProgressPercentage = 0.75
+        self.installprogressVisible = true
+        defer { self.installprogressVisible = false }
+
+        do {
+            let outcome = try await LCAppInstaller.finalizeStagedInstall(
+                session: session,
+                chooseAppToReplace: { options in
+                    self.installOptions = options
+                    return await self.installReplaceAlert.open()
+                },
+                progressHandler: { fraction, _ in
+                    self.installProgressPercentage = Float(fraction)
+                }
+            )
+            if let warning = outcome.warningMessage {
+                self.errorInfo = warning
+                self.errorShow = true
+            }
+        } catch {
+            errorInfo = error.localizedDescription
+            errorShow = true
         }
     }
     

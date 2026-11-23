@@ -17,5 +17,6 @@
 #include "../MultitaskSupport/VirtualWindowsHostView.h"
 #include "../LiveContainer/FoundationPrivate.h"
 #include "../LiveContainer/LCDeviceProfileCatalog.h"
+#include "Utilities/PackageEditor/LCMachOEditor.h"
 
 #endif /* LiveContainerSwiftUI_Bridging_Header_h_h */

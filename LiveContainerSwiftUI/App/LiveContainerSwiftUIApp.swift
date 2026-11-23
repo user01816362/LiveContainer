@@ -153,6 +153,7 @@ private nonisolated func cleanupStaleExportArtifacts(fileManager: FileManager) {
     if fileManager.fileExists(atPath: exportDirectoryURL.path) {
         try? fileManager.removeItem(at: exportDirectoryURL)
     }
+    LCPackageStagingManager.cleanupStaleStagingDirectories(fileManager: fileManager)
 
     // Legacy staging folders used during export and install creation.
     let legacyPrefixes = ["LCAppExport-", "LCDataExport-", "LCBinaryExport-", "LCInstall-"]

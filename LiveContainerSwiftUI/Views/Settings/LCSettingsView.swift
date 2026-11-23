@@ -50,6 +50,7 @@ struct LCSettingsView: View {
     @AppStorage("LCSwitchAppWithoutAsking") var silentSwitchApp = false
     @AppStorage("LCOpenWebPageWithoutAsking") var silentOpenWebPage = false
     @AppStorage("LCDontSignApp", store: LCUtils.appGroupUserDefault) var dontSignApp = false
+    @AppStorage("LCEditBeforeInstall", store: LCUtils.appGroupUserDefault) var editBeforeInstall = false
     @AppStorage("LCStrictHiding", store: LCUtils.appGroupUserDefault) var strictHiding = false
     @AppStorage("dynamicColors", store: LCUtils.appGroupUserDefault) var dynamicColors = true
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) var darkModeIcon = false
@@ -289,6 +290,14 @@ struct LCSettingsView: View {
                     }
                 } footer: {
                     Text("lc.settings.dontSignDesc".loc)
+                }
+
+                Section {
+                    Toggle(isOn: $editBeforeInstall) {
+                        Text("lc.settings.editBeforeInstall".loc)
+                    }
+                } footer: {
+                    Text("lc.settings.editBeforeInstallDesc".loc)
                 }
 
                 Section {

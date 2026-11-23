@@ -160,6 +160,52 @@ extension LCAppBannerViewController {
         }
     }
 
+    func openStandaloneIPAEditor() async {
+        let appInfo = configuration.model.appInfo
+        guard let bundlePath = appInfo.bundlePath() else {
+            await MainActor.run { showError("Unable to read app bundle path.") }
+            return
+        }
+        let displayName = appInfo.displayName()
+        let tweakFolder = appInfo.tweakFolder
+
+        do {
+            let session = try await LCPackageStagingManager.stageInstalledApp(
+                bundlePath: bundlePath,
+                displayName: displayName,
+                tweakFolder: tweakFolder
+            )
+            await MainActor.run {
+                guard presentedViewController == nil else {
+                    session.cleanup()
+                    return
+                }
+                let editorView = LCPackageEditorView(
+                    session: session,
+                    onCancel: { [weak self] in
+                        self?.dismiss(animated: true)
+                    },
+                    onStandaloneExportReady: { [weak self] ipaURL in
+                        self?.dismiss(animated: true) {
+                            guard let self else {
+                                try? FileManager.default.removeItem(at: ipaURL.deletingLastPathComponent())
+                                return
+                            }
+                            self.presentExportShareSheet(for: ipaURL)
+                        }
+                    }
+                )
+                let controller = UIHostingController(rootView: editorView)
+                controller.modalPresentationStyle = .formSheet
+                present(controller, animated: true)
+            }
+        } catch {
+            await MainActor.run {
+                showError(error.localizedDescription)
+            }
+        }
+    }
+
     func exportData() async {
         do {
             let exportURL = try await createDataArchive()

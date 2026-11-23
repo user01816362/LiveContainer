@@ -35078,6 +35078,150 @@
           }
         }
       }
+    },
+    "lc.settings.editBeforeInstall" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تعديل IPA قبل التثبيت"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Edit IPA Before Installing"
+          }
+        }
+      }
+    },
+    "lc.settings.editBeforeInstallDesc" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "فتح محرر الحزمة لحقن أو إزالة التعديلات والإضافات وتعديل البيانات قبل تثبيت ملفات IPA من قائمة التطبيقات."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt to inject/remove dylibs, strip frameworks/extensions, or edit metadata before installing local IPA files."
+          }
+        }
+      }
+    },
+    "lc.appList.installAndEditIpa" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تعديل وتثبيت IPA..."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Install & Edit IPA…"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.mode.preInstall" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "قبل التثبيت"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pre-Install"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.mode.standaloneExport" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "مستقل بدون توقيع"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unsigned Standalone"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.action.install" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تثبيت"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Install"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.action.export" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تصدير ومشاركة"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export IPA"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.title.install" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تعديل الحزمة قبل التثبيت"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Edit Package Before Install"
+          }
+        }
+      }
+    },
+    "lc.packageEditor.title.export" : {
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تصدير IPA مستقل"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export Standalone IPA"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
