@@ -59,8 +59,11 @@ final class LCPackageStagingSession: Identifiable, @unchecked Sendable {
         }
 
         let fm = FileManager.default
-        if let stagingURL = urlsToRemove.0, fm.fileExists(atPath: stagingURL.path) {
-            try? fm.removeItem(at: stagingURL)
+        if let stagingURL = urlsToRemove.0 {
+            LCPackageStagingManager.unregisterActiveSession(stagingURL.lastPathComponent)
+            if fm.fileExists(atPath: stagingURL.path) {
+                try? fm.removeItem(at: stagingURL)
+            }
         }
         if let sourceURL = urlsToRemove.1, fm.fileExists(atPath: sourceURL.path) {
             try? fm.removeItem(at: sourceURL)
@@ -74,6 +77,11 @@ final class LCPackageStagingSession: Identifiable, @unchecked Sendable {
 
 enum LCPackageStagingManager {
     private nonisolated static let stagingFolderName = "LCStaging"
+    private nonisolated static let activeSessionNames = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    fileprivate nonisolated static func unregisterActiveSession(_ folderName: String) {
+        activeSessionNames.withLock { _ = $0.remove(folderName) }
+    }
 
     nonisolated static func stagingBaseDirectoryURL(fileManager: FileManager = .default) -> URL {
         fileManager.temporaryDirectory.appendingPathComponent(stagingFolderName, isDirectory: true)
@@ -81,14 +89,24 @@ enum LCPackageStagingManager {
 
     nonisolated static func cleanupStaleStagingDirectories(fileManager: FileManager = .default) {
         let baseURL = stagingBaseDirectoryURL(fileManager: fileManager)
-        if fileManager.fileExists(atPath: baseURL.path) {
-            try? fileManager.removeItem(at: baseURL)
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: baseURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else {
+            return
+        }
+        let protectedNames = activeSessionNames.withLock { $0 }
+        for childURL in children where !protectedNames.contains(childURL.lastPathComponent) {
+            try? fileManager.removeItem(at: childURL)
         }
     }
 
     nonisolated static func makeSessionDirectory(fileManager: FileManager = .default) throws -> URL {
+        let folderName = "Session-\(UUID().uuidString)"
         let sessionDir = stagingBaseDirectoryURL(fileManager: fileManager)
-            .appendingPathComponent("Session-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(folderName, isDirectory: true)
+        activeSessionNames.withLock { _ = $0.insert(folderName) }
         try fileManager.createDirectory(at: sessionDir, withIntermediateDirectories: true)
         return sessionDir
     }

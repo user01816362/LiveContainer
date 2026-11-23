@@ -285,10 +285,10 @@ struct LCPackageEditorView: View {
             .task {
                 await store.loadIfNeeded()
             }
-            .onDisappear {
-                if !store.didHandOffSession {
-                    store.session.cleanup()
-                }
+        }
+        .onDisappear {
+            if !store.didHandOffSession {
+                store.session.cleanup()
             }
         }
     }

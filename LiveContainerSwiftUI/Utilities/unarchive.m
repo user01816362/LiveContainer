@@ -172,9 +172,6 @@ NSString * _Nullable LCExtractArchiveAtPath(
     if (!normalizePermissions) {
         flags |= ARCHIVE_EXTRACT_PERM;
     }
-#ifdef ARCHIVE_EXTRACT_SECURE_SYMLINKS
-    flags |= ARCHIVE_EXTRACT_SECURE_SYMLINKS;
-#endif
 #ifdef ARCHIVE_EXTRACT_SECURE_NODOTDOT
     flags |= ARCHIVE_EXTRACT_SECURE_NODOTDOT;
 #endif
@@ -226,17 +223,25 @@ NSString * _Nullable LCExtractArchiveAtPath(
         }
 
         NSString *relPath = LCRelativeStringFromCStr(entryPathC, stripLeadingSlashes);
-        if (stripLeadingSlashes && (relPath.length == 0 || [relPath isEqualToString:@"."])) {
-            archive_read_data_skip(a);
-            continue;
-        }
         if (relPath.length == 0 || [relPath.pathComponents containsObject:@".."]) {
+            if (stripLeadingSlashes && relPath.length == 0) {
+                archive_read_data_skip(a);
+                continue;
+            }
             errorMessage = [NSString stringWithFormat:@"Rejected path traversal archive entry: %s", entryPathC];
             break;
+        }
+        if ([relPath isEqualToString:@"."] || [relPath isEqualToString:@"./"]) {
+            archive_read_data_skip(a);
+            continue;
         }
 
         NSString *candidatePath = [canonicalRoot stringByAppendingPathComponent:relPath];
         NSString *resolvedDest = [NSURL fileURLWithPath:candidatePath].URLByStandardizingPath.path;
+        if ([resolvedDest isEqualToString:canonicalRoot]) {
+            archive_read_data_skip(a);
+            continue;
+        }
         if (!LCIsResolvedPathWithinRoot(resolvedDest, canonicalRoot, rootPrefix) ||
             !LCEnsureExistingAncestorWithinRoot(resolvedDest.stringByDeletingLastPathComponent, canonicalRoot, rootPrefix)) {
             errorMessage = [NSString stringWithFormat:@"Rejected escaping archive path: %s", entryPathC];

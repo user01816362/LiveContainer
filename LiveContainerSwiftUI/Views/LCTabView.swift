@@ -47,6 +47,20 @@ struct LCTabView: View {
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        .sheet(item: $downloadManager.pendingPreInstallRequest) { request in
+            LCPackageEditorView(
+                session: request.session,
+                onCancel: {
+                    downloadManager.cancelPendingPreInstall(request)
+                },
+                onPreInstallReady: { _ in
+                    downloadManager.pendingPreInstallRequest = nil
+                    Task {
+                        await downloadManager.finalizePendingPreInstall(request)
+                    }
+                }
+            )
+        }
         .overlay(alignment: .bottom) {
             LCDownloadPillBar()
                 .padding(.bottom, 76)

@@ -749,8 +749,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
         do {
             self.installprogressVisible = true
+            defer { try? FileManager.default.removeItem(at: fileUrl) }
             try await installIpaFile(fileUrl)
-            try FileManager.default.removeItem(at: fileUrl)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
@@ -952,6 +952,33 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
             }
             
+            var shouldDelete = false
+            if let documentsDirectory = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let inboxURL = documentsDirectory.appendingPathComponent("Inbox")
+                shouldDelete = installUrl.deletingLastPathComponent().standardizedFileURL == inboxURL.standardizedFileURL
+            }
+
+            if editBeforeInstall {
+                self.installProgressPercentage = 0.0
+                do {
+                    let stagedSession = try await LCAppInstaller.stageIPA(
+                        at: installUrl,
+                        sourceIPAURLToDeleteOnFinish: shouldDelete ? installUrl : nil,
+                        progressHandler: { fraction, _ in
+                            self.installProgressPercentage = Float(fraction)
+                        }
+                    )
+                    self.pendingPreInstallSession = stagedSession
+                } catch {
+                    if shouldDelete {
+                        try? fm.removeItem(at: installUrl)
+                    }
+                    errorInfo = error.localizedDescription
+                    errorShow = true
+                }
+                return
+            }
+
             do {
                 try await installIpaFile(installUrl)
             } catch {
@@ -959,19 +986,13 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 errorShow = true
             }
             
-            do {
-                // delete ipa if it's in inbox
-                var shouldDelete = false
-                if let documentsDirectory = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
-                    let inboxURL = documentsDirectory.appendingPathComponent("Inbox")
-                    shouldDelete = installUrl.deletingLastPathComponent().standardizedFileURL == inboxURL.standardizedFileURL
-                }
-                if shouldDelete {
+            if shouldDelete {
+                do {
                     try fm.removeItem(at: installUrl)
+                } catch {
+                    errorInfo = error.localizedDescription
+                    errorShow = true
                 }
-            } catch {
-                errorInfo = error.localizedDescription
-                errorShow = true
             }
             return
         }

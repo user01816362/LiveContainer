@@ -225,11 +225,14 @@ final class LCAppInstaller {
             progressHandler?(0.02, "Unpacking…")
             let ipaPath = ipaFileURL.path
             let destPath = stagingDir.path
-            let extractCode = await Task.detached(priority: .userInitiated) {
-                extract(ipaPath, destPath, decompressProgress)
+            let extractError = await Task.detached(priority: .userInitiated) {
+                LCExtractArchiveAtPath(ipaPath, destPath, .normalizePermissions, decompressProgress)
             }.value
-            guard extractCode == 0 else {
-                throw "lc.appList.urlFileIsNotIpaError".loc
+            if let extractError {
+                if extractError.hasPrefix("Failed to open archive:") || extractError.localizedCaseInsensitiveContains("Unrecognized archive format") {
+                    throw "lc.appList.urlFileIsNotIpaError".loc
+                }
+                throw extractError
             }
 
             let (stagedBundleURL, importedDataURL) = try await lcRunOffMain { () throws -> (URL, URL?) in
@@ -462,7 +465,7 @@ final class LCAppInstaller {
             stagedAppInfo.patchExecAndSignIfNeed(completionHandler: { success, error in
                 continuation.resume(returning: (success, error))
             }, progressHandler: { signProgress in
-                installProgress.addChild(signProgress, withPendingUnitCount: 25)
+                installProgress.addChild(signProgress, withPendingUnitCount: 100)
             }, forceSign: false)
         }
 
@@ -666,6 +669,35 @@ final class LCAppInstaller {
     }
 }
 
+final class LCPendingDownloadPreInstallRequest: Identifiable, @unchecked Sendable {
+    let id = UUID()
+    let downloadItemId: UUID
+    let session: LCPackageStagingSession
+    let sourceURL: String?
+    let sourceVersion: String?
+    let sourceBuildVersion: String?
+    let targetRelPath: String?
+    let ignoreUpdateKeyAfterInstall: String?
+
+    init(
+        downloadItemId: UUID,
+        session: LCPackageStagingSession,
+        sourceURL: String?,
+        sourceVersion: String?,
+        sourceBuildVersion: String?,
+        targetRelPath: String?,
+        ignoreUpdateKeyAfterInstall: String?
+    ) {
+        self.downloadItemId = downloadItemId
+        self.session = session
+        self.sourceURL = sourceURL
+        self.sourceVersion = sourceVersion
+        self.sourceBuildVersion = sourceBuildVersion
+        self.targetRelPath = targetRelPath
+        self.ignoreUpdateKeyAfterInstall = ignoreUpdateKeyAfterInstall
+    }
+}
+
 public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate, @unchecked Sendable {
     public static let shared = LCDownloadManager()
     private static let sessionIdentifier = "com.kdt.livecontainer.downloads"
@@ -674,6 +706,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
     @MainActor @Published public var isQueueSheetPresented = false
     @MainActor @Published public var isPillDismissed = false
     @MainActor @Published public var alertMessage: String? = nil
+    @MainActor @Published var pendingPreInstallRequest: LCPendingDownloadPreInstallRequest? = nil
 
     private let lock = NSLock()
     private var backgroundSession: URLSession!
@@ -1151,7 +1184,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         let item = items[idx]
         items[idx].taskIdentifier = nil
         items[idx].state = .installing("Unpacking…")
-        items[idx].progress = 0.72
+        items[idx].progress = max(items[idx].progress, 0.70)
         persistQueue()
 
         do {
@@ -1162,6 +1195,39 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                     $0.appInfo.relativeBundlePath == targetAppId || $0.appInfo.bundleIdentifier() == targetAppId
                 }?.appInfo.relativeBundlePath ?? targetAppId
 
+                let shouldEditBeforeInstall = LCUtils.appGroupUserDefault.bool(forKey: "LCEditBeforeInstall")
+                if shouldEditBeforeInstall && pendingPreInstallRequest == nil {
+                    let stagedSession = try await LCAppInstaller.stageIPA(
+                        at: localFileURL,
+                        sourceIPAURLToDeleteOnFinish: nil,
+                        progressHandler: { [weak self] fraction, label in
+                            guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == item.id }) else { return }
+                            self.items[liveIdx].progress = max(self.items[liveIdx].progress, 0.70 + (fraction * 0.15))
+                            self.items[liveIdx].state = .installing(label)
+                        }
+                    )
+                    if let liveIdx = items.firstIndex(where: { $0.id == item.id }) {
+                        items[liveIdx].progress = max(items[liveIdx].progress, 0.85)
+                        items[liveIdx].state = .installing("Ready to edit…")
+                        persistQueue()
+                    }
+                    let request = LCPendingDownloadPreInstallRequest(
+                        downloadItemId: item.id,
+                        session: stagedSession,
+                        sourceURL: sourceURL,
+                        sourceVersion: version,
+                        sourceBuildVersion: buildVersion,
+                        targetRelPath: targetRelPath,
+                        ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall
+                    )
+                    if isQueueSheetPresented {
+                        isQueueSheetPresented = false
+                        try? await Task.sleep(for: .milliseconds(350))
+                    }
+                    pendingPreInstallRequest = request
+                    return
+                }
+
                 let outcome = try await LCAppInstaller.installIPA(
                     at: localFileURL,
                     sourceURL: sourceURL,
@@ -1171,7 +1237,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                     ignoreUpdateKeyAfterInstall: ignoreUpdateKeyAfterInstall,
                     progressHandler: { [weak self] fraction, label in
                         guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == item.id }) else { return }
-                        self.items[liveIdx].progress = 0.70 + (fraction * 0.30)
+                        self.items[liveIdx].progress = max(self.items[liveIdx].progress, 0.70 + (fraction * 0.30))
                         self.items[liveIdx].state = .installing(label)
                     }
                 )
@@ -1186,7 +1252,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
             case let .tweak(destinationFolderPath):
                 if let liveIdx = items.firstIndex(where: { $0.id == item.id }) {
                     items[liveIdx].state = .installing("Unpacking tweak…")
-                    items[liveIdx].progress = 0.72
+                    items[liveIdx].progress = max(items[liveIdx].progress, 0.70)
                 }
                 let result = try await LCTweakInstallService.installDownloadedTweak(
                     at: localFileURL,
@@ -1195,7 +1261,7 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                     progressHandler: { [weak self] prog in
                         Task { @MainActor [weak self] in
                             guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == item.id }) else { return }
-                            self.items[liveIdx].progress = 0.72 + (prog.fraction * 0.28)
+                            self.items[liveIdx].progress = max(self.items[liveIdx].progress, 0.70 + (prog.fraction * 0.30))
                             self.items[liveIdx].state = .installing(prog.status)
                         }
                     }
@@ -1214,6 +1280,53 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                 items[liveIdx].state = .failed(error.localizedDescription)
                 persistQueue()
             }
+        }
+    }
+
+    @MainActor
+    func finalizePendingPreInstall(_ request: LCPendingDownloadPreInstallRequest) async {
+        defer { request.session.cleanup(deleteSourceIPA: false) }
+        do {
+            let outcome = try await LCAppInstaller.finalizeStagedInstall(
+                session: request.session,
+                sourceURL: request.sourceURL,
+                sourceVersion: request.sourceVersion,
+                sourceBuildVersion: request.sourceBuildVersion,
+                preferredTargetRelativePath: request.targetRelPath,
+                ignoreUpdateKeyAfterInstall: request.ignoreUpdateKeyAfterInstall,
+                progressHandler: { [weak self] fraction, label in
+                    guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == request.downloadItemId }) else { return }
+                    let scaled = max(self.items[liveIdx].progress, 0.85 + (fraction * 0.15))
+                    self.items[liveIdx].progress = min(scaled, 0.99)
+                    self.items[liveIdx].state = .installing(label)
+                }
+            )
+            if let liveIdx = items.firstIndex(where: { $0.id == request.downloadItemId }) {
+                items[liveIdx].progress = 1.0
+                items[liveIdx].state = .completed
+                persistQueue()
+            }
+            if let warning = outcome.warningMessage {
+                alertMessage = warning
+            }
+        } catch {
+            if let liveIdx = items.firstIndex(where: { $0.id == request.downloadItemId }) {
+                items[liveIdx].state = .failed(error.localizedDescription)
+                persistQueue()
+            }
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    func cancelPendingPreInstall(_ request: LCPendingDownloadPreInstallRequest) {
+        if pendingPreInstallRequest?.id == request.id {
+            pendingPreInstallRequest = nil
+        }
+        request.session.cleanup(deleteSourceIPA: false)
+        if let liveIdx = items.firstIndex(where: { $0.id == request.downloadItemId }) {
+            items[liveIdx].state = .failed("Installation cancelled.")
+            persistQueue()
         }
     }
 }
