@@ -135,10 +135,14 @@ final class AppInfoProvider {
 
     @objc public var windowHostingView = VirtualWindowsHostView()
     internal var hostingController: UIHostingController<AnyView>?
-    private var autoHideTask: Task<Void, Never>?
+    private var autoHideWorkItem: DispatchWorkItem?
+    private var autoHideGeneration: UInt64 = 0
+    private weak var dockPanGesture: UIPanGestureRecognizer?
+    private var panStartFrame: CGRect = .zero
     private weak var leftEdgeGesture: UIScreenEdgePanGestureRecognizer?
     private weak var rightEdgeGesture: UIScreenEdgePanGestureRecognizer?
     private var edgeWakeView: UIView?
+    private weak var edgeWakeTapGesture: UITapGestureRecognizer?
     private var isUserInteracting: Bool = false
     private var lastActivityResetTime: CFTimeInterval = 0
     private var isObservingGuestTouches: Bool = false
@@ -395,9 +399,16 @@ final class AppInfoProvider {
         let dockView = AnyView(MultitaskDockSwiftView()
             .environmentObject(self))
         
-        self.hostingController = UIHostingController(rootView: dockView)
-        self.hostingController?.view.autoresizingMask = [.flexibleTopMargin, .flexibleLeftMargin, .flexibleRightMargin, .flexibleBottomMargin]
-        self.hostingController?.view.backgroundColor = .clear
+        let controller = UIHostingController(rootView: dockView)
+        controller.view.autoresizingMask = [.flexibleTopMargin, .flexibleLeftMargin, .flexibleRightMargin, .flexibleBottomMargin]
+        controller.view.backgroundColor = .clear
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handleDockPan(_:)))
+        pan.maximumNumberOfTouches = 1
+        pan.cancelsTouchesInView = true
+        controller.view.addGestureRecognizer(pan)
+        self.dockPanGesture = pan
+        self.hostingController = controller
     }
 
     private func updateDockFrame(animated: Bool = true) {
@@ -483,7 +494,7 @@ final class AppInfoProvider {
                 delay: 0,
                 usingSpringWithDamping: Constants.standardSpringDamping,
                 initialSpringVelocity: Constants.standardSpringVelocity,
-                options: [.curveEaseOut, .allowUserInteraction]
+                options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
             ) {
                 hostingController.view.frame = newFrame
             }
@@ -584,8 +595,9 @@ final class AppInfoProvider {
     }
 
     private func cancelAutoHideTimer() {
-        autoHideTask?.cancel()
-        autoHideTask = nil
+        autoHideGeneration &+= 1
+        autoHideWorkItem?.cancel()
+        autoHideWorkItem = nil
     }
 
     func scheduleAutoHideIfNeeded() {
@@ -593,23 +605,27 @@ final class AppInfoProvider {
         guard isVisible, isCollapsed, isDockHidden, isAutoHideEnabled, !isHideCollapsedDockEnabled, !isUserInteracting, !isAutoHidden else {
             return
         }
+        let generation = autoHideGeneration
         let delay = autoHideDelaySeconds
-        autoHideTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(delay))
-            } catch {
-                return
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.autoHideGeneration == generation else { return }
+                self.autoHideWorkItem = nil
+                guard self.isVisible, self.isCollapsed, self.isDockHidden, self.isAutoHideEnabled, !self.isHideCollapsedDockEnabled, !self.isUserInteracting else {
+                    return
+                }
+                self.isAutoHidden = true
+                self.syncInteractionAndWakeOverlays()
             }
-            guard let self, !Task.isCancelled else { return }
-            guard self.isVisible, self.isCollapsed, self.isDockHidden, self.isAutoHideEnabled, !self.isHideCollapsedDockEnabled, !self.isUserInteracting else {
-                return
-            }
-            self.isAutoHidden = true
-            self.syncInteractionAndWakeOverlays()
         }
+        autoHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     @objc public func noteHostTouchActivity() {
+        if dockPanGesture?.state != .began && dockPanGesture?.state != .changed {
+            isUserInteracting = false
+        }
         guard isVisible, isCollapsed, isDockHidden, isAutoHideEnabled, !isHideCollapsedDockEnabled else {
             return
         }
@@ -635,19 +651,6 @@ final class AppInfoProvider {
         scheduleAutoHideIfNeeded()
     }
 
-    func setUserInteracting(_ interacting: Bool) {
-        isUserInteracting = interacting
-        if interacting {
-            cancelAutoHideTimer()
-            if isAutoHidden {
-                isAutoHidden = false
-                syncInteractionAndWakeOverlays()
-            }
-        } else {
-            scheduleAutoHideIfNeeded()
-        }
-    }
-
     @objc public func animateFrame(to finalFrame: CGRect) {
         guard let hostingController = self.hostingController else { return }
         
@@ -656,75 +659,86 @@ final class AppInfoProvider {
             delay: 0,
             usingSpringWithDamping: Constants.standardSpringDamping,
             initialSpringVelocity: Constants.standardSpringVelocity,
-            options: [.curveEaseOut, .allowUserInteraction]
+            options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
         ) {
             hostingController.view.frame = finalFrame
         }
     }
 
-    @objc public func updateFrameAfterAnimation(finalOffset: CGSize) {
-        guard let hostingController = self.hostingController else { return }
-        
-        let newFrame = hostingController.view.frame.offsetBy(dx: finalOffset.width, dy: finalOffset.height)
-        
-        hostingController.view.frame = newFrame
-        syncInteractionAndWakeOverlays()
-    }
+    @objc private func handleDockPan(_ gesture: UIPanGestureRecognizer) {
+        guard let view = hostingController?.view else { return }
+        let coordinateSpace: UIView = keyWindow ?? view.superview ?? view
 
-    func finishCrossScreenMoveToVisibleSide() {
-        cancelAutoHideTimer()
-        isDockHidden = false
-        isAutoHidden = false
-        syncInteractionAndWakeOverlays()
-    }
+        switch gesture.state {
+        case .began:
+            let liveFrame = view.layer.presentation()?.frame ?? view.frame
+            view.layer.removeAllAnimations()
+            view.frame = liveFrame
+            panStartFrame = liveFrame
+            isUserInteracting = true
+            cancelAutoHideTimer()
+            if isAutoHidden {
+                isAutoHidden = false
+            }
 
-    func handleSwipeToHideOrShowGesture(for originalFrame: CGRect, translation: CGSize) -> Bool {
-        guard let screenWidth = keyWindow?.bounds.width else { return false }
-        let horizontalDistance = abs(translation.width)
-        let verticalDistance = abs(translation.height)
-        let swipeThreshold = max(16.0, Constants.hideGestureThreshold)
-        guard horizontalDistance >= swipeThreshold, horizontalDistance > verticalDistance else {
-            return false
-        }
+        case .changed:
+            let translation = gesture.translation(in: coordinateSpace)
+            view.frame.origin = CGPoint(
+                x: panStartFrame.origin.x + translation.x,
+                y: panStartFrame.origin.y + translation.y
+            )
 
-        let isOnRightSide = originalFrame.midX > screenWidth / 2
-        let isSwipingAway = (isOnRightSide && translation.width > 0) || (!isOnRightSide && translation.width < 0)
-        
-        if isSwipingAway {
-            guard !self.isDockHidden else { return false }
-            self.hideDockToSide()
-            let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
-            impactFeedback.impactOccurred()
-            return true
-        } else {
-            guard self.isDockHidden else { return false }
-            self.showDockFromHidden()
-            let impactFeedback = UIImpactFeedbackGenerator(style: .light)
-            impactFeedback.impactOccurred()
-            return true
-        }
-    }
-    
-    // Check if gesture is for cross-screen movement (left to right or vice versa)
-    func isPositionChangeGesture(for originalFrame: CGRect, translation: CGSize) -> Bool {
-        let horizontalDistance = abs(translation.width)
-        let verticalDistance = abs(translation.height)
-        
-        guard horizontalDistance > verticalDistance,
-              let screenWidth = keyWindow?.bounds.width else {
-            return false
-        }
-        let isOnRightSide = originalFrame.midX > screenWidth / 2
-        let isMovingToOtherSide = (isOnRightSide && translation.width < 0) || (!isOnRightSide && translation.width > 0)
-        guard isMovingToOtherSide else { return false }
-        
-        let draggedX = originalFrame.origin.x + translation.width
-        let screenCenter = screenWidth / 2
-        
-        if isOnRightSide {
-            return draggedX < screenCenter
-        } else {
-            return (draggedX + originalFrame.width) > screenCenter
+        case .ended, .cancelled, .failed:
+            guard let screenBounds = keyWindow?.bounds else {
+                isUserInteracting = false
+                scheduleAutoHideIfNeeded()
+                return
+            }
+
+            let currentFrame = view.frame
+            let translation = gesture.translation(in: coordinateSpace)
+            let safeInsets = self.safeAreaInsets
+            let verticalMargin = Constants.dockVerticalMargin
+            let minY = safeInsets.top + verticalMargin
+            let maxY = max(minY, screenBounds.height - safeInsets.bottom - currentFrame.height - verticalMargin)
+            let targetY = max(minY, min(maxY, currentFrame.origin.y))
+
+            let startedOnRight = panStartFrame.midX > screenBounds.width / 2
+            let crossedCenter = (startedOnRight && currentFrame.midX < screenBounds.width / 2) ||
+                                (!startedOnRight && currentFrame.midX > screenBounds.width / 2)
+            let isOnRightSide = crossedCenter ? !startedOnRight : startedOnRight
+
+            let swipeThreshold = max(16.0, Constants.hideGestureThreshold)
+            let horizontalIntent = abs(translation.width) >= swipeThreshold && abs(translation.width) > abs(translation.height)
+            let swipingOutward = (startedOnRight && translation.width > 0) || (!startedOnRight && translation.width < 0)
+            let swipingInward = (startedOnRight && translation.width < 0) || (!startedOnRight && translation.width > 0)
+
+            if crossedCenter {
+                isDockHidden = false
+                isAutoHidden = false
+            } else if horizontalIntent && swipingOutward && !isDockHidden {
+                isDockHidden = true
+                isAutoHidden = false
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            } else if horizontalIntent && swipingInward && isDockHidden {
+                isDockHidden = false
+                isAutoHidden = false
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
+
+            let targetX = calculateTargetX(
+                isDockHidden: isDockHidden,
+                isOnRightSide: isOnRightSide,
+                dockWidth: currentFrame.width,
+                screenWidth: screenBounds.width
+            )
+            animateFrame(to: CGRect(x: targetX, y: targetY, width: currentFrame.width, height: currentFrame.height))
+            isUserInteracting = false
+            syncInteractionAndWakeOverlays()
+            scheduleAutoHideIfNeeded()
+
+        default:
+            break
         }
     }
     
@@ -935,6 +949,7 @@ final class AppInfoProvider {
         }
         edgeWakeView?.removeFromSuperview()
         edgeWakeView = nil
+        edgeWakeTapGesture = nil
     }
     
     // Add edge gesture recognition areas & a host-owned edge wake strip only when the dock is completely invisible
@@ -973,6 +988,7 @@ final class AppInfoProvider {
         guard isVisible, isCompletelyInvisible, let keyWindow = self.keyWindow else {
             edgeWakeView?.removeFromSuperview()
             edgeWakeView = nil
+            edgeWakeTapGesture = nil
             return
         }
 
@@ -987,9 +1003,6 @@ final class AppInfoProvider {
             created.backgroundColor = UIColor(white: 0.5, alpha: 0.015)
             created.isUserInteractionEnabled = true
 
-            let tap = UITapGestureRecognizer(target: self, action: #selector(handleEdgeWakeTap(_:)))
-            created.addGestureRecognizer(tap)
-
             let pan = UIPanGestureRecognizer(target: self, action: #selector(handleEdgeWakePan(_:)))
             created.addGestureRecognizer(pan)
 
@@ -998,9 +1011,21 @@ final class AppInfoProvider {
             wakeView = created
         }
 
+        let shouldAllowTapWake = isHideCollapsedDockEnabled && isCollapsed && isDockHidden
+        if shouldAllowTapWake {
+            if edgeWakeTapGesture == nil {
+                let tap = UITapGestureRecognizer(target: self, action: #selector(handleEdgeWakeTap(_:)))
+                wakeView.addGestureRecognizer(tap)
+                edgeWakeTapGesture = tap
+            }
+        } else if let tap = edgeWakeTapGesture {
+            wakeView.removeGestureRecognizer(tap)
+            edgeWakeTapGesture = nil
+        }
+
         let screenBounds = keyWindow.bounds
         let isOnRightSide = (dockFrame.midX > screenBounds.width / 2) || dockFrame.isEmpty
-        let stripWidth: CGFloat = 20.0
+        let stripWidth: CGFloat = isHideCollapsedDockEnabled ? 20.0 : 14.0
         let safeTop = safeAreaInsets.top + 8.0
         let safeBottom = safeAreaInsets.bottom + 8.0
         let maxHeight = max(140.0, screenBounds.height - safeTop - safeBottom)
@@ -1061,9 +1086,6 @@ final class AppInfoProvider {
 public struct MultitaskDockSwiftView: View {
     @EnvironmentObject var dockManager: MultitaskDockManager
     @Namespace private var dockGlassNamespace
-    @State private var dragOffset = CGSize.zero
-    @State private var isMoving: Bool = false
-    @State private var pendingSnapTask: Task<Void, Never>?
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
     
     // Calculate dynamic padding based on user settings
@@ -1117,130 +1139,9 @@ public struct MultitaskDockSwiftView: View {
                     : (dockManager.isDockHidden ? (hideCollapsedDock && dockManager.isCollapsed ? 0.0 : 0.4) : 1.0)
             )
             .animation(.easeInOut(duration: 0.25), value: dockManager.isAutoHidden)
-            .offset(dragOffset)
             .position(x: g.size.width / 2, y: g.size.height / 2)
         }
-
-
-
         .ignoresSafeArea()
-        .gesture(
-            DragGesture(minimumDistance: 5)
-            .onChanged { value in
-                pendingSnapTask?.cancel()
-                pendingSnapTask = nil
-                if !self.isMoving {
-                    dockManager.setUserInteracting(true)
-                }
-                self.isMoving = true
-                self.dragOffset = value.translation
-            }
-            .onEnded { value in
-                pendingSnapTask?.cancel()
-                pendingSnapTask = nil
-                self.isMoving = true
-
-                let hcFrame = dockManager.hostingController?.view.frame ?? .zero
-                
-                let currentPhysicalFrame = hcFrame.offsetBy(dx: self.dragOffset.width, dy: self.dragOffset.height)
-                
-                if dockManager.isPositionChangeGesture(for: hcFrame, translation: value.translation),
-                   let screenBounds = dockManager.keyWindow?.bounds {
-                    let targetX = dockManager.calculateTargetX(isDockHidden: false, isOnRightSide: currentPhysicalFrame.midX > screenBounds.width / 2, dockWidth: dockManager.dockWidth, screenWidth: screenBounds.width)
-                    
-                    let safeAreaInsets = dockManager.safeAreaInsets
-                    let dockVerticalMargin = MultitaskDockManager.Constants.dockVerticalMargin
-                    let minY = safeAreaInsets.top + dockVerticalMargin
-                    let maxY = screenBounds.height - safeAreaInsets.bottom - currentPhysicalFrame.height - dockVerticalMargin
-                    let targetY = max(minY, min(maxY, currentPhysicalFrame.origin.y))
-                    
-                    let finalPhysicalPosition = CGPoint(x: targetX, y: targetY)
-                    
-                    let newOffset = CGSize(
-                        width: finalPhysicalPosition.x - hcFrame.origin.x,
-                        height: finalPhysicalPosition.y - hcFrame.origin.y
-                    )
-                    
-                    let animationDuration = MultitaskDockManager.Constants.longAnimationDuration
-                    
-                    withAnimation(.spring(response: animationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping)) {
-                        self.dragOffset = newOffset
-                    }
-                    
-                    pendingSnapTask = Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(animationDuration))
-                        guard !Task.isCancelled else { return }
-                        dockManager.updateFrameAfterAnimation(finalOffset: newOffset)
-                        dockManager.finishCrossScreenMoveToVisibleSide()
-                        
-                        self.dragOffset = .zero
-                        
-                        self.isMoving = false
-                        self.pendingSnapTask = nil
-                        dockManager.setUserInteracting(false)
-                    }
-                    return
-                }
-                
-                if dockManager.handleSwipeToHideOrShowGesture(for: hcFrame, translation: value.translation) {
-                    withAnimation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping)) {
-                        self.dragOffset = .zero
-                    }
-                    pendingSnapTask = Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(MultitaskDockManager.Constants.longAnimationDuration))
-                        guard !Task.isCancelled else { return }
-                        self.isMoving = false
-                        self.pendingSnapTask = nil
-                        dockManager.setUserInteracting(false)
-                    }
-                    return
-                }
-                
-                guard let screenBounds = dockManager.keyWindow?.bounds else {
-                    withAnimation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping)) {
-                        self.dragOffset = .zero
-                    }
-                    self.isMoving = false
-                    dockManager.setUserInteracting(false)
-                    return
-                }
-                let safeAreaInsets = dockManager.safeAreaInsets
-                let dockVerticalMargin = MultitaskDockManager.Constants.dockVerticalMargin
-                let minY = safeAreaInsets.top + dockVerticalMargin
-                let maxY = screenBounds.height - safeAreaInsets.bottom - currentPhysicalFrame.height - dockVerticalMargin
-                let targetY = max(minY, min(maxY, currentPhysicalFrame.origin.y))
-                
-                let targetX: CGFloat
-
-                let isOnRightSide = hcFrame.midX > screenBounds.width / 2
-                targetX = dockManager.calculateTargetX(isDockHidden: dockManager.isDockHidden, isOnRightSide: isOnRightSide, dockWidth: currentPhysicalFrame.width, screenWidth: screenBounds.width)
-                
-                let finalPhysicalPosition = CGPoint(x: targetX, y: targetY)
-                
-                let newOffset = CGSize(
-                    width: finalPhysicalPosition.x - hcFrame.origin.x,
-                    height: finalPhysicalPosition.y - hcFrame.origin.y
-                )
-                
-                let animationDuration = MultitaskDockManager.Constants.longAnimationDuration
-                
-                withAnimation(.spring(response: animationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping)) {
-                    self.dragOffset = newOffset
-                }
-                
-                pendingSnapTask = Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(animationDuration))
-                    guard !Task.isCancelled else { return }
-                    dockManager.updateFrameAfterAnimation(finalOffset: newOffset)
-                    
-                    self.dragOffset = .zero
-                    
-                    self.isMoving = false
-                    self.pendingSnapTask = nil
-                    dockManager.setUserInteracting(false)
-                }
-            }
-        )
         .animation(.spring(response: MultitaskDockManager.Constants.standardAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.isCollapsed)
         .animation(.spring(response: MultitaskDockManager.Constants.standardAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.isDockHidden)
         .animation(.spring(response: MultitaskDockManager.Constants.longAnimationDuration, dampingFraction: MultitaskDockManager.Constants.standardSpringDamping), value: dockManager.dockWidth)

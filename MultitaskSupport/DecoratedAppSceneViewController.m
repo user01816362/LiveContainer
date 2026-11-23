@@ -10,12 +10,52 @@
 
 @interface LCDecoratedWindowStackView : UIStackView
 @property (nonatomic, weak) UIView *externalResizeHandle;
+@property (nonatomic, weak) UINavigationBar *externalNavigationBar;
 @end
 
 @implementation LCDecoratedWindowStackView
 
+- (UIView *)hitTestNavigationBarControlInView:(UIView *)view atPointInNavBar:(CGPoint)navPoint navBar:(UINavigationBar *)navBar {
+    for (UIView *subview in view.subviews.reverseObjectEnumerator) {
+        if (subview.hidden || !subview.userInteractionEnabled || subview.alpha <= 0.01) {
+            continue;
+        }
+        if ([subview isKindOfClass:UIControl.class] && [(UIControl *)subview isEnabled]) {
+            CGRect frameInNav = [subview convertRect:subview.bounds toView:navBar];
+            if (CGRectContainsPoint(CGRectInset(frameInNav, -4.0, -4.0), navPoint)) {
+                return subview;
+            }
+        }
+        if (subview.subviews.count > 0) {
+            UIView *nested = [self hitTestNavigationBarControlInView:subview atPointInNavBar:navPoint navBar:navBar];
+            if (nested) {
+                return nested;
+            }
+        }
+    }
+    return nil;
+}
+
+- (UIView *)hitTestNavigationBarAtPoint:(CGPoint)point withEvent:(UIEvent *)event {
+    UINavigationBar *navBar = self.externalNavigationBar;
+    if (!navBar || navBar.hidden || !navBar.userInteractionEnabled || navBar.alpha <= 0.01) {
+        return nil;
+    }
+    CGPoint navPoint = [self convertPoint:point toView:navBar];
+    if (CGRectContainsPoint(navBar.bounds, navPoint)) {
+        return [navBar hitTest:navPoint withEvent:event] ?: navBar;
+    }
+    if (CGRectContainsPoint(CGRectInset(navBar.bounds, -10.0, -10.0), navPoint)) {
+        return [self hitTestNavigationBarControlInView:navBar atPointInNavBar:navPoint navBar:navBar];
+    }
+    return nil;
+}
+
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     if ([super pointInside:point withEvent:event]) {
+        return YES;
+    }
+    if ([self hitTestNavigationBarAtPoint:point withEvent:event] != nil) {
         return YES;
     }
     UIView *handle = self.externalResizeHandle;
@@ -29,6 +69,10 @@
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *navHit = [self hitTestNavigationBarAtPoint:point withEvent:event];
+    if (navHit) {
+        return navHit;
+    }
     UIView *handle = self.externalResizeHandle;
     if (handle && !handle.hidden && handle.userInteractionEnabled && handle.alpha > 0.01) {
         CGPoint handlePoint = [self convertPoint:point toView:handle];
@@ -36,7 +80,7 @@
             return [handle hitTest:handlePoint withEvent:event] ?: handle;
         }
     }
-    return [super hitTest:point withEvent:event];
+    return [super hitTest:point withEvent:event] ?: ([super pointInside:point withEvent:event] ? self : nil);
 }
 
 @end
@@ -261,6 +305,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     [self.resizeHandle addGestureRecognizer:resizeGesture];
     [self.view addSubview:self.resizeHandle];
     ((LCDecoratedWindowStackView *)self.view).externalResizeHandle = self.resizeHandle;
+    ((LCDecoratedWindowStackView *)self.view).externalNavigationBar = self.navigationBar;
     
     self.view.layer.borderColor = UIColor.secondarySystemBackgroundColor.CGColor;
     self.view.layer.shadowColor = UIColor.blackColor.CGColor;
@@ -730,10 +775,8 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     self.view.layer.shadowRadius = 16.0;
     self.view.layer.shadowOffset = CGSizeMake(0, 8);
 
-    self.navigationBar.layer.cornerRadius = radius;
-    self.navigationBar.layer.cornerCurve = kCACornerCurveContinuous;
-    self.navigationBar.layer.masksToBounds = !maximized;
-    self.navigationBar.layer.maskedCorners = bottomWindowBar ? bottomCorners : topCorners;
+    self.navigationBar.layer.cornerRadius = 0.0;
+    self.navigationBar.layer.masksToBounds = NO;
 
     self.appSceneVC.view.layer.cornerRadius = radius;
     self.appSceneVC.view.layer.cornerCurve = kCACornerCurveContinuous;
