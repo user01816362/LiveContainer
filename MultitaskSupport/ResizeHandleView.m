@@ -35,6 +35,18 @@
     return self;
 }
 
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!CGRectContainsPoint(self.bounds, point)) {
+        return NO;
+    }
+    // Let touches in the top-left interior quadrant pass through to the guest app underneath,
+    // while capturing touches along the corner edge and outer Liquid Glass arc grabber.
+    if (point.x < 22.0 && point.y < 22.0) {
+        return NO;
+    }
+    return YES;
+}
+
 - (void)handleHover:(UIHoverGestureRecognizer *)recognizer {
     self.isHovering = (recognizer.state == UIGestureRecognizerStateBegan || recognizer.state == UIGestureRecognizerStateChanged);
     [self updateVisualActiveState];

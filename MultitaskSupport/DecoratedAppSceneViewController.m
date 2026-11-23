@@ -8,6 +8,39 @@
 #import "../LiveContainer/Localization.h"
 #import "utils.h"
 
+@interface LCDecoratedWindowStackView : UIStackView
+@property (nonatomic, weak) UIView *externalResizeHandle;
+@end
+
+@implementation LCDecoratedWindowStackView
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if ([super pointInside:point withEvent:event]) {
+        return YES;
+    }
+    UIView *handle = self.externalResizeHandle;
+    if (handle && !handle.hidden && handle.userInteractionEnabled && handle.alpha > 0.01) {
+        CGPoint handlePoint = [self convertPoint:point toView:handle];
+        if ([handle pointInside:handlePoint withEvent:event]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *handle = self.externalResizeHandle;
+    if (handle && !handle.hidden && handle.userInteractionEnabled && handle.alpha > 0.01) {
+        CGPoint handlePoint = [self convertPoint:point toView:handle];
+        if ([handle pointInside:handlePoint withEvent:event]) {
+            return [handle hitTest:handlePoint withEvent:event] ?: handle;
+        }
+    }
+    return [super hitTest:point withEvent:event];
+}
+
+@end
+
 @interface DecoratedAppSceneViewController()
 @property(nonatomic) NSArray* activatedVerticalConstraints;
 @property(nonatomic) NSString* dataUUID;
@@ -42,7 +75,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 @dynamic view;
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC {
     self = [super initWithNibName:nil bundle:nil];
-    self.view = [[UIStackView alloc] initWithFrame:self.view.frame];
+    self.view = [[LCDecoratedWindowStackView alloc] initWithFrame:self.view.frame];
     [MultitaskDockManager.shared.windowHostingView addSubview:self.view];
     [rootVC addChildViewController:self];
     
@@ -184,7 +217,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.view.layer.cornerRadius = _isMaximized ? 0.0 : 18.0;
     self.view.layer.cornerCurve = kCACornerCurveContinuous;
-    self.view.layer.masksToBounds = YES;
+    self.view.layer.masksToBounds = NO;
 
     self.navigationBar = navigationBar;
     self.navigationItem = navigationBar.items.firstObject;
@@ -212,24 +245,32 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     moveGesture.maximumNumberOfTouches = 1;
     [self.navigationBar addGestureRecognizer:moveGesture];
 
-    // Resize handle (concentric Liquid Glass corner grabber)
+    // Outer concentric Liquid Glass corner resize grabber (protrudes 14pt outside bottom-right corner)
     UIPanGestureRecognizer *resizeGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(resizeWindow:)];
     resizeGesture.minimumNumberOfTouches = 1;
     resizeGesture.maximumNumberOfTouches = 1;
-    self.resizeHandle = [[ResizeHandleView alloc] initWithFrame:CGRectMake(self.view.frame.size.width - navBarHeight, self.view.frame.size.height - navBarHeight, navBarHeight, navBarHeight)];
+    CGFloat handleSize = 48.0;
+    CGFloat handleOutset = 14.0;
+    self.resizeHandle = [[ResizeHandleView alloc] initWithFrame:CGRectMake(
+        self.view.frame.size.width - handleSize + handleOutset,
+        self.view.frame.size.height - handleSize + handleOutset,
+        handleSize,
+        handleSize
+    )];
     [self.resizeHandle setWindowCornerRadius:18.0];
-    self.resizeHandle.alpha = _isMaximized ? 0.0 : 1.0;
     [self.resizeHandle addGestureRecognizer:resizeGesture];
     [self.view addSubview:self.resizeHandle];
+    ((LCDecoratedWindowStackView *)self.view).externalResizeHandle = self.resizeHandle;
     
-    self.view.layer.borderWidth = _isMaximized ? 0.0 : 1.0;
     self.view.layer.borderColor = UIColor.secondarySystemBackgroundColor.CGColor;
+    self.view.layer.shadowColor = UIColor.blackColor.CGColor;
     
     [self addChildViewController:_appSceneVC];
     [self.view insertSubview:_appSceneVC.view atIndex:0];
     _appSceneVC.view.translatesAutoresizingMaskIntoConstraints = NO;
     
     [self updateVerticalConstraints];
+    [self updateWindowCornerStylingForMaximized:_isMaximized];
     [NSLayoutConstraint activateConstraints:@[
         [_appSceneVC.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_appSceneVC.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
@@ -456,9 +497,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         CGRect newFrame = CGRectMake(self.originalFrame.origin.x * maxFrame.size.width, self.originalFrame.origin.y * maxFrame.size.height, self.originalFrame.size.width, self.originalFrame.size.height);
         [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
             self.view.frame = newFrame;
-            self.view.layer.cornerRadius = 18.0;
-            self.view.layer.borderWidth = 1;
-            self.resizeHandle.alpha = 1;
+            [self updateWindowCornerStylingForMaximized:NO];
             
             [self.appSceneVC updateSettingsWithBlock:updateSettingsBlock];
             
@@ -477,10 +516,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
             self.isMaximized = YES;
             [self updateVerticalConstraints];
-            
-            self.view.layer.cornerRadius = 0.0;
-            self.view.layer.borderWidth = 0;
-            self.resizeHandle.alpha = 0;
+            [self updateWindowCornerStylingForMaximized:YES];
             
             [self.appSceneVC updateSettingsWithBlock:updateSettingsBlock];
             
@@ -632,6 +668,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         }
         
         [self updateVerticalConstraints];
+        [self updateWindowCornerStylingForMaximized:self.isMaximized];
         [self adjustNavigationBarButtonSpacingWithNegativeSpacing:-8.0 rightMargin:-4.0];
         
         if(_isMaximized) {
@@ -676,6 +713,34 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     frame.size.height = MAX(50, frame.size.height + point.y);
     self.view.frame = frame;
     [self updateOriginalFrame];
+}
+
+- (void)updateWindowCornerStylingForMaximized:(BOOL)maximized {
+    CGFloat radius = maximized ? 0.0 : 18.0;
+    BOOL bottomWindowBar = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskBottomWindowBar"];
+    CACornerMask topCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    CACornerMask bottomCorners = kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+
+    self.view.layer.masksToBounds = NO;
+    self.view.layer.cornerRadius = radius;
+    self.view.layer.cornerCurve = kCACornerCurveContinuous;
+    self.view.layer.borderWidth = maximized ? 0.0 : 1.0;
+    self.view.layer.shadowOpacity = maximized ? 0.0f : 0.28f;
+    self.view.layer.shadowRadius = 16.0;
+    self.view.layer.shadowOffset = CGSizeMake(0, 8);
+
+    self.navigationBar.layer.cornerRadius = radius;
+    self.navigationBar.layer.cornerCurve = kCACornerCurveContinuous;
+    self.navigationBar.layer.masksToBounds = !maximized;
+    self.navigationBar.layer.maskedCorners = bottomWindowBar ? bottomCorners : topCorners;
+
+    self.appSceneVC.view.layer.cornerRadius = radius;
+    self.appSceneVC.view.layer.cornerCurve = kCACornerCurveContinuous;
+    self.appSceneVC.view.layer.masksToBounds = !maximized;
+    self.appSceneVC.view.layer.maskedCorners = bottomWindowBar ? topCorners : bottomCorners;
+
+    self.resizeHandle.alpha = maximized ? 0.0 : 1.0;
+    self.resizeHandle.userInteractionEnabled = !maximized;
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {

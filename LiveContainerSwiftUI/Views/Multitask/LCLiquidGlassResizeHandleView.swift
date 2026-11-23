@@ -7,7 +7,7 @@ import Observation
 import SwiftUI
 import UIKit
 
-/// Shared observable state driving the Liquid Glass corner resize grabber.
+/// Shared observable state driving the outer Liquid Glass corner resize grabber.
 @MainActor
 @Observable
 final class LCLiquidGlassResizeHandleState {
@@ -15,27 +15,31 @@ final class LCLiquidGlassResizeHandleState {
     var windowCornerRadius: CGFloat = 18.0
 }
 
-/// Concentric bottom-right curved arc pill matching the iPadOS Liquid Glass window resize handle.
-struct LCResizeCornerArcShape: Shape {
+/// Concentric curved arc pill positioned *outside* the bottom-right corner of a floating
+/// multitask window (`48×48` handle view protruding `14pt` past the window frame).
+struct LCOuterResizeCornerArcShape: Shape {
     var windowCornerRadius: CGFloat
-    var edgeInset: CGFloat
+    var outset: CGFloat = 14.0
+    var gap: CGFloat
     var thickness: CGFloat
     var legLength: CGFloat
 
     func path(in rect: CGRect) -> Path {
         guard rect.width > 0, rect.height > 0 else { return Path() }
 
+        let cornerX = rect.maxX - outset
+        let cornerY = rect.maxY - outset
         let outerRadius = max(windowCornerRadius, 12.0)
-        let arcRadius = max(4.0, outerRadius - edgeInset)
-        let center = CGPoint(x: rect.maxX - outerRadius, y: rect.maxY - outerRadius)
+        let center = CGPoint(x: cornerX - outerRadius, y: cornerY - outerRadius)
+        let arcRadius = outerRadius + gap + thickness * 0.5
 
         let start = CGPoint(x: center.x - legLength, y: center.y + arcRadius)
-        let corner = CGPoint(x: center.x + arcRadius, y: center.y + arcRadius)
+        let tangentCorner = CGPoint(x: center.x + arcRadius, y: center.y + arcRadius)
         let end = CGPoint(x: center.x + arcRadius, y: center.y - legLength)
 
         let centerline = CGMutablePath()
         centerline.move(to: start)
-        centerline.addArc(tangent1End: corner, tangent2End: end, radius: arcRadius)
+        centerline.addArc(tangent1End: tangentCorner, tangent2End: end, radius: arcRadius)
         centerline.addLine(to: end)
 
         let stroked = centerline.copy(
@@ -48,27 +52,35 @@ struct LCResizeCornerArcShape: Shape {
     }
 }
 
-/// Liquid Glass corner resize grabber rendered in the bottom-right corner of floating multitask windows.
+/// Native iOS Liquid Glass corner resize grabber: subtle & reduced at rest outside the
+/// window corner, expanding and brightening smoothly on pointer hover or active drag.
 struct LCLiquidGlassResizeCornerView: View {
     let state: LCLiquidGlassResizeHandleState
 
     var body: some View {
-        let shape = LCResizeCornerArcShape(
+        let arcShape = LCOuterResizeCornerArcShape(
             windowCornerRadius: state.windowCornerRadius,
-            edgeInset: 6.5,
-            thickness: state.isResizing ? 5.5 : 4.5,
-            legLength: state.isResizing ? 6.5 : 5.0
+            outset: 14.0,
+            gap: state.isResizing ? 4.0 : 3.5,
+            thickness: state.isResizing ? 6.0 : 4.5,
+            legLength: state.isResizing ? 7.0 : 5.0
         )
 
-        shape
-            .fill(Color.primary.opacity(state.isResizing ? 0.14 : 0.08))
-            .glassEffect(.regular.interactive(), in: shape)
+        // Apply `.glassEffect` on a standard convex RoundedRectangle first to avoid iOS 26
+        // concave-shape fallback artifacts, then clip to the concentric outer corner arc.
+        Color.clear
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay {
-                shape.stroke(
+                arcShape.fill(Color.white.opacity(state.isResizing ? 0.24 : 0.12))
+            }
+            .clipShape(arcShape)
+            .overlay {
+                arcShape.stroke(
                     LinearGradient(
                         colors: [
-                            Color.white.opacity(state.isResizing ? 0.72 : 0.48),
-                            Color.white.opacity(state.isResizing ? 0.30 : 0.14)
+                            Color.white.opacity(state.isResizing ? 0.85 : 0.55),
+                            Color.white.opacity(state.isResizing ? 0.35 : 0.18)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -76,15 +88,14 @@ struct LCLiquidGlassResizeCornerView: View {
                     lineWidth: 0.75
                 )
             }
+            .opacity(state.isResizing ? 1.0 : 0.72)
             .shadow(
-                color: .black.opacity(state.isResizing ? 0.28 : 0.18),
-                radius: state.isResizing ? 4 : 2.5,
+                color: .black.opacity(state.isResizing ? 0.32 : 0.20),
+                radius: state.isResizing ? 5 : 3,
                 x: 0,
                 y: 1
             )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .scaleEffect(state.isResizing ? 1.05 : 1.0, anchor: .bottomTrailing)
-            .animation(.spring(response: 0.24, dampingFraction: 0.74), value: state.isResizing)
+            .animation(.spring(response: 0.22, dampingFraction: 0.74), value: state.isResizing)
     }
 }
 
