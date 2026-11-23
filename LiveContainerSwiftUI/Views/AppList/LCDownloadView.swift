@@ -153,111 +153,6 @@ public struct LCDownloadTaskItem: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-enum LCTweakPackageInstaller {
-    static func copyOrMovePayload(from sourceURL: URL, into targetFolder: URL, move: Bool) throws {
-        let fm = FileManager.default
-        let destinationURL = targetFolder.appendingPathComponent(sourceURL.lastPathComponent)
-        if fm.fileExists(atPath: destinationURL.path) {
-            try fm.removeItem(at: destinationURL)
-        }
-        if move {
-            try fm.moveItem(at: sourceURL, to: destinationURL)
-        } else {
-            try fm.copyItem(at: sourceURL, to: destinationURL)
-        }
-        if destinationURL.pathExtension.lowercased() == "dylib" {
-            LCParseMachO((destinationURL.path as NSString).utf8String, false) { path, header, _, _ in
-                LCPatchAddRPath(path, header)
-            }
-        }
-    }
-
-    static func extractArchiveAndInstallPayloads(from archiveURL: URL, ext: String, workDir: URL, into baseURL: URL, copiedCount: inout Int) async throws {
-        let fm = FileManager.default
-        let outerExtractDir = workDir.appendingPathComponent("outer", isDirectory: true)
-        try fm.createDirectory(at: outerExtractDir, withIntermediateDirectories: true)
-
-        let outerCode = await Task.detached(priority: .userInitiated) {
-            extract(archiveURL.path, outerExtractDir.path, nil)
-        }.value
-        guard outerCode == 0 else {
-            throw "Failed to extract \(archiveURL.lastPathComponent) (code \(outerCode))."
-        }
-
-        var searchRoot = outerExtractDir
-        if ext == "deb" {
-            let outerItems = (try? fm.contentsOfDirectory(at: outerExtractDir, includingPropertiesForKeys: nil)) ?? []
-            if let dataTar = outerItems.first(where: { $0.lastPathComponent.hasPrefix("data.tar") }) {
-                let innerDir = workDir.appendingPathComponent("inner", isDirectory: true)
-                try fm.createDirectory(at: innerDir, withIntermediateDirectories: true)
-                let innerCode = await Task.detached(priority: .userInitiated) {
-                    extract(dataTar.path, innerDir.path, nil)
-                }.value
-                guard innerCode == 0 else {
-                    throw "Failed to unpack data archive inside \(archiveURL.lastPathComponent) (code \(innerCode))."
-                }
-                searchRoot = innerDir
-            }
-        }
-
-        guard let enumerator = fm.enumerator(
-            at: searchRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        var payloadURLs: [URL] = []
-        while let itemURL = enumerator.nextObject() as? URL {
-            let itemExt = itemURL.pathExtension.lowercased()
-            if itemExt == "framework" {
-                enumerator.skipDescendants()
-                payloadURLs.append(itemURL)
-            } else if itemExt == "dylib" {
-                payloadURLs.append(itemURL)
-            }
-        }
-
-        guard !payloadURLs.isEmpty else {
-            throw "No .dylib or .framework found inside \(archiveURL.lastPathComponent)."
-        }
-
-        for payloadURL in payloadURLs {
-            try copyOrMovePayload(from: payloadURL, into: baseURL, move: false)
-            copiedCount += 1
-        }
-    }
-
-    @MainActor
-    static func installDownloadedFile(at localFileURL: URL, originalFileName: String, destinationFolder: URL) async throws {
-        let fm = FileManager.default
-        let stagingDir = fm.temporaryDirectory.appendingPathComponent("LCTweakDL-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: stagingDir) }
-        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
-
-        let ext = URL(fileURLWithPath: originalFileName).pathExtension.lowercased()
-        let namedFileURL = stagingDir.appendingPathComponent(originalFileName)
-        try fm.copyItem(at: localFileURL, to: namedFileURL)
-
-        var count = 0
-        if ext == "zip" || ext == "deb" {
-            let workDir = stagingDir.appendingPathComponent("work", isDirectory: true)
-            try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
-            try await extractArchiveAndInstallPayloads(from: namedFileURL, ext: ext, workDir: workDir, into: destinationFolder, copiedCount: &count)
-        } else if ext == "dylib" || ext == "framework" {
-            try copyOrMovePayload(from: namedFileURL, into: destinationFolder, move: true)
-            count = 1
-        } else {
-            throw "Unsupported tweak file type: \(originalFileName)"
-        }
-
-        if count > 0 {
-            try? await LCUtils.signTweaks(tweakFolderUrl: destinationFolder, force: false) { _ in }
-            NotificationCenter.default.post(name: Notification.Name("LC.TweakManagementDidChange"), object: nil)
-        }
-    }
-}
-
 public struct LCAppInstallOutcome: Sendable {
     let installedApp: LCAppModel?
     let warningMessage: String?
@@ -801,6 +696,28 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
         storeDirectory.appendingPathComponent("tasks.json")
     }
 
+    /// Removes orphaned `.download` files in `Caches/LCDownloads` whose task IDs no longer appear in persisted tasks.
+    nonisolated static func cleanupOrphanedDownloads(fileManager fm: FileManager = .default) {
+        let dir = storeDirectory
+        let persistedIDs: Set<String> = {
+            guard let data = try? Data(contentsOf: metadataFileURL),
+                  let decoded = try? JSONDecoder().decode([LCDownloadTaskItem].self, from: data) else {
+                return []
+            }
+            return Set(decoded.filter { $0.state.isActive || $0.state == .paused }.map { $0.id.uuidString })
+        }()
+
+        guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for fileURL in entries where fileURL.pathExtension == "download" {
+            let stem = fileURL.deletingPathExtension().lastPathComponent
+            if !persistedIDs.contains(stem) {
+                try? fm.removeItem(at: fileURL)
+            }
+        }
+    }
+
     private override init() {
         super.init()
 
@@ -954,7 +871,8 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
     @MainActor
     @discardableResult
     public func enqueueTweakDownload(url: URL, displayName: String? = nil, destinationFolder: URL) -> LCDownloadTaskItem {
-        if let existing = items.first(where: { $0.url == url && $0.state.isActive }) {
+        let targetKind = LCDownloadKind.tweak(destinationFolderPath: destinationFolder.path)
+        if let existing = items.first(where: { $0.url == url && $0.kind == targetKind && $0.state.isActive }) {
             isPillDismissed = false
             return existing
         }
@@ -1169,18 +1087,11 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
             return
         }
 
-        let suggested = downloadTask.response?.suggestedFilename
-        let origExt = downloadTask.originalRequest?.url?.pathExtension.lowercased() ?? ""
-        let suggestedExt = suggested.map { URL(fileURLWithPath: $0).pathExtension.lowercased() } ?? ""
-        let validExts: Set<String> = ["dylib", "framework", "zip", "deb", "ipa", "tipa"]
-        let resolvedName: String
-        if let suggested, validExts.contains(suggestedExt) {
-            resolvedName = suggested
-        } else if !origExt.isEmpty, let lastComp = downloadTask.originalRequest?.url?.lastPathComponent, !lastComp.isEmpty {
-            resolvedName = lastComp
-        } else {
-            resolvedName = suggested ?? "download.ipa"
-        }
+        let resolvedName = LCTweakFormatDetector.resolveDownloadedFileName(
+            response: downloadTask.response,
+            originalRequest: downloadTask.originalRequest,
+            localFileURL: savedURL
+        )
         Task { @MainActor in
             await self.handleDownloadedFile(itemId: itemId, taskId: taskId, localFileURL: savedURL, suggestedFileName: resolvedName)
         }
@@ -1274,18 +1185,28 @@ public final class LCDownloadManager: NSObject, ObservableObject, URLSessionDown
                 }
             case let .tweak(destinationFolderPath):
                 if let liveIdx = items.firstIndex(where: { $0.id == item.id }) {
-                    items[liveIdx].state = .installing("Installing tweak…")
-                    items[liveIdx].progress = 0.85
+                    items[liveIdx].state = .installing("Unpacking tweak…")
+                    items[liveIdx].progress = 0.72
                 }
-                try await LCTweakPackageInstaller.installDownloadedFile(
+                let result = try await LCTweakInstallService.installDownloadedTweak(
                     at: localFileURL,
-                    originalFileName: suggestedFileName,
-                    destinationFolder: URL(fileURLWithPath: destinationFolderPath, isDirectory: true)
+                    resolvedFileName: suggestedFileName,
+                    destinationFolder: URL(fileURLWithPath: destinationFolderPath, isDirectory: true),
+                    progressHandler: { [weak self] prog in
+                        Task { @MainActor [weak self] in
+                            guard let self, let liveIdx = self.items.firstIndex(where: { $0.id == item.id }) else { return }
+                            self.items[liveIdx].progress = 0.72 + (prog.fraction * 0.28)
+                            self.items[liveIdx].state = .installing(prog.status)
+                        }
+                    }
                 )
                 if let liveIdx = items.firstIndex(where: { $0.id == item.id }) {
                     items[liveIdx].progress = 1.0
                     items[liveIdx].state = .completed
                     persistQueue()
+                }
+                if let signingWarning = result.signingWarning {
+                    alertMessage = signingWarning
                 }
             }
         } catch {

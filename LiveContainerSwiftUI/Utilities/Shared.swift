@@ -197,6 +197,11 @@ extension UTType {
     static let zipArchive = UTType(filenameExtension: "zip")!
     static let lcFramework = UTType(filenameExtension: "framework", conformingTo: .package)!
     static let p12 = UTType(filenameExtension: "p12")!
+    static let tarArchiveCompat = UTType(filenameExtension: "tar") ?? .data
+    static let gzArchive = UTType(filenameExtension: "gz") ?? .gzip
+    static let tgzArchive = UTType(filenameExtension: "tgz") ?? .gzip
+    static let xzArchive = UTType(filenameExtension: "xz") ?? .data
+    static let bz2Archive = UTType(filenameExtension: "bz2") ?? .bz2
 }
 
 extension Color {

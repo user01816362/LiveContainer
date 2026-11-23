@@ -313,12 +313,17 @@ extension LCAppBannerViewController {
 
     private func copySelectedToTweaks(selectedItems: [AppBinaryExportItem], destinationFolderURL: URL) async {
         do {
-            let copiedCount = try await Task.detached(priority: .userInitiated) {
+            let copiedURLs = try await Task.detached(priority: .userInitiated) {
                 try Self.copySelectedBinaryItems(selectedItems: selectedItems, to: destinationFolderURL)
             }.value
+            let patchWarnings = try await LCTweakInstallService.patchAndSignCopiedTweaks(at: copiedURLs, in: destinationFolderURL)
             await MainActor.run {
                 dismiss(animated: true) {
-                    self.showExportSuccess("Copied \(copiedCount) item(s) to \(destinationFolderURL.lastPathComponent).")
+                    if let firstWarning = patchWarnings.first {
+                        self.showExportSuccess("Copied \(copiedURLs.count) item(s) to \(destinationFolderURL.lastPathComponent) (warning: \(firstWarning)).")
+                    } else {
+                        self.showExportSuccess("Copied \(copiedURLs.count) item(s) to \(destinationFolderURL.lastPathComponent).")
+                    }
                 }
             }
         } catch {
@@ -328,18 +333,18 @@ extension LCAppBannerViewController {
         }
     }
 
-    nonisolated private static func copySelectedBinaryItems(selectedItems: [AppBinaryExportItem], to destinationFolderURL: URL) throws -> Int {
+    nonisolated private static func copySelectedBinaryItems(selectedItems: [AppBinaryExportItem], to destinationFolderURL: URL) throws -> [URL] {
         let fm = FileManager.default
         try fm.createDirectory(at: destinationFolderURL, withIntermediateDirectories: true)
 
-        var copiedCount = 0
+        var copiedURLs: [URL] = []
         for item in selectedItems {
             let proposedURL = destinationFolderURL.appendingPathComponent(item.url.lastPathComponent, isDirectory: item.kind == .framework)
             let destinationURL = nextAvailableCopyURL(for: proposedURL)
             try fm.copyItem(at: item.url, to: destinationURL)
-            copiedCount += 1
+            copiedURLs.append(destinationURL)
         }
-        return copiedCount
+        return copiedURLs
     }
 
     nonisolated private static func nextAvailableCopyURL(for proposedURL: URL) -> URL {

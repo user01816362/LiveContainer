@@ -18,12 +18,54 @@ static BOOL LCIsResolvedPathWithinRoot(NSString *resolvedPath, NSString *canonic
     return [resolvedPath isEqualToString:canonicalRoot] || [resolvedPath hasPrefix:rootPrefix];
 }
 
-static NSString *LCRelativeStringFromCStr(const char *cStr) {
+static BOOL LCFileHasZstdMagic(NSString *path) {
+    int fd = open(path.fileSystemRepresentation, O_RDONLY);
+    if (fd < 0) {
+        return NO;
+    }
+    uint8_t magic[4] = {0};
+    ssize_t n = read(fd, magic, sizeof(magic));
+    close(fd);
+    return n == 4 && magic[0] == 0x28 && magic[1] == 0xB5 && magic[2] == 0x2F && magic[3] == 0xFD;
+}
+
+static NSString *LCRelativeStringFromCStr(const char *cStr, BOOL stripLeadingSlashes) {
     if (!cStr || cStr[0] == '\0') {
         return nil;
     }
     size_t len = strlen(cStr);
-    return [NSFileManager.defaultManager stringWithFileSystemRepresentation:cStr length:len];
+    NSString *str = [NSFileManager.defaultManager stringWithFileSystemRepresentation:cStr length:len];
+    if (!stripLeadingSlashes || str.length == 0) {
+        return str;
+    }
+    while (YES) {
+        if ([str hasPrefix:@"/"]) {
+            str = [str substringFromIndex:1];
+        } else if ([str hasPrefix:@"./"]) {
+            str = [str substringFromIndex:2];
+        } else {
+            break;
+        }
+    }
+    return str;
+}
+
+static BOOL LCEnsureExistingAncestorWithinRoot(NSString *candidateParentDir, NSString *canonicalRoot, NSString *rootPrefix) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *probe = candidateParentDir;
+    while (probe.length > canonicalRoot.length) {
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:probe isDirectory:&isDir]) {
+            NSString *resolvedAncestor = [NSURL fileURLWithPath:probe isDirectory:isDir].URLByResolvingSymlinksInPath.path;
+            return LCIsResolvedPathWithinRoot(resolvedAncestor, canonicalRoot, rootPrefix);
+        }
+        NSString *next = probe.stringByDeletingLastPathComponent;
+        if (next.length == 0 || [next isEqualToString:probe]) {
+            break;
+        }
+        probe = next;
+    }
+    return LCIsResolvedPathWithinRoot(probe, canonicalRoot, rootPrefix);
 }
 
 static void LCUpdateProgressFromArchive(struct archive *a, NSProgress *progress, int64_t totalBytes) {
@@ -40,33 +82,55 @@ static void LCUpdateProgressFromArchive(struct archive *a, NSProgress *progress,
     }
 }
 
-static int copy_data(struct archive *ar, struct archive *aw, NSProgress *progress, int64_t totalBytes) {
+static int copy_data(struct archive *ar, struct archive *aw, NSProgress *progress, int64_t totalBytes, BOOL *outCancelled, NSString **outErrorMessage) {
     int r;
     const void *buff;
     size_t size;
     la_int64_t offset;
 
     for (;;) {
+        if (progress && progress.isCancelled) {
+            if (outCancelled) {
+                *outCancelled = YES;
+            }
+            return ARCHIVE_FAILED;
+        }
         r = archive_read_data_block(ar, &buff, &size, &offset);
         if (r == ARCHIVE_EOF) {
             LCUpdateProgressFromArchive(ar, progress, totalBytes);
             return ARCHIVE_OK;
         }
         if (r < ARCHIVE_OK) {
+            const char *errC = archive_error_string(ar);
+            if (errC && outErrorMessage && !*outErrorMessage) {
+                *outErrorMessage = [NSString stringWithUTF8String:errC];
+            }
             return r;
         }
         la_ssize_t writeResult = archive_write_data_block(aw, buff, size, offset);
         if (writeResult < ARCHIVE_OK) {
-            fprintf(stderr, "%s\n", archive_error_string(aw));
+            const char *errC = archive_error_string(aw);
+            fprintf(stderr, "%s\n", errC ?: "archive_write_data_block failed");
+            if (errC && outErrorMessage && !*outErrorMessage) {
+                *outErrorMessage = [NSString stringWithUTF8String:errC];
+            }
             return (int)writeResult;
         }
         LCUpdateProgressFromArchive(ar, progress, totalBytes);
     }
 }
 
-int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progress) {
+NSString * _Nullable LCExtractArchiveAtPath(
+    NSString * _Nonnull fileToExtract,
+    NSString * _Nonnull extractionPath,
+    LCArchiveExtractOptions options,
+    NSProgress * _Nullable progress
+) {
     if (fileToExtract.length == 0 || extractionPath.length == 0) {
-        return 1;
+        return @"Invalid archive or destination path.";
+    }
+    if (progress && progress.isCancelled) {
+        return @"Extraction cancelled.";
     }
 
     NSError *dirError = nil;
@@ -74,16 +138,20 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
                                 withIntermediateDirectories:YES
                                                  attributes:nil
                                                       error:&dirError]) {
-        fprintf(stderr, "Failed to create extraction root: %s\n", dirError.localizedDescription.UTF8String);
-        return 1;
+        return [NSString stringWithFormat:@"Failed to create extraction root: %@", dirError.localizedDescription ?: @"unknown error"];
     }
 
     NSURL *rootURL = [NSURL fileURLWithPath:extractionPath isDirectory:YES].URLByStandardizingPath.URLByResolvingSymlinksInPath;
     NSString *canonicalRoot = rootURL.path;
     if (canonicalRoot.length == 0) {
-        return 1;
+        return @"Failed to resolve extraction destination directory.";
     }
     NSString *rootPrefix = [canonicalRoot hasSuffix:@"/"] ? canonicalRoot : [canonicalRoot stringByAppendingString:@"/"];
+
+    BOOL isZstdMagic = LCFileHasZstdMagic(fileToExtract);
+    BOOL skipUnsafeLinks = (options & LCArchiveExtractOptionSkipUnsafeLinks) != 0;
+    BOOL stripLeadingSlashes = (options & LCArchiveExtractOptionStripLeadingSlashes) != 0;
+    BOOL normalizePermissions = (options & LCArchiveExtractOptionNormalizePermissions) != 0;
 
     struct stat st;
     int64_t totalBytes = (stat(fileToExtract.fileSystemRepresentation, &st) == 0 && st.st_size > 0) ? (int64_t)st.st_size : 1;
@@ -97,10 +165,19 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
     if (!a || !ext) {
         if (a) archive_read_free(a);
         if (ext) archive_write_free(ext);
-        return 1;
+        return @"Unable to allocate libarchive reader or writer.";
     }
 
-    int flags = ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_ACL | ARCHIVE_EXTRACT_FFLAGS;
+    int flags = ARCHIVE_EXTRACT_TIME;
+    if (!normalizePermissions) {
+        flags |= ARCHIVE_EXTRACT_PERM;
+    }
+#ifdef ARCHIVE_EXTRACT_SECURE_SYMLINKS
+    flags |= ARCHIVE_EXTRACT_SECURE_SYMLINKS;
+#endif
+#ifdef ARCHIVE_EXTRACT_SECURE_NODOTDOT
+    flags |= ARCHIVE_EXTRACT_SECURE_NODOTDOT;
+#endif
 
     archive_read_support_format_all(a);
     archive_read_support_filter_all(a);
@@ -109,16 +186,24 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
 
     int r = archive_read_open_filename(a, fileToExtract.fileSystemRepresentation, 10240);
     if (r != ARCHIVE_OK) {
-        fprintf(stderr, "archive_read_open_filename failed: %s\n", archive_error_string(a) ?: "unknown");
+        const char *openErr = archive_error_string(a);
+        NSString *errorMessage = isZstdMagic
+            ? @"This archive uses Zstandard (.zst) compression, which is not supported by iOS system libarchive. Repackage with gzip/xz or import the extracted .dylib/.framework."
+            : [NSString stringWithFormat:@"Failed to open archive: %s", openErr ?: "unknown error"];
         archive_read_free(a);
         archive_write_free(ext);
-        return 1;
+        return errorMessage;
     }
 
-    int result = 0;
+    NSString *errorMessage = nil;
     struct archive_entry *entry = NULL;
 
     for (;;) {
+        if (progress && progress.isCancelled) {
+            errorMessage = @"Extraction cancelled.";
+            break;
+        }
+
         r = archive_read_next_header(a, &entry);
         if (r == ARCHIVE_EOF) {
             break;
@@ -127,47 +212,58 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
             fprintf(stderr, "%s\n", archive_error_string(a) ?: "archive_read_next_header warning");
         }
         if (r < ARCHIVE_WARN) {
-            result = 1;
+            const char *readErr = archive_error_string(a);
+            errorMessage = isZstdMagic
+                ? @"This archive uses Zstandard (.zst) compression, which is not supported by iOS system libarchive. Repackage with gzip/xz or import the extracted .dylib/.framework."
+                : [NSString stringWithFormat:@"Failed while reading archive header: %s", readErr ?: "corrupt or unsupported archive format"];
             break;
         }
 
         const char *entryPathC = archive_entry_pathname(entry);
-        if (!entryPathC || entryPathC[0] == '\0' || entryPathC[0] == '/') {
-            fprintf(stderr, "Rejected invalid archive entry path: %s\n", entryPathC ?: "(null)");
-            result = 1;
+        if (!entryPathC || entryPathC[0] == '\0' || (!stripLeadingSlashes && entryPathC[0] == '/')) {
+            errorMessage = [NSString stringWithFormat:@"Rejected invalid archive entry path: %s", entryPathC ?: "(null)"];
             break;
         }
 
-        NSString *relPath = LCRelativeStringFromCStr(entryPathC);
+        NSString *relPath = LCRelativeStringFromCStr(entryPathC, stripLeadingSlashes);
+        if (stripLeadingSlashes && (relPath.length == 0 || [relPath isEqualToString:@"."])) {
+            archive_read_data_skip(a);
+            continue;
+        }
         if (relPath.length == 0 || [relPath.pathComponents containsObject:@".."]) {
-            fprintf(stderr, "Rejected path traversal archive entry: %s\n", entryPathC);
-            result = 1;
+            errorMessage = [NSString stringWithFormat:@"Rejected path traversal archive entry: %s", entryPathC];
             break;
         }
 
         NSString *candidatePath = [canonicalRoot stringByAppendingPathComponent:relPath];
         NSString *resolvedDest = [NSURL fileURLWithPath:candidatePath].URLByStandardizingPath.path;
-        if (!LCIsResolvedPathWithinRoot(resolvedDest, canonicalRoot, rootPrefix)) {
-            fprintf(stderr, "Rejected escaping archive path: %s\n", entryPathC);
-            result = 1;
+        if (!LCIsResolvedPathWithinRoot(resolvedDest, canonicalRoot, rootPrefix) ||
+            !LCEnsureExistingAncestorWithinRoot(resolvedDest.stringByDeletingLastPathComponent, canonicalRoot, rootPrefix)) {
+            errorMessage = [NSString stringWithFormat:@"Rejected escaping archive path: %s", entryPathC];
             break;
         }
 
         // Validate symlink targets against the entry's directory so relative framework symlinks work
-        // while symlinks escaping canonicalRoot are rejected.
+        // while absolute or escaping symlinks in `.deb` tarballs can either be skipped safely or rejected.
         const char *symlinkC = archive_entry_symlink(entry);
         if (symlinkC && symlinkC[0] != '\0') {
+            BOOL unsafeSymlink = NO;
             if (symlinkC[0] == '/') {
-                fprintf(stderr, "Rejected absolute symlink target: %s\n", symlinkC);
-                result = 1;
-                break;
+                unsafeSymlink = YES;
+            } else {
+                NSString *symlinkRel = LCRelativeStringFromCStr(symlinkC, NO);
+                NSString *parentDir = resolvedDest.stringByDeletingLastPathComponent;
+                NSString *resolvedTarget = symlinkRel ? [NSURL fileURLWithPath:[parentDir stringByAppendingPathComponent:symlinkRel]].URLByStandardizingPath.path : nil;
+                if (!LCIsResolvedPathWithinRoot(resolvedTarget, canonicalRoot, rootPrefix)) {
+                    unsafeSymlink = YES;
+                }
             }
-            NSString *symlinkRel = LCRelativeStringFromCStr(symlinkC);
-            NSString *parentDir = resolvedDest.stringByDeletingLastPathComponent;
-            NSString *resolvedTarget = symlinkRel ? [NSURL fileURLWithPath:[parentDir stringByAppendingPathComponent:symlinkRel]].URLByStandardizingPath.path : nil;
-            if (!LCIsResolvedPathWithinRoot(resolvedTarget, canonicalRoot, rootPrefix)) {
-                fprintf(stderr, "Rejected escaping symlink target: %s -> %s\n", entryPathC, symlinkC);
-                result = 1;
+            if (unsafeSymlink) {
+                if (skipUnsafeLinks) {
+                    archive_read_data_skip(a);
+                    continue;
+                }
+                errorMessage = [NSString stringWithFormat:@"Rejected unsafe symlink target: %s -> %s", entryPathC, symlinkC];
                 break;
             }
         }
@@ -175,24 +271,30 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
         // Validate hardlink targets relative to canonicalRoot.
         const char *hardlinkC = archive_entry_hardlink(entry);
         if (hardlinkC && hardlinkC[0] != '\0') {
-            if (hardlinkC[0] == '/') {
-                fprintf(stderr, "Rejected absolute hardlink target: %s\n", hardlinkC);
-                result = 1;
-                break;
+            NSString *hardlinkRel = (hardlinkC[0] == '/' && !stripLeadingSlashes) ? nil : LCRelativeStringFromCStr(hardlinkC, stripLeadingSlashes);
+            NSString *resolvedHardlink = nil;
+            if (hardlinkRel.length > 0 && ![hardlinkRel.pathComponents containsObject:@".."]) {
+                resolvedHardlink = [NSURL fileURLWithPath:[canonicalRoot stringByAppendingPathComponent:hardlinkRel]].URLByStandardizingPath.path;
             }
-            NSString *hardlinkRel = LCRelativeStringFromCStr(hardlinkC);
-            if (!hardlinkRel || [hardlinkRel.pathComponents containsObject:@".."]) {
-                fprintf(stderr, "Rejected invalid hardlink target: %s\n", hardlinkC);
-                result = 1;
-                break;
-            }
-            NSString *resolvedHardlink = [NSURL fileURLWithPath:[canonicalRoot stringByAppendingPathComponent:hardlinkRel]].URLByStandardizingPath.path;
             if (!LCIsResolvedPathWithinRoot(resolvedHardlink, canonicalRoot, rootPrefix)) {
-                fprintf(stderr, "Rejected escaping hardlink target: %s -> %s\n", entryPathC, hardlinkC);
-                result = 1;
+                if (skipUnsafeLinks) {
+                    archive_read_data_skip(a);
+                    continue;
+                }
+                errorMessage = [NSString stringWithFormat:@"Rejected escaping hardlink target: %s -> %s", entryPathC, hardlinkC];
                 break;
             }
             archive_entry_set_hardlink(entry, resolvedHardlink.fileSystemRepresentation);
+        }
+
+        if (normalizePermissions) {
+            mode_t mode = archive_entry_perm(entry);
+            mode_t filetype = archive_entry_filetype(entry);
+            if (filetype == AE_IFDIR) {
+                archive_entry_set_perm(entry, (mode | 0700) & 0777);
+            } else if (filetype == AE_IFREG) {
+                archive_entry_set_perm(entry, (mode | 0600) & 0777);
+            }
         }
 
         archive_entry_set_pathname(entry, resolvedDest.fileSystemRepresentation);
@@ -202,17 +304,21 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
             fprintf(stderr, "%s\n", archive_error_string(ext) ?: "archive_write_header warning");
         }
         if (r < ARCHIVE_WARN) {
-            result = 1;
+            const char *writeErr = archive_error_string(ext);
+            errorMessage = [NSString stringWithFormat:@"Failed writing entry %@: %s", relPath, writeErr ?: "write header error"];
             break;
         }
 
         if (archive_entry_size(entry) > 0) {
-            r = copy_data(a, ext, progress, totalBytes);
-            if (r < ARCHIVE_OK) {
-                fprintf(stderr, "%s\n", archive_error_string(ext) ?: "copy_data warning");
+            BOOL cancelled = NO;
+            NSString *copyErr = nil;
+            r = copy_data(a, ext, progress, totalBytes, &cancelled, &copyErr);
+            if (cancelled) {
+                errorMessage = @"Extraction cancelled.";
+                break;
             }
             if (r < ARCHIVE_WARN) {
-                result = 1;
+                errorMessage = copyErr ?: [NSString stringWithFormat:@"Failed extracting data for %@", relPath];
                 break;
             }
         } else {
@@ -224,12 +330,13 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
             fprintf(stderr, "%s\n", archive_error_string(ext) ?: "archive_write_finish_entry warning");
         }
         if (r < ARCHIVE_WARN) {
-            result = 1;
+            const char *finishErr = archive_error_string(ext);
+            errorMessage = [NSString stringWithFormat:@"Failed finishing entry %@: %s", relPath, finishErr ?: "finish entry error"];
             break;
         }
     }
 
-    if (result == 0 && progress) {
+    if (errorMessage == nil && progress) {
         progress.completedUnitCount = totalBytes;
     }
 
@@ -238,7 +345,16 @@ int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progr
     archive_write_close(ext);
     archive_write_free(ext);
 
-    return result;
+    return errorMessage;
+}
+
+int extract(NSString *fileToExtract, NSString *extractionPath, NSProgress *progress) {
+    NSString *error = LCExtractArchiveAtPath(fileToExtract, extractionPath, LCArchiveExtractOptionNone, progress);
+    if (error) {
+        fprintf(stderr, "%s\n", error.UTF8String);
+        return 1;
+    }
+    return 0;
 }
 
 // MARK: - Streaming libarchive ZIP Writer

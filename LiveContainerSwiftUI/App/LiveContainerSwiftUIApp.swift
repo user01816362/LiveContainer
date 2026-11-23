@@ -121,6 +121,10 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     continue
                 }
                 let folderName = tweakDir.hasSuffix(".disabled") ? String(tweakDir.dropLast(".disabled".count)) : tweakDir
+                let lowerName = folderName.lowercased()
+                if lowerName.hasSuffix(".framework") || lowerName.hasSuffix(".bundle") {
+                    continue
+                }
                 tempTweakFolderNames.append(folderName)
             }
         } catch {
@@ -154,9 +158,14 @@ private nonisolated func cleanupStaleExportArtifacts(fileManager: FileManager) {
         try? fileManager.removeItem(at: exportDirectoryURL)
     }
     LCPackageStagingManager.cleanupStaleStagingDirectories(fileManager: fileManager)
+    LCTweakArchiveUnpacker.cleanupStaleStagingDirectories(fileManager: fileManager)
+    LCDownloadManager.cleanupOrphanedDownloads(fileManager: fileManager)
 
     // Legacy staging folders used during export and install creation.
-    let legacyPrefixes = ["LCAppExport-", "LCDataExport-", "LCBinaryExport-", "LCInstall-"]
+    let legacyPrefixes = [
+        "LCAppExport-", "LCDataExport-", "LCBinaryExport-", "LCInstall-",
+        "LCTweakImport-", "LCTweakDL-", "LCTweakProbe-", "LCTweakWork-"
+    ]
     let tempRoot = fileManager.temporaryDirectory
     guard let tempItems = try? fileManager.contentsOfDirectory(
         at: tempRoot,

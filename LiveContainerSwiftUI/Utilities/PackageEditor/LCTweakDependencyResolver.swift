@@ -14,33 +14,10 @@ struct LCUnpackedTweakPayloads: Sendable {
 /// Discovers LiveContainer tweaks, unpacks `.deb`/`.zip`/`.framework`/`.dylib` tweaks safely off-main,
 /// detects Substrate/ElleKit/Substitute dependencies, and computes coherent `@rpath` remap tables.
 enum LCTweakDependencyResolver {
-    nonisolated static let canonicalSubstrateLoadPath = "@rpath/CydiaSubstrate.framework/CydiaSubstrate"
-
-    private nonisolated static let substrateAliases: Set<String> = [
-        "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-        "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-        "@rpath/CydiaSubstrate.framework/CydiaSubstrate",
-        "@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-        "/usr/lib/libsubstrate.dylib",
-        "/var/jb/usr/lib/libsubstrate.dylib",
-        "@rpath/libsubstrate.dylib",
-        "/usr/lib/libellekit.dylib",
-        "/var/jb/usr/lib/libellekit.dylib",
-        "@rpath/libellekit.dylib",
-        "/usr/lib/libsubstitute.dylib",
-        "/var/jb/usr/lib/libsubstitute.dylib",
-        "@rpath/libsubstitute.dylib"
-    ]
+    nonisolated static let canonicalSubstrateLoadPath = LCTweakMachOInspector.canonicalSubstrateLoadPath
 
     nonisolated static func isSubstrateAlias(_ path: String) -> Bool {
-        if substrateAliases.contains(path) {
-            return true
-        }
-        let lower = path.lowercased()
-        return lower.hasSuffix("/cydiasubstrate.framework/cydiasubstrate") ||
-            lower.hasSuffix("/libsubstrate.dylib") ||
-            lower.hasSuffix("/libellekit.dylib") ||
-            lower.hasSuffix("/libsubstitute.dylib")
+        LCTweakMachOInspector.isSubstrateAlias(path)
     }
 
     nonisolated static func discoverLiveContainerTweaks(appTweakFolder: String?) -> [LCLiveContainerTweakSection] {
@@ -142,33 +119,14 @@ enum LCTweakDependencyResolver {
             var unresolved = Set<String>()
 
             for binURL in machOURLs {
-                guard let ctx = try? LCMachOParser.parseSliceContext(at: binURL) else {
-                    allHaveArm64 = false
-                    continue
-                }
-                let hasArm64 = ctx.overview.slices.contains { slice in
-                    slice.is64Bit && slice.architectureName.lowercased().hasPrefix("arm64")
-                }
-                if !hasArm64 {
+                let report = LCTweakMachOInspector.inspectBinary(at: binURL, siblingKeys: bundledSiblingKeys)
+                if !report.isMachOValid || !report.hasArm64iOSSlice {
                     allHaveArm64 = false
                 }
-                for dep in ctx.overview.dylibs where dep.kind != .id {
-                    if isSubstrateAlias(dep.path) {
-                        needsElleKit = true
-                        continue
-                    }
-                    if isSystemDependencyPath(dep.path) {
-                        continue
-                    }
-                    if matchesSiblingPayload(dep.path, siblingKeys: bundledSiblingKeys) {
-                        continue
-                    }
-                    if dep.path.hasPrefix("@") {
-                        // Ignore standard internal `@rpath`/`@executable_path` unless clearly an external jb library
-                        continue
-                    }
-                    unresolved.insert(dep.path)
+                if report.needsSubstrate {
+                    needsElleKit = true
                 }
+                unresolved.formUnion(report.unresolvedDependencies)
             }
 
             return LCPackageQueuedTweak(
@@ -188,102 +146,20 @@ enum LCTweakDependencyResolver {
         }
     }
 
-    /// Extracts `.deb` / `.zip` or copies `.dylib` / `.framework` payloads into `workDir`.
-    /// Never modifies or moves the user's original source files.
+    /// Extracts `.deb` / `.zip` / `.tar.*` / `.ipa` or copies `.dylib` / `.framework` payloads into `workDir`.
+    /// Delegates to `LCTweakArchiveUnpacker` so nested archives, `__MACOSX`, `.deb` symlinks, and `.zst` errors are handled uniformly.
     nonisolated static func unpackTweakSynchronously(
         from sourceURL: URL,
         kind: LCTweakPackageKind,
         into workDir: URL,
         fileManager fm: FileManager = .default
     ) throws -> LCUnpackedTweakPayloads {
-        let localSourceCopy = workDir.appendingPathComponent(sourceURL.lastPathComponent)
-        if sourceURL.standardizedFileURL != localSourceCopy.standardizedFileURL {
-            if fm.fileExists(atPath: localSourceCopy.path) {
-                try fm.removeItem(at: localSourceCopy)
-            }
-            try fm.copyItem(at: sourceURL, to: localSourceCopy)
-        }
-
-        if kind == .dylib {
-            return LCUnpackedTweakPayloads(dylibs: [localSourceCopy], frameworks: [], resourceBundles: [])
-        }
-        if kind == .framework {
-            return LCUnpackedTweakPayloads(dylibs: [], frameworks: [localSourceCopy], resourceBundles: [])
-        }
-
-        let outerDir = workDir.appendingPathComponent("outer", isDirectory: true)
-        try fm.createDirectory(at: outerDir, withIntermediateDirectories: true)
-        let outerStatus = extract(localSourceCopy.path, outerDir.path, nil)
-        guard outerStatus == 0 else {
-            throw "Failed to extract \(sourceURL.lastPathComponent) (libarchive code \(outerStatus))."
-        }
-
-        var searchRoot = outerDir
-        if kind == .deb {
-            let outerItems = (try? fm.contentsOfDirectory(at: outerDir, includingPropertiesForKeys: nil)) ?? []
-            if let dataTar = outerItems.first(where: { $0.lastPathComponent.hasPrefix("data.tar") }) {
-                let innerDir = workDir.appendingPathComponent("inner", isDirectory: true)
-                try fm.createDirectory(at: innerDir, withIntermediateDirectories: true)
-                let innerStatus = extract(dataTar.path, innerDir.path, nil)
-                guard innerStatus == 0 else {
-                    throw "Failed to extract \(dataTar.lastPathComponent) inside \(sourceURL.lastPathComponent)."
-                }
-                searchRoot = innerDir
-            }
-        }
-
-        var dylibs: [URL] = []
-        var frameworks: [URL] = []
-        var bundles: [URL] = []
-
-        if let enumerator = fm.enumerator(
-            at: searchRoot,
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            while let itemURL = enumerator.nextObject() as? URL {
-                let values = try? itemURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                if values?.isSymbolicLink == true {
-                    continue
-                }
-                let isDir = values?.isDirectory ?? false
-                let ext = itemURL.pathExtension.lowercased()
-                if isDir && ext == "framework" {
-                    frameworks.append(itemURL)
-                    enumerator.skipDescendants()
-                } else if isDir && ext == "bundle" {
-                    bundles.append(itemURL)
-                    enumerator.skipDescendants()
-                } else if !isDir && ext == "dylib" {
-                    dylibs.append(itemURL)
-                }
-            }
-        }
-
-        return LCUnpackedTweakPayloads(dylibs: dylibs, frameworks: frameworks, resourceBundles: bundles)
-    }
-
-    private nonisolated static func isSystemDependencyPath(_ path: String) -> Bool {
-        if path.hasPrefix("/System/Library/") {
-            return true
-        }
-        if path.hasPrefix("/usr/lib/") {
-            // Standard Apple libraries live directly under /usr/lib/, whereas jailbreak tweaks put
-            // substrate/ellekit/substitute (handled above) or custom libs there.
-            let name = (path as NSString).lastPathComponent.lowercased()
-            return !name.contains("substrate") && !name.contains("ellekit") && !name.contains("substitute") && !name.contains("rocket") && !name.contains("cephei")
-        }
-        return false
-    }
-
-    private nonisolated static func matchesSiblingPayload(_ path: String, siblingKeys: Set<String>) -> Bool {
-        let parts = path.split(separator: "/").map(String.init)
-        for key in siblingKeys {
-            if parts.contains(key) {
-                return true
-            }
-        }
-        return false
+        let extracted = try LCTweakArchiveUnpacker.unpackSimplePayloads(from: sourceURL, into: workDir, fileManager: fm)
+        return LCUnpackedTweakPayloads(
+            dylibs: extracted.dylibs,
+            frameworks: extracted.frameworks,
+            resourceBundles: extracted.resourceBundles
+        )
     }
 
     private nonisolated static func itemSize(at url: URL, fileManager: FileManager) -> Int64 {

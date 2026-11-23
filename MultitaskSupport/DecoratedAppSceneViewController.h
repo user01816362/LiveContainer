@@ -1,12 +1,14 @@
 #import "FoundationPrivate.h"
 #import "AppSceneViewController.h"
 
+@class ResizeHandleView;
+
 @interface DecoratedAppSceneViewController : UIViewController<AppSceneViewControllerDelegate>
 @property(nonatomic, null_unspecified) AppSceneViewController* appSceneVC;
 @property(nonatomic, null_unspecified) UIStackView *view;
 @property(nonatomic, null_unspecified) UINavigationBar *navigationBar;
 @property(nonatomic, null_unspecified) UINavigationItem *navigationItem;
-@property(nonatomic, null_unspecified) UIView *resizeHandle;
+@property(nonatomic, null_unspecified) ResizeHandleView *resizeHandle;
 @property(nonatomic, null_unspecified) UIView* contentView;
 
 @property(nonatomic) BOOL isMaximized;

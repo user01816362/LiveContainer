@@ -89,6 +89,8 @@ private struct LCManagedTweakFolderView: View {
     @State private var errorInfo = ""
     @State private var choosingTweak = false
     @State private var isTweakSigning = false
+    @State private var isImportingTweaks = false
+    @State private var pendingImportSession: LCTweakInspectionSession?
     @State private var transferRequest: LCTweakTransferRequest?
     @State private var inspectedTweakTarget: LCTweakInspectTarget?
     @State private var browsedFolderTarget: LCTweakBrowseTarget?
@@ -143,7 +145,7 @@ private struct LCManagedTweakFolderView: View {
                     Button("Select Here") {
                         destinationMode.onSelect(baseURL)
                     }
-                } else if !isTweakSigning && LCSharedUtils.certificatePassword() != nil {
+                } else if !(isTweakSigning || isImportingTweaks) && LCSharedUtils.certificatePassword() != nil {
                     Button {
                         Task { await signAllTweaks() }
                     } label: {
@@ -154,7 +156,7 @@ private struct LCManagedTweakFolderView: View {
 
             ToolbarItem(placement: .topBarTrailing) {
                 if !isDestinationMode {
-                    if !isTweakSigning {
+                    if !(isTweakSigning || isImportingTweaks) {
                         Menu {
                             Button {
                                 choosingTweak = true
@@ -213,7 +215,7 @@ private struct LCManagedTweakFolderView: View {
         )
         .textFieldAlert(
             isPresented: $downloadUrlInput.show,
-            title: "Download Tweak (.dylib / .deb / .zip)",
+            title: "Download Tweak (.dylib / .deb / .zip / .ipa)",
             text: $downloadUrlInput.initVal,
             placeholder: "https://",
             action: { newText in
@@ -225,7 +227,10 @@ private struct LCManagedTweakFolderView: View {
         )
         .betterFileImporter(
             isPresented: $choosingTweak,
-            types: [.dylib, .lcFramework, .zipArchive, .deb],
+            types: [
+                .dylib, .lcFramework, .zipArchive, .deb, .ipa, .tipa,
+                .tarArchiveCompat, .gzArchive, .tgzArchive, .xzArchive, .bz2Archive
+            ],
             multiple: true,
             callback: { urls in
                 Task { await installTweaks(urls) }
@@ -234,6 +239,24 @@ private struct LCManagedTweakFolderView: View {
                 choosingTweak = false
             }
         )
+        .sheet(item: $pendingImportSession, onDismiss: {
+            pendingImportSession?.cleanup()
+            pendingImportSession = nil
+        }) { session in
+            LCTweakImportReviewSheet(
+                session: session,
+                destinationFolderURL: baseURL,
+                destinationFolderName: isRoot ? "Tweaks" : baseURL.lastPathComponent,
+                onComplete: { result in
+                    pendingImportSession = nil
+                    finalizeTweakImportResult(result)
+                },
+                onCancel: {
+                    session.cleanup()
+                    pendingImportSession = nil
+                }
+            )
+        }
         .sheet(item: $transferRequest) { request in
             LCTweakDestinationView(
                 onClose: {
@@ -499,10 +522,18 @@ private struct LCManagedTweakFolderView: View {
     }
 
     private func downloadTweakFromURL() async {
-        guard let urlStr = await downloadUrlInput.open(),
-              !urlStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let url = URL(string: urlStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-              (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") else {
+        guard let rawUrlStr = await downloadUrlInput.open() else {
+            return
+        }
+        let trimmed = rawUrlStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host?.isEmpty == false else {
+            show("Enter a valid http:// or https:// download URL.")
             return
         }
         LCDownloadManager.shared.enqueueTweakDownload(url: url, destinationFolder: baseURL)
@@ -527,37 +558,56 @@ private struct LCManagedTweakFolderView: View {
     }
 
     private func installTweaks(_ urls: [URL]) async {
-        let fm = FileManager.default
-        let stagingDir = fm.temporaryDirectory.appendingPathComponent("LCTweakImport-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fm.removeItem(at: stagingDir) }
+        guard !isImportingTweaks, !urls.isEmpty else {
+            return
+        }
+        isImportingTweaks = true
+        let tempRootPath = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        defer {
+            for url in urls where url.isFileURL {
+                let stdPath = url.standardizedFileURL.path
+                if stdPath.hasPrefix(tempRootPath) {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
 
         do {
-            try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-            var extractedPayloadCount = 0
-
-            for url in urls {
-                guard url.isFileURL else {
-                    throw "lc.tweakView.notFileError %@".localizeWithFormat(url.lastPathComponent)
-                }
-                let ext = url.pathExtension.lowercased()
-                if ext == "zip" || ext == "deb" {
-                    let archiveWorkDir = stagingDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
-                    try fm.createDirectory(at: archiveWorkDir, withIntermediateDirectories: true)
-                    try await LCTweakPackageInstaller.extractArchiveAndInstallPayloads(from: url, ext: ext, workDir: archiveWorkDir, into: baseURL, copiedCount: &extractedPayloadCount)
-                } else {
-                    try LCTweakPackageInstaller.copyOrMovePayload(from: url, into: baseURL, move: true)
-                    extractedPayloadCount += 1
-                }
+            for url in urls where !url.isFileURL {
+                throw "lc.tweakView.notFileError %@".localizeWithFormat(url.lastPathComponent)
             }
 
-            if extractedPayloadCount > 0 {
-                try? await LCUtils.signTweaks(tweakFolderUrl: baseURL, force: false) { _ in }
+            let session = try await LCTweakInstallService.inspectSources(urls, destinationFolder: baseURL)
+            isImportingTweaks = false
+
+            if session.requiresReview {
+                pendingImportSession = session
+                return
             }
-            reloadTweakItems()
-            syncRootTweakFoldersIfNeeded()
-            postChange()
+
+            defer { session.cleanup() }
+            let selectedIDs = session.defaultSelectedIDs
+            let result = try await LCTweakInstallService.installSelectedPayloads(
+                from: session,
+                selectedIDs: selectedIDs,
+                destinationFolder: baseURL,
+                conflictPolicy: .overwrite
+            )
+            finalizeTweakImportResult(result)
         } catch {
+            isImportingTweaks = false
             show(error)
+        }
+    }
+
+    private func finalizeTweakImportResult(_ result: LCTweakImportResult) {
+        reloadTweakItems()
+        syncRootTweakFoldersIfNeeded()
+        postChange()
+        if let signingWarning = result.signingWarning {
+            show(signingWarning)
+        } else if result.installedNames.isEmpty && !result.warnings.isEmpty {
+            show(result.warnings.joined(separator: "\n"))
         }
     }
 
