@@ -182,7 +182,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     
     self.view.axis = UILayoutConstraintAxisVertical;
     self.view.backgroundColor = UIColor.systemBackgroundColor;
-    self.view.layer.cornerRadius = 10;
+    self.view.layer.cornerRadius = _isMaximized ? 0.0 : 18.0;
     self.view.layer.cornerCurve = kCACornerCurveContinuous;
     self.view.layer.masksToBounds = YES;
 
@@ -212,11 +212,12 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     moveGesture.maximumNumberOfTouches = 1;
     [self.navigationBar addGestureRecognizer:moveGesture];
 
-    // Resize handle (idea stolen from Notes debugging window)
+    // Resize handle (concentric Liquid Glass corner grabber)
     UIPanGestureRecognizer *resizeGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(resizeWindow:)];
     resizeGesture.minimumNumberOfTouches = 1;
     resizeGesture.maximumNumberOfTouches = 1;
     self.resizeHandle = [[ResizeHandleView alloc] initWithFrame:CGRectMake(self.view.frame.size.width - navBarHeight, self.view.frame.size.height - navBarHeight, navBarHeight, navBarHeight)];
+    [self.resizeHandle setWindowCornerRadius:18.0];
     self.resizeHandle.alpha = _isMaximized ? 0.0 : 1.0;
     [self.resizeHandle addGestureRecognizer:resizeGesture];
     [self.view addSubview:self.resizeHandle];
@@ -455,6 +456,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         CGRect newFrame = CGRectMake(self.originalFrame.origin.x * maxFrame.size.width, self.originalFrame.origin.y * maxFrame.size.height, self.originalFrame.size.width, self.originalFrame.size.height);
         [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
             self.view.frame = newFrame;
+            self.view.layer.cornerRadius = 18.0;
             self.view.layer.borderWidth = 1;
             self.resizeHandle.alpha = 1;
             
@@ -476,6 +478,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
             self.isMaximized = YES;
             [self updateVerticalConstraints];
             
+            self.view.layer.cornerRadius = 0.0;
             self.view.layer.borderWidth = 0;
             self.resizeHandle.alpha = 0;
             
@@ -653,6 +656,17 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 
 - (void)resizeWindow:(UIPanGestureRecognizer*)sender {
     if(_isMaximized) return;
+
+    if (sender.state == UIGestureRecognizerStateBegan) {
+        [self.resizeHandle setResizing:YES];
+        [self.view.superview bringSubviewToFront:self.view];
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [feedback impactOccurred];
+    } else if (sender.state == UIGestureRecognizerStateEnded ||
+               sender.state == UIGestureRecognizerStateCancelled ||
+               sender.state == UIGestureRecognizerStateFailed) {
+        [self.resizeHandle setResizing:NO];
+    }
     
     CGPoint point = [sender translationInView:self.view];
     [sender setTranslation:CGPointZero inView:self.view];

@@ -8,4 +8,6 @@
 
 @interface ResizeHandleView : UIView
 - (instancetype)initWithFrame:(CGRect)frame;
+- (void)setResizing:(BOOL)resizing;
+- (void)setWindowCornerRadius:(CGFloat)cornerRadius;
 @end
