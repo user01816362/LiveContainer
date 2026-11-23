@@ -709,9 +709,9 @@ final class AppInfoProvider {
             let isOnRightSide = crossedCenter ? !startedOnRight : startedOnRight
 
             let swipeThreshold = max(16.0, Constants.hideGestureThreshold)
-            let horizontalIntent = abs(translation.width) >= swipeThreshold && abs(translation.width) > abs(translation.height)
-            let swipingOutward = (startedOnRight && translation.width > 0) || (!startedOnRight && translation.width < 0)
-            let swipingInward = (startedOnRight && translation.width < 0) || (!startedOnRight && translation.width > 0)
+            let horizontalIntent = abs(translation.x) >= swipeThreshold && abs(translation.x) > abs(translation.y)
+            let swipingOutward = (startedOnRight && translation.x > 0) || (!startedOnRight && translation.x < 0)
+            let swipingInward = (startedOnRight && translation.x < 0) || (!startedOnRight && translation.x > 0)
 
             if crossedCenter {
                 isDockHidden = false
