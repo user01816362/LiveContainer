@@ -9,6 +9,7 @@ on:
         description: Create a nightly release
         type: boolean
         required: false
+        default: true
 
 jobs:
   build:
@@ -94,7 +95,7 @@ jobs:
     name: Nightly Release
     permissions:
       contents: write
-    if: inputs.release__nightly || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: (github.event_name == 'workflow_dispatch' && inputs.release__nightly != false) || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-latest
     needs: [build]
     concurrency:
@@ -135,7 +136,7 @@ jobs:
         with: 
           body: |
             **Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
-            **Message:** ${{ github.event.head_commit.message }}
+            **Message:** ${{ env.COMMIT_MSG }}
             
             This is a nightly release [created automatically with GitHub Actions workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
           files: |
