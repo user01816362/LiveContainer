@@ -188,9 +188,9 @@ struct LCLiveContainerTweakPickerSheet: View {
             }
             .task {
                 let folder = appTweakFolder
-                sections = await lcRunOffMain {
+                sections = (try? await lcRunOffMain {
                     LCTweakDependencyResolver.discoverLiveContainerTweaks(appTweakFolder: folder)
-                }
+                }) ?? []
             }
         }
     }
