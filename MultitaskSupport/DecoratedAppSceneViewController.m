@@ -488,6 +488,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 - (void)maximizeWindow {
     void (^updateSettingsBlock)(UIMutableApplicationSceneSettings *settings);
     
+    [MultitaskDockManager.shared noteHostTouchActivity];
     [self.view layoutIfNeeded];
     if (self.isMaximized) {
         updateSettingsBlock = ^(UIMutableApplicationSceneSettings *settings) {

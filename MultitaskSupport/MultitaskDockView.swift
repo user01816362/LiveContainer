@@ -138,8 +138,12 @@ final class AppInfoProvider {
     private var autoHideTask: Task<Void, Never>?
     private weak var leftEdgeGesture: UIScreenEdgePanGestureRecognizer?
     private weak var rightEdgeGesture: UIScreenEdgePanGestureRecognizer?
+    private var edgeWakeView: UIView?
     private var isUserInteracting: Bool = false
     private var lastActivityResetTime: CFTimeInterval = 0
+    private var isObservingGuestTouches: Bool = false
+
+    private static let guestTouchNotificationName = "com.kdt.livecontainer.multitask.guestTouch"
 
     private var isAutoHideEnabled: Bool {
         LCUtils.appGroupUserDefault.bool(forKey: "LCAutoHideMultitaskDock")
@@ -317,11 +321,32 @@ final class AppInfoProvider {
             name: UIDevice.orientationDidChangeNotification,
             object: nil
         )
+        registerGuestTouchObserver()
     }
     
     deinit {
         NotificationCenter.default.removeObserver(self)
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        CFNotificationCenterRemoveObserver(center, Unmanaged.passUnretained(self).toOpaque(), nil, nil)
+    }
+
+    private func registerGuestTouchObserver() {
+        guard !isObservingGuestTouches else { return }
+        isObservingGuestTouches = true
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        CFNotificationCenterAddObserver(
+            center,
+            Unmanaged.passUnretained(self).toOpaque(),
+            { _, _, _, _, _ in
+                Task { @MainActor in
+                    MultitaskDockManager.shared.noteGuestTouchActivity()
+                }
+            },
+            Self.guestTouchNotificationName as CFString,
+            nil,
+            .deliverImmediately
+        )
     }
 
     @objc nonisolated private func deviceOrientationDidChange() {
@@ -380,6 +405,12 @@ final class AppInfoProvider {
         let newFrame = CGRect(x: targetX, y: targetY, width: currentDockWidth, height: dockHeight)
         
         applyNewFrame(newFrame, for: hostingController, animated: animated)
+        let hideCollapsed = LCUtils.appGroupUserDefault.bool(forKey: "LCHideCollapsedDock")
+        hostingController.view.isUserInteractionEnabled = !isAutoHidden && !(isDockHidden && hideCollapsed && isCollapsed)
+        if hostingController.view.superview === keyWindow {
+            keyWindow?.bringSubviewToFront(hostingController.view)
+        }
+        updateEdgeWakeView(forDockFrame: newFrame)
     }
 
     // MARK: - Frame Calculation Helpers
@@ -516,6 +547,7 @@ final class AppInfoProvider {
         guard isVisible, let hostingController = hostingController else { return }
         self.cancelAutoHideTimer()
         self.isAutoHidden = false
+        self.isDockHidden = false
         self.removeTrackedEdgeGestures()
         
         UIView.animate(
@@ -573,6 +605,11 @@ final class AppInfoProvider {
             return
         }
         noteUserActivity(wakeDock: true)
+    }
+
+    @objc public func noteGuestTouchActivity() {
+        guard isVisible else { return }
+        noteHostTouchActivity()
     }
 
     func noteUserActivity(wakeDock: Bool = true) {
@@ -875,9 +912,11 @@ final class AppInfoProvider {
             right.view?.removeGestureRecognizer(right)
             rightEdgeGesture = nil
         }
+        edgeWakeView?.removeFromSuperview()
+        edgeWakeView = nil
     }
     
-    // Add edge gesture recognition areas when dock is hidden
+    // Add edge gesture recognition areas & a host-owned edge wake strip above remote LiveProcess scenes
     private func setupEdgeGestureRecognizers() {
         removeTrackedEdgeGestures()
         guard let keyWindow = self.keyWindow else { return }
@@ -894,6 +933,78 @@ final class AppInfoProvider {
             rightEdgeGesture.cancelsTouchesInView = false
             keyWindow.addGestureRecognizer(rightEdgeGesture)
             self.rightEdgeGesture = rightEdgeGesture
+
+            updateEdgeWakeView(forDockFrame: hostingController?.view.frame ?? .zero)
+        }
+    }
+
+    /// Maintains a thin, visually imperceptible host-owned view (`alpha = 0.015 > 0.01`) above
+    /// `windowHostingView` along the dock's screen edge when hidden so BackBoardD routes edge taps
+    /// and inward swipes to LiveContainer even when a remote `LiveProcess` app is fullscreen.
+    private func updateEdgeWakeView(forDockFrame dockFrame: CGRect) {
+        guard isVisible, isEffectivelyHidden, let keyWindow = self.keyWindow else {
+            edgeWakeView?.removeFromSuperview()
+            edgeWakeView = nil
+            return
+        }
+
+        let wakeView: UIView
+        if let existing = edgeWakeView {
+            wakeView = existing
+            if wakeView.superview !== keyWindow {
+                keyWindow.addSubview(wakeView)
+            }
+        } else {
+            let created = UIView()
+            created.backgroundColor = UIColor(white: 0.5, alpha: 0.015)
+            created.isUserInteractionEnabled = true
+
+            let tap = UITapGestureRecognizer(target: self, action: #selector(handleEdgeWakeTap(_:)))
+            created.addGestureRecognizer(tap)
+
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleEdgeWakePan(_:)))
+            created.addGestureRecognizer(pan)
+
+            keyWindow.addSubview(created)
+            edgeWakeView = created
+            wakeView = created
+        }
+
+        let screenBounds = keyWindow.bounds
+        let isOnRightSide = (dockFrame.midX > screenBounds.width / 2) || dockFrame.isEmpty
+        let stripWidth: CGFloat = 24.0
+        let safeTop = safeAreaInsets.top + 8.0
+        let safeBottom = safeAreaInsets.bottom + 8.0
+        let maxHeight = max(140.0, screenBounds.height - safeTop - safeBottom)
+        let stripHeight = min(max(160.0, dockFrame.height + 80.0), maxHeight)
+        let centerY = dockFrame.height > 0 ? dockFrame.midY : screenBounds.midY
+        let clampedY = max(safeTop, min(screenBounds.height - safeBottom - stripHeight, centerY - stripHeight / 2.0))
+        let stripX = isOnRightSide ? (screenBounds.width - stripWidth) : 0.0
+
+        wakeView.frame = CGRect(x: stripX, y: clampedY, width: stripWidth, height: stripHeight)
+        keyWindow.bringSubviewToFront(wakeView)
+    }
+
+    @objc private func handleEdgeWakeTap(_ gesture: UITapGestureRecognizer) {
+        guard isEffectivelyHidden else { return }
+        wakeDockFromEdgeInteraction()
+    }
+
+    @objc private func handleEdgeWakePan(_ gesture: UIPanGestureRecognizer) {
+        guard isEffectivelyHidden, gesture.state == .began || gesture.state == .changed else { return }
+        let translation = gesture.translation(in: gesture.view)
+        if abs(translation.x) > 12.0 {
+            wakeDockFromEdgeInteraction()
+        }
+    }
+
+    private func wakeDockFromEdgeInteraction() {
+        let feedback = UIImpactFeedbackGenerator(style: .light)
+        feedback.impactOccurred()
+        if isDockHidden {
+            showDockFromHidden()
+        } else {
+            noteUserActivity(wakeDock: true)
         }
     }
     
@@ -906,11 +1017,7 @@ final class AppInfoProvider {
         let swipeDistance = abs(translation.x)
         
         if swipeDistance > Constants.edgeSwipeThreshold {
-            if isDockHidden {
-                showDockFromHidden()
-            } else {
-                noteUserActivity(wakeDock: true)
-            }
+            wakeDockFromEdgeInteraction()
         }
     }
     
@@ -984,8 +1091,8 @@ public struct MultitaskDockSwiftView: View {
             .scaleEffect(dockManager.isVisible ? 1.0 : 0.8)
             .opacity(
                 dockManager.isAutoHidden
-                    ? 0.01
-                    : (dockManager.isDockHidden ? (hideCollapsedDock && dockManager.isCollapsed ? 0.01 : 0.4) : 1.0)
+                    ? 0.0
+                    : (dockManager.isDockHidden ? (hideCollapsedDock && dockManager.isCollapsed ? 0.0 : 0.4) : 1.0)
             )
             .animation(.easeInOut(duration: 0.25), value: dockManager.isAutoHidden)
             .offset(dragOffset)

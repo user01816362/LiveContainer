@@ -1756,6 +1756,9 @@ static void UIKitGuestHooksInit(void) {
     swizzle(UIApplication.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
     swizzle(UIApplication.class, @selector(canOpenURL:), @selector(hook_canOpenURL:));
     swizzle(UIApplication.class, @selector(setDelegate:), @selector(hook_setDelegate:));
+    if (NSUserDefaults.isLiveProcess) {
+        swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lc_sendEvent:));
+    }
     swizzle(UIScene.class, @selector(scene:didReceiveActions:fromTransitionContext:), @selector(hook_scene:didReceiveActions:fromTransitionContext:));
     swizzle(UIScene.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
     NSInteger LCOrientationLockDirection = [NSUserDefaults.guestAppInfo[@"LCOrientationLock"] integerValue];
@@ -2880,6 +2883,32 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
         });
     }
     [self hook_setDelegate:delegate];
+}
+
+- (void)hook_lc_sendEvent:(UIEvent *)event {
+    [self hook_lc_sendEvent:event];
+    if (event.type != UIEventTypeTouches) {
+        return;
+    }
+    static CFAbsoluteTime sLastGuestTouchPostTime = 0;
+    BOOL hasTouchBegan = NO;
+    for (UITouch *touch in event.allTouches) {
+        if (touch.phase == UITouchPhaseBegan) {
+            hasTouchBegan = YES;
+            break;
+        }
+    }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (hasTouchBegan || (now - sLastGuestTouchPostTime) >= 0.4) {
+        sLastGuestTouchPostTime = now;
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFSTR("com.kdt.livecontainer.multitask.guestTouch"),
+            NULL,
+            NULL,
+            true
+        );
+    }
 }
 
 + (BOOL)_wantsApplicationBehaviorAsExtension {
