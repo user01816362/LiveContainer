@@ -166,15 +166,29 @@ final class AppInfoProvider {
         isAutoHidden || (isDockHidden && isCollapsed && isHideCollapsedDockEnabled)
     }
 
-    private func syncInteractionAndWakeOverlays() {
+    private func syncInteractionAndWakeOverlays(animated: Bool = true) {
         guard let hostingController else {
             removeTrackedEdgeGestures()
             return
         }
         let completelyHidden = isCompletelyInvisible
         hostingController.view.isUserInteractionEnabled = !completelyHidden
-        if isVisible && !completelyHidden, let keyWindow, hostingController.view.superview === keyWindow {
-            keyWindow.bringSubviewToFront(hostingController.view)
+        if isVisible {
+            let targetAlpha: CGFloat = completelyHidden ? 0.0 : 1.0
+            if animated {
+                UIView.animate(
+                    withDuration: 0.25,
+                    delay: 0,
+                    options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]
+                ) {
+                    hostingController.view.alpha = targetAlpha
+                }
+            } else {
+                hostingController.view.alpha = targetAlpha
+            }
+            if !completelyHidden, let keyWindow, hostingController.view.superview === keyWindow {
+                keyWindow.bringSubviewToFront(hostingController.view)
+            }
         }
         setupEdgeGestureRecognizers()
     }
@@ -432,7 +446,7 @@ final class AppInfoProvider {
         let newFrame = CGRect(x: targetX, y: targetY, width: currentDockWidth, height: dockHeight)
         
         applyNewFrame(newFrame, for: hostingController, animated: animated)
-        syncInteractionAndWakeOverlays()
+        syncInteractionAndWakeOverlays(animated: animated)
     }
 
     // MARK: - Frame Calculation Helpers
@@ -674,6 +688,9 @@ final class AppInfoProvider {
             let liveFrame = view.layer.presentation()?.frame ?? view.frame
             view.layer.removeAllAnimations()
             view.frame = liveFrame
+            if view.alpha < 1.0 {
+                view.alpha = 1.0
+            }
             panStartFrame = liveFrame
             isUserInteracting = true
             cancelAutoHideTimer()
@@ -697,6 +714,7 @@ final class AppInfoProvider {
 
             let currentFrame = view.frame
             let translation = gesture.translation(in: coordinateSpace)
+            let velocity = gesture.velocity(in: coordinateSpace)
             let safeInsets = self.safeAreaInsets
             let verticalMargin = Constants.dockVerticalMargin
             let minY = safeInsets.top + verticalMargin
@@ -708,8 +726,7 @@ final class AppInfoProvider {
                                 (!startedOnRight && currentFrame.midX > screenBounds.width / 2)
             let isOnRightSide = crossedCenter ? !startedOnRight : startedOnRight
 
-            let swipeThreshold = max(16.0, Constants.hideGestureThreshold)
-            let horizontalIntent = abs(translation.x) >= swipeThreshold && abs(translation.x) > abs(translation.y)
+            let horizontalIntent = (abs(translation.x) >= 10.0 || abs(velocity.x) >= 250.0) && abs(translation.x) > abs(translation.y)
             let swipingOutward = (startedOnRight && translation.x > 0) || (!startedOnRight && translation.x < 0)
             let swipingInward = (startedOnRight && translation.x < 0) || (!startedOnRight && translation.x > 0)
 

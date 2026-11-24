@@ -52,6 +52,9 @@
 }
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || !self.userInteractionEnabled || self.alpha <= 0.01) {
+        return NO;
+    }
     if ([super pointInside:point withEvent:event]) {
         return YES;
     }
@@ -69,6 +72,9 @@
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || !self.userInteractionEnabled || self.alpha <= 0.01) {
+        return nil;
+    }
     UIView *navHit = [self hitTestNavigationBarAtPoint:point withEvent:event];
     if (navHit) {
         return navHit;
@@ -80,7 +86,7 @@
             return [handle hitTest:handlePoint withEvent:event] ?: handle;
         }
     }
-    return [super hitTest:point withEvent:event] ?: ([super pointInside:point withEvent:event] ? self : nil);
+    return [super hitTest:point withEvent:event];
 }
 
 @end
